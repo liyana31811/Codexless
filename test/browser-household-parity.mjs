@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import path from "node:path";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { CodexBrowserExecutor, canonicalizeContentEditableParagraphText, resolveBoundContentEditableParagraphText } from "../src/codex-browser-executor.mjs";
 import { registerBrowserPreviewTools } from "../src/browser-tools.mjs";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const fakeSkillPath = "C:\\Users\\Test\\.codex\\plugins\\cache\\openai-bundled\\chrome\\99.1\\skills\\control-chrome\\SKILL.md";
+const fakeDownloadPath = process.platform === "win32"
+  ? "C:\\Users\\Test\\Downloads\\fixture.txt"
+  : "/Users/Test/Downloads/fixture.txt";
 function makeAuthorityExecutor() {
   return {
     async resolveAuthority() {
@@ -807,7 +810,7 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
             snapshot: "POST_DOWNLOAD_OK",
             clickReturned: true,
             downloadConfirmed: true,
-            downloadPath: "C:\\Users\\Test\\Downloads\\fixture.txt",
+            downloadPath: fakeDownloadPath,
             pathError: null,
             readbackError: null,
             cleanupStatus: "released",
@@ -1892,7 +1895,7 @@ test("Browser prepared download confirms one exact target and returns the browse
   const downloaded = await browser.download({ actionApprovalRef: prepared.actionApprovalRef });
   assert.equal(downloaded.status, "downloaded");
   assert.equal(downloaded.downloadConfirmed, true);
-  assert.equal(downloaded.downloadPath, "C:\\Users\\Test\\Downloads\\fixture.txt");
+  assert.equal(downloaded.downloadPath, fakeDownloadPath);
   assert.equal(downloaded.downloadFileName, "fixture.txt");
   assert.equal(downloaded.pathStatus, "available");
   assert.equal(downloaded.readbackStatus, "ok");
@@ -1980,6 +1983,7 @@ test("Browser prepared upload refuses authority escape before any browser mutati
 });
 
 test("Browser prepared upload refuses source drift before any browser dispatch", async () => {
+  await mkdir(path.join(projectRoot, "_work"), { recursive: true });
   const fixtureDir = await mkdtemp(path.join(projectRoot, "_work", "p1c-upload-pre-drift-"));
   const fixturePath = path.join(fixtureDir, "probe.txt");
   try {
@@ -2004,6 +2008,7 @@ test("Browser prepared upload refuses source drift before any browser dispatch",
 });
 
 test("Browser prepared upload detects source drift after setFiles and does not replay", async () => {
+  await mkdir(path.join(projectRoot, "_work"), { recursive: true });
   const fixtureDir = await mkdtemp(path.join(projectRoot, "_work", "p1c-upload-post-drift-"));
   const fixturePath = path.join(fixtureDir, "probe.txt");
   try {

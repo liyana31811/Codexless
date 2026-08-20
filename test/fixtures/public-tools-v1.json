@@ -1,0 +1,1479 @@
+{
+  "server": {
+    "name": "codexless",
+    "title": "Codexless",
+    "version": "0.1.1-preview.3",
+    "description": "Local bridge that lets ChatGPT use accepted Codex-backed capabilities and explicitly escalate to Codex when needed."
+  },
+  "instructions": "Codexless Public Technical Preview. Public surface is deliberately small: authority-bounded project construction, Codex project context and Skills, a narrow existing-login Chrome Browser surface, and explicit metered Codex Agent delegation with visible consent/usage state. Browser exposes Reader plus the reviewed bounded Operator slice: dynamic confirmation-policy read, current viewport screenshot, prepared exact single-tab close/open/navigate/click/fill/download/upload, bounded scroll, and fixed Enter/Tab/Escape. Prepared refs are exact-action bindings rather than permission tokens; mutation uncertainty is fail-visible/no-replay; tab close revalidates one exact current tab and never batch-closes or blindly retries; upload file selection is not remote acceptance; download success requires a Chrome download event receipt. Arbitrary keys, raw selectors/JavaScript/coordinates, Computer Use, generic MCP calls/catalogs, raw host filesystem/process Workbench controls, and private household capabilities remain absent. Remote callers cannot widen Codex permission profiles, sandbox, approval policy, trusted roots, or network authority. Model-free work and metered Codex Agent work are separate lanes. Simple tasks do not require bootstrap. For non-simple local project, code, file, or tool work, prefer codex.project_context(cwd); use codex.skill_read only when a Skill is materially relevant, and revisit project context or that Skill if stuck.",
+  "tools": [
+    {
+      "name": "codex.command_exec",
+      "title": "Codex Model-Free Command",
+      "description": "Run one buffered argv command through official Codex App Server command/exec without a Codex model turn. Codexless resolves the authorized Codex permission profile locally; the caller cannot select a stronger profile or permission envelope. This model-free lane must not launch Codex CLI directly or through recognized shell/interpreter wrappers; formal metered Codex work must use codex.agent_start / codex.agent_send so Task Card, quota state, and lifecycle remain visible. A bare executable name may be resolved through host PATH on Windows without changing authority.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "minItems": 1,
+            "maxItems": 128,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 32768
+            },
+            "description": "argv vector passed to official Codex command/exec under the locally resolved Codex permission profile"
+          },
+          "cwd": {
+            "description": "Optional local working-directory context. cwd does not let the caller select or widen a permission profile.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "access": {
+            "default": "readOnly",
+            "description": "readOnly is the safe compatibility default. inherit uses the locally authorized/resolved Codex permission profile.",
+            "type": "string",
+            "enum": [
+              "inherit",
+              "readOnly"
+            ]
+          },
+          "timeoutMs": {
+            "default": 10000,
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 30000
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.project_context",
+      "title": "Codex Project Context",
+      "description": "Read a fresh Codex project bootstrap for cwd: workspace roots, effective permission profile, instruction sources, approval policy, sandbox projection, CLI version, and authoritative implicit Skill routing when stock prompt-input alignment is proven. The App Server path starts no turn; implicit routing fails closed without using the explicit Skill catalog, and the remote caller cannot choose a stronger permission profile.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "codex.account_preflight",
+      "title": "Codex Account / Quota Preflight",
+      "description": "Model-free account/quota preflight using a short-lived official Codex App Server client. Returns sanitized account presence/auth/plan and quota facts only; credentials are never returned and no model turn is started.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "codex.skill_list",
+      "title": "List Current Codex Skills",
+      "description": "List enabled Codex Skills for the current project context. This public tool is intentionally Skills-only; it does not expose Codex plugin, app, or generic MCP inventories.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "query": {
+            "default": "",
+            "type": "string",
+            "maxLength": 32768
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "codex.skill_read",
+      "title": "Read Current Codex Skill",
+      "description": "Resolve one Skill from Codex skills/list for cwd, then read exactly the Skill path returned by Codex. Exact name is preferred; a unique substring is accepted. The caller cannot supply an arbitrary filesystem path through this tool.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "codex.read_many",
+      "title": "Read Multiple Authorized Project Files",
+      "description": "Read several UTF-8 text files in one model-free call while preserving Codex project authority. Paths may be absolute or relative to cwd, but every resolved real path must remain inside the Codex trusted authority root for cwd. Returns bounded per-file text plus hashes and truncation metadata. It does not follow a junction/symlink outside the authorized root and does not use the broad raw host filesystem preview.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "minItems": 1,
+            "maxItems": 20,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            }
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "maxCharsPerFile": {
+            "default": 50000,
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 200000
+          },
+          "maxTotalChars": {
+            "default": 200000,
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 500000
+          }
+        },
+        "required": [
+          "paths"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "codex.precise_edit",
+      "title": "Guarded Precise Project Edit",
+      "description": "Apply one guarded exact-text edit to an existing UTF-8 project file without shell quoting. The service first resolves Codex authority for cwd, requires the file's real path to stay inside that trusted root, optionally checks the current SHA-256, requires expectedText to occur exactly expectedOccurrences times, rechecks the source hash immediately before writing, and then replaces only those exact occurrences. previewOnly validates and previews without writing. Any drift or mismatch fails closed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "expectedText": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200000
+          },
+          "replacementText": {
+            "type": "string",
+            "maxLength": 200000
+          },
+          "expectedOccurrences": {
+            "default": 1,
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "expectedSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{64}$"
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "previewOnly": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "expectedText",
+          "replacementText"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "codex.browser_status",
+      "title": "Check Existing-Login Chrome Browser",
+      "description": "Read-only Browser status probe. Check whether the current Codex Chrome Skill, node_repl body, and connected Chrome extension/backend are available for existing-login browser work. This starts no Codex model turn and inspects no page content. Website authentication is site-specific and is not inferred merely from extension connectivity.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "description": "Optional project cwd used only to resolve the current Codex Skill/MCP context; it is not browser navigation or a permission selector.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_confirmation_policy",
+      "title": "Read Codex Browser Confirmation Policy",
+      "description": "Read-only Browser authority helper. Dynamically read the current Codex Chrome Skill's maintained `confirmations` policy so the caller can apply the same default risk taxonomy instead of maintaining a parallel hard-coded permission table. The response also carries this product's task-level verbal-confirmation guidance: ask at most once for a bounded browser task when the Codex policy indicates confirmation is needed, unless the task materially expands or a higher-level rule requires action-time confirmation. This tool does not start a Codex model turn, grant permission, inspect a page, or mutate browser state.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "description": "Optional project cwd used only to resolve the current Codex Chrome Skill/runtime. It is not a permission selector.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "codex.browser_tabs",
+      "title": "List Existing Chrome Tabs",
+      "description": "Read-only Browser tab-list tool. List tabs already open in the user's connected Chrome session and return opaque tabRef values plus visible title/url/lastOpened. The Browser runtime automatically supplies the Codex Browser turn metadata required by the current Chrome runtime. This tool does not open, navigate, click, submit, or modify any tab.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "description": "Optional project cwd used to resolve the current Codex Browser runtime; it does not choose a browser profile or widen authority.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_read",
+      "title": "Read Existing Chrome Tab",
+      "description": "Read-only Browser DOM tool. Read a DOM snapshot from exactly one existing Chrome tabRef returned by codex.browser_tabs. The tab is claimed through the current Codex Chrome body only for read access; the Browser runtime does not navigate, click, type, submit, open a new tab, or expose raw provider tab IDs. The response includes the tab's current title/url so site-specific login redirects remain visible instead of being guessed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tabRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Opaque tab reference returned by codex.browser_tabs. Raw Chrome/provider tab IDs are not accepted."
+          },
+          "cwd": {
+            "description": "Optional project cwd used to resolve the current Codex Browser runtime; it is not a browser navigation target or permission selector.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "maxChars": {
+            "default": 80000,
+            "description": "Maximum DOM snapshot characters returned. The Browser runtime reports the original character count and whether truncation occurred.",
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 200000
+          }
+        },
+        "required": [
+          "tabRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_screenshot",
+      "title": "Screenshot Existing Chrome Tab",
+      "description": "Read-only Browser screenshot tool. Capture exactly the current visible viewport of one existing Chrome tabRef returned by codex.browser_tabs using the official tab.screenshot() API. The capture is viewport-only: callers cannot request full-page capture, crop rectangles, coordinates, selectors, JavaScript, viewport changes, or scrolling. The Browser runtime releases the claimed user tab after capture, validates a bounded JPEG/PNG payload from the official runtime, returns compact tab/image metadata as structured content, and returns the screenshot itself as MCP image content rather than base64 inside JSON. Use this when visual confirmation matters and a DOM snapshot alone is insufficient.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tabRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Opaque tab reference returned by codex.browser_tabs. Raw Chrome/provider tab IDs are not accepted."
+          },
+          "cwd": {
+            "description": "Optional project cwd used to resolve the current Codex Browser runtime; it is not a navigation target or permission selector.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "required": [
+          "tabRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_prepare_close_tab",
+      "title": "Prepare Exact Chrome Tab Close",
+      "description": "Browser lifecycle Preview. Prepare closing exactly one existing user-visible Chrome tab without closing or otherwise changing it. The tab must be identified only by an opaque tabRef returned by codex.browser_tabs; raw provider tab IDs, URLs, titles, indexes, selectors, and window targets are not accepted. The Browser runtime re-reads the current open-tab record and binds its provider identity, current URL, and current Workbench generation into a legacy-named single-use actionApprovalRef. Closing an existing tab can discard unsaved page input or other in-tab state, so the ref is only an exact-action binding and is not evidence of user approval. Apply codex.browser_confirmation_policy plus the current user-authored task context before execution; this tool itself is read-only and does not claim or close the tab.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tabRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Opaque tab reference returned by codex.browser_tabs. Raw Chrome/provider tab IDs, URLs, titles, and indexes are not accepted."
+          },
+          "cwd": {
+            "description": "Optional project cwd used only to resolve the current Codex Browser runtime; it is bound into the prepared action and cannot be changed at execution time.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "required": [
+          "tabRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_close_tab",
+      "title": "Execute Prepared Chrome Tab Close",
+      "description": "Browser lifecycle Preview. Close exactly one previously prepared existing Chrome tab using only the single-use actionApprovalRef returned by codex.browser_prepare_close_tab. The ref is not user-approval evidence. Before dispatch, apply codex.browser_confirmation_policy plus current user-authored task context; ordinary tabs may contain unsaved input, so preserve conservative confirmation semantics rather than assuming that close is harmless. The Browser runtime consumes the ref before dispatch, revalidates the same Workbench generation, provider identity, and current URL, claims that exact current open-tab object, calls the official Chrome Tab.close() exactly once, and then removes the Browser runtime's local tabRef/provider mapping after confirmed success. No raw provider id, tabRef, URL, title, index, window target, selector, JavaScript, reload/back/focus action, or replacement target is accepted at execution time. If the close dispatch result is uncertain, the Browser runtime fails visibly and never auto-retries the close.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "actionApprovalRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Legacy-named single-use exact-action reference returned by codex.browser_prepare_close_tab. It binds one exact tab close but does not itself prove user approval."
+          }
+        },
+        "required": [
+          "actionApprovalRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_prepare_open_tab",
+      "title": "Prepare Exact Chrome New Tab",
+      "description": "Browser Operate Preview. Prepare opening exactly one new Chrome tab to one explicit http(s) URL without creating or navigating any tab. When the user goal is simply to reach/read a page and the exact destination is already reliably available from Browser-derived evidence, this direct route is preferred over simulating an intermediate click; do not guess route patterns. The exact normalized destination is stored in a legacy-named single-use actionApprovalRef. That ref is only an exact-action binding and is not evidence of user approval. Apply codex.browser_confirmation_policy plus current user-authored task context; do not ask for confirmation merely because a prepared ref exists. No existing tab, selector, JavaScript, click, fill, or scroll target is accepted.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192,
+            "description": "Exact destination URL. The Browser runtime accepts only explicit http:// or https:// URLs and binds the normalized URL into the prepared action."
+          },
+          "cwd": {
+            "description": "Optional project cwd used only to resolve the current Codex Browser runtime; it is bound into the prepared action and cannot be changed at execution time.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_open_tab",
+      "title": "Execute Prepared Chrome New Tab",
+      "description": "Browser Operate Preview. Create exactly one new Chrome tab for a previously prepared explicit http(s) URL. The action receives only the single-use actionApprovalRef, uses official browser.tabs.new() + tab.goto(), reads back title/url/DOM, and finalizes the new tab as a user-visible deliverable. Call codex.browser_tabs afterward to obtain its normal opaque tabRef. Never auto-retry an uncertain new-tab result.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "actionApprovalRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Legacy-named single-use exact-action reference returned by codex.browser_prepare_open_tab. It binds the destination but does not itself prove user approval; apply the current Browser confirmation policy and task context before dispatch."
+          }
+        },
+        "required": [
+          "actionApprovalRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_scroll",
+      "title": "Scroll Existing Chrome Tab",
+      "description": "Browser Operate Preview. Scroll exactly one existing Chrome tab up or down by one bounded small/page step using an official Playwright keypress targeted at the fixed document body, then perform a separate read-only DOM readback. Page steps use PageDown/PageUp; small steps use a bounded ArrowDown/ArrowUp sequence. This intentionally avoids the Chrome Input.synthesizeScrollGesture path that can time out on real pages such as Reddit. The scroll receipt is independent from the readback: once the keypress scroll returns successfully, a later DOM-read failure is reported as readbackStatus=unavailable rather than turning the confirmed scroll into an uncertain mutation. No caller-supplied selectors, coordinates, node ids, or keys are accepted. It never clicks, types text, submits, or requests a new URL, but scrolling may naturally trigger lazy-loaded page content or site-side network activity.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tabRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Opaque tab reference returned by codex.browser_tabs."
+          },
+          "direction": {
+            "default": "down",
+            "description": "Scroll direction.",
+            "type": "string",
+            "enum": [
+              "down",
+              "up"
+            ]
+          },
+          "amount": {
+            "default": "page",
+            "description": "Bounded scroll step: small uses a fixed ArrowDown sequence; page uses PageDown/PageUp.",
+            "type": "string",
+            "enum": [
+              "small",
+              "page"
+            ]
+          },
+          "cwd": {
+            "description": "Optional project cwd used only to resolve the current Codex Browser runtime.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "maxChars": {
+            "default": 80000,
+            "description": "Maximum fresh DOM snapshot characters returned after the scroll.",
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 200000
+          }
+        },
+        "required": [
+          "tabRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_keypress",
+      "title": "Press Fixed Key in Existing Chrome Tab",
+      "description": "Browser Operate Preview. Press exactly one fixed Enter, Tab, or Escape key at the currently focused element in one existing Chrome tabRef using the official Chrome DOM CUA keypress API, then perform a separate read-only DOM readback. Callers cannot supply arbitrary key names, text, modifiers, repeats, selectors, coordinates, node ids, or JavaScript. Use an existing exact click/fill first when a specific control must be focused. Tab and Escape are ordinary bounded UI controls; Enter can activate or submit the focused control, so apply codex.browser_confirmation_policy plus the current task context before calling and ask only when that exact bounded task/action class requires confirmation. Once the keypress returns successfully, a later readback failure does not make the keypress uncertain and The Browser runtime never repeats it automatically.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tabRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Opaque tab reference returned by codex.browser_tabs."
+          },
+          "key": {
+            "type": "string",
+            "enum": [
+              "Enter",
+              "Tab",
+              "Escape"
+            ],
+            "description": "Exactly one supported fixed key. Arbitrary keys, text and modifiers are not accepted."
+          },
+          "cwd": {
+            "description": "Optional project cwd used only to resolve the current Codex Browser runtime.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "maxChars": {
+            "default": 80000,
+            "description": "Maximum fresh DOM snapshot characters returned after the keypress.",
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 200000
+          }
+        },
+        "required": [
+          "tabRef",
+          "key"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_prepare_navigate",
+      "title": "Prepare Exact Chrome Navigation",
+      "description": "Browser Operate Preview. Prepare one direct navigation of exactly one existing Chrome tab to one explicit http(s) URL without dispatching it. When the user goal is simply to reach/read another page and the exact destination is already reliably available from Browser-derived evidence, this is the preferred path over clicking an intermediate UI element; do not guess route patterns. The tab must come from codex.browser_tabs. Preparing binds the current tab URL plus the exact destination into a legacy-named single-use actionApprovalRef and does not navigate, click, type, submit, open a new tab, or accept JavaScript/selectors. The ref is an exact-action binding, not a permission token. Apply codex.browser_confirmation_policy plus current user-authored task context; ordinary navigation must not trigger a redundant confirmation just because it uses prepare/execute.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tabRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Opaque tab reference returned by codex.browser_tabs. Raw Chrome/provider tab IDs are not accepted."
+          },
+          "url": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192,
+            "description": "Exact destination URL. The Browser runtime accepts only explicit http:// or https:// URLs and binds the normalized URL into the prepared action."
+          },
+          "cwd": {
+            "description": "Optional project cwd used only to resolve the current Codex Browser runtime; it is bound into the prepared action and cannot be changed at execution time.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "required": [
+          "tabRef",
+          "url"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_navigate",
+      "title": "Execute Prepared Chrome Navigation",
+      "description": "Browser Operate Preview. Execute exactly one previously prepared existing-tab navigation identified only by a legacy-named single-use actionApprovalRef. The ref is not user-approval evidence. Before dispatch, the caller applies codex.browser_confirmation_policy plus current user-authored task context and asks only when that policy/task actually requires confirmation. The Browser runtime consumes the ref, revalidates the same current tab URL, calls the official Chrome tab.goto() for the bound http(s) destination, reads back the resulting URL/title/DOM, releases the claimed user tab, and never auto-retries an uncertain navigation. No tab, URL, selector, JavaScript, click, fill, scroll, or permission fields are accepted at execution time.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "actionApprovalRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Legacy-named single-use exact-action reference returned by codex.browser_prepare_navigate. It binds the exact navigation but is not itself user-approval evidence; apply the current Browser confirmation policy and task context before dispatch."
+          }
+        },
+        "required": [
+          "actionApprovalRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_prepare_click",
+      "title": "Prepare Exact Chrome Click",
+      "description": "Browser Operate Preview. Resolve exactly one visible enabled element in an existing Chrome tab and prepare one single click without dispatching it. Do not use click merely to imitate human navigation when the actual goal is page arrival and an exact destination URL is already reliably available from Browser-derived evidence; prefer direct navigate/open-tab in that case. Preferred targeting remains accessible role + exact accessible name. When a page repeats the same role/name control for many local items, role/name may additionally use one exact visible http(s) scopeUrl observed from the current Browser DOM: the Browser runtime finds exactly one visible link with that resolved URL, walks only a bounded server-fixed ancestor range, and selects the nearest ancestor containing exactly one matching local control. For real sites whose clickable cards expose only ordinary DOM text, callers may instead provide exact visible text. Exact-text preparation filters visibility candidate-by-candidate (so hidden duplicates do not create false ambiguity) and then requires one stable server-derived binding: link/button role, bounded onclick-property ancestor, or a bounded `.thread-card[data-thread-id]` ancestor whose exact thread id is stored and revalidated before execution. Caller input still exposes no CSS selector/JavaScript/coordinates/node ids/item indexes/ancestor depth; callers also cannot supply the server-recognized class or thread id. Exact-text and role/name modes are mutually exclusive; scopeUrl belongs only to role/name mode. The target tab must come from codex.browser_tabs. This tool is read-only, reuses the existing-login Chrome body, and returns a legacy-named single-use actionApprovalRef plus the exact target descriptor. The ref is only an exact-action binding. Use codex.browser_confirmation_policy and current task context to decide whether this click needs user confirmation; do not ask merely because the action is a click.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tabRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Opaque tab reference returned by codex.browser_tabs. Raw Chrome/provider tab IDs are not accepted."
+          },
+          "role": {
+            "description": "Accessible role observed in current Browser DOM state, for example button or link. Use together with name, and omit text. Role/name remains the preferred semantic target mode.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "name": {
+            "description": "Exact accessible name for role mode. Use together with role, and omit text. The target must resolve to exactly one visible enabled element, either globally or inside the optional scopeUrl.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "scopeUrl": {
+            "description": "Optional exact visible http(s) link URL observed from the current Browser DOM, used only with role+name to bind one repeated local control to the nearest bounded ancestor scope. This is not a selector, node id, item index, or permission token.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "text": {
+            "description": "Exact visible text fallback for clickable cards or other elements that expose no useful accessibility role. Use text alone without role/name; the Browser runtime uses exact getByText matching and still requires exactly one visible enabled target.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "cwd": {
+            "description": "Optional project cwd used only to resolve the current Codex Browser runtime; it is bound into the prepared action and cannot be changed at execution time.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "required": [
+          "tabRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_click",
+      "title": "Execute Prepared Chrome Click",
+      "description": "Browser Operate Preview. Execute exactly one previously prepared Chrome click identified only by a legacy-named single-use actionApprovalRef. The ref is not permission evidence. Before dispatch, apply codex.browser_confirmation_policy plus current user-authored task context: ordinary navigation/expansion clicks should not cause redundant prompts, while policy-covered external-side-effect clicks use the task-level verbal confirmation flow unless a higher-level rule requires otherwise. The Browser runtime consumes the action ref, revalidates the same tab URL plus the same unique visible enabled target (role/name or exact visible text) immediately before clicking, reads back current page state, releases the claimed user tab, and never auto-retries an uncertain click result. No tab, URL, selector, target text, role/name, coordinates, JavaScript, double-click, typing, scroll, navigation, or permission fields are accepted here; execution receives only the prepared opaque ref.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "actionApprovalRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Legacy-named single-use exact-action reference returned by codex.browser_prepare_click. It binds the exact target but is not itself user-approval evidence; apply the current Browser confirmation policy and task context before dispatch."
+          }
+        },
+        "required": [
+          "actionApprovalRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_prepare_download",
+      "title": "Prepare Exact Chrome Download",
+      "description": "Browser Operate Preview. Resolve exactly one visible enabled semantic download target in an existing Chrome tab and prepare one local download without clicking it. Targeting uses the same narrow role+exact accessible name or exact visible-text binding as prepared click; callers cannot provide CSS selectors, JavaScript, coordinates, node ids, or a local destination path. The tab must come from codex.browser_tabs. Preparing returns a legacy-named single-use actionApprovalRef that binds the current tab URL and exact target but is not permission evidence. Apply codex.browser_confirmation_policy plus current task context before dispatch; preparing does not create a local file.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tabRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Opaque tab reference returned by codex.browser_tabs."
+          },
+          "role": {
+            "description": "Accessible role observed in current Browser DOM state, normally link or button. Use together with name and omit text.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "name": {
+            "description": "Exact accessible name for role mode. The target must resolve to exactly one visible enabled element.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "text": {
+            "description": "Exact visible-text fallback when the download control exposes no useful accessible role/name. Use text alone without role/name.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "cwd": {
+            "description": "Optional project cwd used only to resolve the current Codex Browser runtime; it is bound into the prepared action.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "required": [
+          "tabRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_download",
+      "title": "Execute Prepared Chrome Download",
+      "description": "Browser Operate Preview. Execute exactly one prepared semantic download target and wait for the official Chrome Playwright download event. The execution receives only the single-use actionApprovalRef, revalidates the same tab URL and exact target before clicking, and never accepts a caller-supplied filesystem destination. When the runtime exposes download.path(), the Browser runtime returns Chrome's browser-managed local download path; it never opens, parses, executes, uploads, or trusts the downloaded file. If dispatch may have happened but no reliable download receipt returns, the result is fail-visible and must not be auto-retried because a local file may already exist.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "actionApprovalRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Legacy-named single-use exact-action reference returned by codex.browser_prepare_download. It binds the exact target but is not user-approval evidence."
+          }
+        },
+        "required": [
+          "actionApprovalRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_prepare_upload",
+      "title": "Prepare Exact Chrome Upload",
+      "description": "Browser Operate Preview. Prepare one authority-bounded local file for one exact semantic file-input/upload target in an existing Chrome tab. The local file path is resolved through the Browser runtime's Codex authority layer and its real path must remain inside the current trusted authority root; files above 100 MiB are refused in this Preview, and canonical path + byte length + SHA-256 are bound into the prepared record. This tool must not become an arbitrary host-file exfiltration path. Targeting uses role+exact accessible name or exact visible text, with no caller CSS selector, JavaScript, coordinates, node ids, or native-picker automation. The returned actionApprovalRef binds the current tab URL, exact target, and canonical authorized file. Preparing is read-only with respect to the webpage and does not expose file contents to it.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tabRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Opaque tab reference returned by codex.browser_tabs."
+          },
+          "role": {
+            "description": "Accessible role for the current file input/upload control, commonly button. Use with name and omit text.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "name": {
+            "description": "Exact accessible name for role mode. The target must resolve to exactly one visible enabled element.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "text": {
+            "description": "Exact visible-text fallback for an upload control that exposes no useful role/name. Use text alone without role/name.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "filePath": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768,
+            "description": "One existing local file path. The Browser runtime resolves it through Codex authority and refuses any real path outside the current trusted authority root."
+          },
+          "cwd": {
+            "description": "Optional project cwd used to resolve both Browser runtime context and Codex file authority; it is not a permission selector.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "required": [
+          "tabRef",
+          "filePath"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_upload",
+      "title": "Execute Prepared Chrome Upload",
+      "description": "Browser Operate Preview. Execute one prepared authority-bounded local file handoff through the official Chrome filechooser/setFiles flow. Execution accepts only the single-use actionApprovalRef, revalidates the same tab URL and exact semantic target, then waits for a filechooser before applying the server-bound canonical file path. It never accepts an arbitrary local path at execution time. The Browser runtime revalidates the prepared canonical path + byte length + SHA-256 immediately before Browser dispatch and again after setFiles returns; this detects ordinary source drift but is not an OS write lock against an actively malicious concurrent writer. setFiles returning proves browser-side file selection/change delivery, not remote server acceptance; stronger upload-complete claims require page-state evidence. Uploading personal or sensitive files follows codex.browser_confirmation_policy and the user's bounded task authorization. Uncertain upload results are fail-visible and never auto-retried.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "actionApprovalRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Legacy-named single-use exact-action reference returned by codex.browser_prepare_upload. It binds the exact target and authorized file but is not user-approval evidence."
+          }
+        },
+        "required": [
+          "actionApprovalRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_prepare_fill",
+      "title": "Prepare Exact Chrome Fill",
+      "description": "Browser Operate Preview. Prepare one exact text fill into an existing Chrome textbox/searchbox without changing the page. Preferred targeting is exact accessible role+name; when a real page exposes no accessible name, callers may instead provide either the exact visible placeholder or one exact visible http(s) scopeUrl observed from the current Browser DOM. scopeUrl mode is for locally unique unnamed editors inside repeated items: the Browser runtime finds exactly one visible link with that URL, walks only a bounded server-fixed ancestor range, and selects the nearest ancestor containing exactly one visible textbox/searchbox of the requested role. Name, placeholder, and scopeUrl modes are mutually exclusive. Callers still cannot provide selectors, node ids, item indexes, ancestor depth, JavaScript, or coordinates. The exact text is stored server-side in a legacy-named single-use actionApprovalRef. Preparing validates the current tab/URL and target but does not fill, click, press Enter, navigate, or submit. The ref is not permission evidence. Apply codex.browser_confirmation_policy plus task context: ordinary non-sensitive typing should not trigger a redundant prompt merely because it is Fill, while sensitive-data transmission or other policy-covered cases must follow the task confirmation rule before typing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tabRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Opaque tab reference returned by codex.browser_tabs. Raw Chrome/provider tab IDs are not accepted."
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "textbox",
+              "searchbox"
+            ],
+            "description": "Text-entry role observed in current Browser DOM state. Browser fill intentionally supports only textbox/searchbox."
+          },
+          "name": {
+            "description": "Exact accessible name for preferred role/name mode. Supply name or placeholder, never both.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "placeholder": {
+            "description": "Exact placeholder fallback for a textbox/searchbox that exposes no useful accessible name. Supply placeholder, name, or scopeUrl; never more than one target mode.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "scopeUrl": {
+            "description": "Optional exact visible http(s) link URL observed from the current Browser DOM, used instead of name/placeholder to bind one locally unique unnamed textbox/searchbox to the nearest bounded ancestor scope. This is not a selector, node id, item index, or permission token.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 20000,
+            "description": "Exact text to bind into the prepared action. No Enter, click, navigation, or submit is implied."
+          },
+          "cwd": {
+            "description": "Optional project cwd used only to resolve the current Codex Browser runtime; it is bound into the prepared action and cannot be changed at execution time.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        },
+        "required": [
+          "tabRef",
+          "role",
+          "text"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.browser_fill",
+      "title": "Execute Prepared Chrome Fill",
+      "description": "Browser Operate Preview. Execute exactly one previously prepared textbox/searchbox fill identified only by a legacy-named single-use actionApprovalRef. The ref is not permission evidence. Before dispatch, apply codex.browser_confirmation_policy plus current user-authored task context; ask only when the policy/task actually requires confirmation, and use the task-level verbal flow rather than per-action prompting unless a higher-level rule requires otherwise. The Browser runtime consumes the action ref, revalidates the same tab URL plus unique visible enabled target, fills only the bound text, then re-resolves the same semantic target from fresh DOM before verification so rich editors may replace their activation shell without causing a stale-locator false negative. Verification stays narrow: exact fresh target value/rendered text, exactly one visible same-role target, or exactly one visible editable value inside a bounded local ancestor scope. If the first dispatch only activates a replacement editor, the Browser runtime may perform one internal repair fill only when the fresh bound target is proven blank and the exact prepared text is absent from fresh DOM. The first Browser execution then fully finalizes/releases its claimed tab before the Browser runtime starts one separate fresh Browser execution against the same provider tab and re-resolves the same bound role/name or role/placeholder target; this mirrors a true second interaction without requiring the caller to replay the mutation. Partial/ambiguous states, URL drift, failed fresh execution, or already-present text never auto-repair. Deterministic empty/no-write returns BROWSER_FILL_NOT_APPLIED; text-visible-but-bound-target-unproven returns BROWSER_FILL_VERIFICATION_UNAVAILABLE; true mutation uncertainty remains BROWSER_FILL_RESULT_UNCERTAIN. Multiple matches remain fail-closed and arbitrary matching page text is never accepted as proof. It then reads back current page state and releases the claimed user tab. It does not click, press Enter, navigate, or submit.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "actionApprovalRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Legacy-named single-use exact-action reference returned by codex.browser_prepare_fill. It binds the exact target/text but is not itself user-approval evidence; apply the current Browser confirmation policy and task context before dispatch."
+          }
+        },
+        "required": [
+          "actionApprovalRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.model_list",
+      "title": "List Codex Models",
+      "description": "Model-free read of the current Codex App Server model catalog. Use it when a user explicitly cares which model to run. The catalog reports current model ids/capabilities/defaults but does not provide price data, so Codexless must not infer cheapest from names alone.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "includeHidden": {
+            "type": "boolean"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "codex.agent_start",
+      "title": "Start Codex Agent",
+      "description": "Experimental Preview. Prepare one formal Codex agent thread/turn under Codexless's locally resolved Codex authority. Local metered consent mode is always; when set to always, every unapproved logical start returns consent_required and quota context without starting a turn. requestId is a caller-stable idempotency key and MUST be reused if the same start is retried after an uncertain response. A returned consentRef identifies the prepared task but is never proof of approval: replaying it through this public tool cannot start Codex work. Approval normally occurs through the Rich Task Card; when the Host cannot render that UI, codex.agent_card_render returns a Portable Card and an explicit user Yes/No may be bound to that exact prepared task through codex.agent_commit / codex.agent_decline. model is optional; omit it to preserve Codex's current default routing. reasoningEffort is also optional and is validated against the current codex.model_list entry for the effective model rather than a hard-coded global enum. The caller cannot choose permission profile, sandbox, approval policy, roots, or network authority.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200000
+          },
+          "requestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Stable caller-generated idempotency key. Reuse this exact value for retries of the same logical start."
+          },
+          "cwd": {
+            "description": "Optional execution-directory context. Codexless resolves authority locally for this cwd; cwd is not a permission selector.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "model": {
+            "description": "Optional exact model id from codex.model_list. Omit to use Codex's current default model routing.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "reasoningEffort": {
+            "description": "Optional reasoning effort supported by the effective model's current codex.model_list entry. Runtime validation is per-model; no global effort enum is hard-coded.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "consentRef": {
+            "description": "Legacy compatibility field. It identifies an already prepared task only; supplying or replaying it never authorizes metered Codex work. Approval must occur through the server-side Task Card commit path.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "required": [
+          "prompt",
+          "requestId"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "_meta": {
+        "openai/toolInvocation/invoking": "Preparing Codex task…",
+        "openai/toolInvocation/invoked": "Codex task ready."
+      }
+    },
+    {
+      "name": "codex.agent_card_render",
+      "title": "Render Prepared Codex Task Card",
+      "description": "Read-only render step for a prepared metered Codex start/send. Call this only after codex.agent_start or codex.agent_send returns consent_required. It does not start or continue Codex work; it re-reads the server-bound prepared record. Rich-UI Hosts can mount the Codex Task Card from outputTemplate; Hosts that cannot render that UI still receive the same confirmation as a framed Portable Card in ordinary MCP text content. Rich Card buttons use the card capability path; Portable Card Yes/No decisions bind the exact prepared task through codex.agent_commit / codex.agent_decline.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "consentRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "required": [
+          "consentRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "ui": {
+          "resourceUri": "ui://codexless/codex-task-card-v13.html"
+        },
+        "openai/outputTemplate": "ui://codexless/codex-task-card-v13.html",
+        "openai/toolInvocation/invoking": "Opening Codex confirmation…",
+        "openai/toolInvocation/invoked": "Codex confirmation ready."
+      }
+    },
+    {
+      "name": "codex.agent_card_state",
+      "title": "Read Codex Task Card State",
+      "description": "App-only read-only state endpoint for one already mounted Codex Task Card. New cards use opaque taskRef so state remains task-specific even without a metered consentRef; consentRef remains a legacy in-runtime fallback. Persisted terminal snapshots survive Codexless restarts. Persisted non-terminal tasks recover as LOST/uncertain and are never replayed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "taskRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "consentRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "ui": {
+          "visibility": [
+            "app"
+          ]
+        }
+      }
+    },
+    {
+      "name": "codex.agent_show",
+      "title": "Show Codex Agent",
+      "description": "Experimental Preview. Read the bounded operational state of one Codexless-owned Codex agent by opaque agentRef. Returns status, sendability, minimal pending-approval summary, final result, and a bounded event tail; it does not duplicate the Codex transcript.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "agentRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "afterSeq": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "agentRef"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "codex.agent_send",
+      "title": "Continue Codex Agent",
+      "description": "Experimental Preview. Prepare one exact Codexless-owned Codex agent follow-up by opaque agentRef. The caller must deliberately choose the target agentRef; Codexless has no implicit \"most recent agent\" routing. Local metered consent mode is always; when set to always, every unapproved logical send returns consent_required and quota context without starting a turn. requestId is a caller-stable idempotency key and MUST be reused if the same send is retried after an uncertain response. A returned consentRef identifies the prepared follow-up but is never proof of approval: replaying it through this public tool cannot start Codex work. Approval normally occurs through the Rich Task Card; when the Host cannot render that UI, codex.agent_card_render returns a Portable Card and an explicit user Yes/No may be bound to that exact prepared follow-up through codex.agent_commit / codex.agent_decline. model is optional and may override the model for this turn and subsequent turns. reasoningEffort is an optional per-turn override validated against the current codex.model_list entry for the effective model. Active turns, stale parent turns, and pending approvals fail visibly; Codexless never auto-replays an accepted or uncertain send.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "agentRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200000
+          },
+          "requestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Stable caller-generated idempotency key. Reuse this exact value for retries of the same logical send."
+          },
+          "model": {
+            "description": "Optional exact model id from codex.model_list. Omit to keep the current Codex thread model.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "reasoningEffort": {
+            "description": "Optional per-turn reasoning effort supported by the effective model's current codex.model_list entry. Runtime validation is per-model; no global effort enum is hard-coded.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "consentRef": {
+            "description": "Legacy compatibility field. It identifies an already prepared follow-up only; supplying or replaying it never authorizes metered Codex work. Approval must occur through the server-side Task Card commit path.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "required": [
+          "agentRef",
+          "message",
+          "requestId"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "_meta": {
+        "openai/toolInvocation/invoking": "Preparing Codex follow-up…",
+        "openai/toolInvocation/invoked": "Codex follow-up ready."
+      }
+    },
+    {
+      "name": "codex.agent_decline",
+      "title": "Decline Prepared Metered Codex Task",
+      "description": "Decline exactly one prepared Codex task without starting Codex work. Rich Task Card callers use the opaque consentRef. Portable Card callers use only the exact short taskId carried in structured content, and should call this only after the user explicitly replies No to that displayed Portable Card. After decline the prepared task is terminal and cannot be revived by a cached commit.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "consentRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "taskId": {
+            "type": "string",
+            "pattern": "^C-[A-F0-9]{10}$"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "codex.agent_commit",
+      "title": "Commit Prepared Metered Codex Task",
+      "description": "Commit exactly one previously prepared metered Codex start/send. Rich Task Card callers must supply both consentRef and the separate card-only commitToken. Portable Card callers supply only the exact short taskId carried in structured content, and should call this only after the user explicitly replies Yes to that displayed Portable Card. In either mode Codexless retrieves the bound requestId, prompt/message, cwd, model, subject and authority from server memory; callers cannot replace them at commit time. Repeated exact commits never create a second logical turn.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "consentRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "commitToken": {
+            "description": "Rich-Task-Card-only capability token delivered outside model-visible structured content. It must match the exact prepared task.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "taskId": {
+            "description": "Exact short task ID from the Portable Card structured content. Use only after an explicit user Yes for that displayed task.",
+            "type": "string",
+            "pattern": "^C-[A-F0-9]{10}$"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.agent_approve",
+      "title": "Approve Pending Codex Agent Action",
+      "description": "Experimental Preview. Resolve exactly the currently pending Codex approval identified by approvalRequestId using the narrow one-turn approval response defined by Codex. Call only after the user explicitly approves that exact pending request. requestId is a caller-stable idempotency key and must be reused for retries of the same logical approval. Codexless never grants permissions beyond the permission subset requested by Codex.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "agentRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "approvalRequestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Exact pendingApproval.requestId from codex.agent_show/start/send."
+          },
+          "requestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Stable caller-generated idempotency key for this logical approval."
+          }
+        },
+        "required": [
+          "agentRef",
+          "approvalRequestId",
+          "requestId"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.agent_reject",
+      "title": "Reject Pending Codex Agent Action",
+      "description": "Experimental Preview. Reject exactly the currently pending Codex approval identified by approvalRequestId without widening permissions. Command/file approvals use Codex's decline response; permission requests grant an empty permission subset for the current turn. requestId is a caller-stable idempotency key and must be reused for retries of the same logical rejection.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "agentRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "approvalRequestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Exact pendingApproval.requestId from codex.agent_show/start/send."
+          },
+          "requestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Stable caller-generated idempotency key for this logical rejection."
+          }
+        },
+        "required": [
+          "agentRef",
+          "approvalRequestId",
+          "requestId"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "codex.agent_cancel",
+      "title": "Cancel Active Codex Agent Turn",
+      "description": "Experimental Preview. Interrupt the currently active formal Codex turn through official turn/interrupt. This does not delete the thread or replay work. requestId is a caller-stable idempotency key and must be reused for retries of the same logical cancel.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "agentRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "expectedTurnId": {
+            "description": "Optional task-bound turn id. When supplied, cancel fails closed if the agent has advanced to another turn.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "requestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Stable caller-generated idempotency key for this logical cancel."
+          }
+        },
+        "required": [
+          "agentRef",
+          "requestId"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    }
+  ]
+}
