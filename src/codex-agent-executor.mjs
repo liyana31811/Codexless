@@ -300,10 +300,6 @@ export class CodexAgentExecutor {
     const duplicate = this.#duplicateRequest("start", clientRequestId, requestHash, "accepted start mapping is no longer available");
     if (duplicate) return duplicate;
 
-    const validatedReasoningModel = requestedReasoningEffort
-      ? (await this.#validateReasoningEffort({ requestedModel, currentModel: null, requestedReasoningEffort })).effectiveModel
-      : null;
-
     const agentRef = `agent_${randomUUID()}`;
     const state = {
       agentRef,
@@ -315,6 +311,9 @@ export class CodexAgentExecutor {
     if (clientRequestId) this.#requestIndex.set(requestKey("start", clientRequestId), { agentRef, requestHash });
 
     try {
+      const validatedReasoningModel = requestedReasoningEffort
+        ? (await this.#validateReasoningEffort({ requestedModel, currentModel: null, requestedReasoningEffort })).effectiveModel
+        : null;
       const threadParams = { cwd: effectiveCwd, ephemeral: false };
       if (permissionProfile) threadParams.permissions = permissionProfile;
       if (requestedModel || validatedReasoningModel) threadParams.model = requestedModel ?? validatedReasoningModel;
@@ -363,6 +362,7 @@ export class CodexAgentExecutor {
   }
 
   async #startTurn(state, { text, clientUserMessageId, model = null, reasoningEffort = null }) {
+    state.previousTurnId = state.currentTurnId;
     state.currentTurnId = null;
     state.latestTurnStatus = null;
     state.latestTokenUsage = null;
@@ -511,6 +511,9 @@ export class CodexAgentExecutor {
       requestedReasoningEffort,
     });
 
+    const duplicateAfterPreparation = this.#duplicateRequest("send", clientRequestId, requestHash, "accepted send mapping is no longer available");
+    if (duplicateAfterPreparation) return duplicateAfterPreparation;
+    if (state.status !== "idle") throw new Error(`agent ${agentRef} is not idle: ${state.status}`);
     if (clientRequestId) this.#requestIndex.set(requestKey("send", clientRequestId), { agentRef, requestHash });
     return this.#startTurn(state, {
       text: message,
@@ -546,7 +549,7 @@ export class CodexAgentExecutor {
 
   #applyTurnObservation(state, observation) {
     const turnId = observation.turnId ?? observation.turn?.id ?? null;
-    if (turnId && state.currentTurnId && turnId !== state.currentTurnId) {
+    if (turnId && ((state.status === "running" && !state.currentTurnId && observation.source) || state.status === "unknown" && !state.currentTurnId && observation.source && (turnId === state.previousTurnId || state.events.some((event) => event.type === "turn/accepted" && event.turnId === turnId)) || state.currentTurnId && turnId !== state.currentTurnId)) {
       this.#appendEvent(state, {
         type: "stale-turn-notification-ignored",
         method: observation.method ?? observation.source ?? "observation",
@@ -554,7 +557,7 @@ export class CodexAgentExecutor {
         currentTurnId: state.currentTurnId,
         at: Date.now(),
       });
-      return;
+      return false;
     }
     if (turnId && !state.currentTurnId) state.currentTurnId = turnId;
     if (TERMINAL_TURN_STATUSES.has(state.latestTurnStatus)) return;
@@ -621,12 +624,7 @@ export class CodexAgentExecutor {
     const state = this.#findAgent({ threadId, turnId, requestId });
     if (!state) return;
 
-    if (["turn/started", "turn/completed"].includes(message.method) && turnId && state.currentTurnId && turnId !== state.currentTurnId) {
-      this.#applyTurnObservation(state, { source: message.method, method: message.method, turnId });
-      return;
-    }
-    if (turnId && !state.currentTurnId) state.currentTurnId = turnId;
-    if (message.method === "thread/tokenUsage/updated" && message?.params?.tokenUsage) state.latestTokenUsage = structuredClone(message.params.tokenUsage);
+    if (message.method === "thread/tokenUsage/updated" && message?.params?.tokenUsage && (!turnId || state.currentTurnId === turnId || state.status !== "running" && turnId !== state.previousTurnId && !state.events.some((event) => event.type === "turn/accepted" && event.turnId === turnId))) state.latestTokenUsage = structuredClone(message.params.tokenUsage);
     if (message.method === "item/started" && message?.params?.item?.id) {
       state.approvalItems.set(message.params.item.id, structuredClone(message.params.item));
       if (state.approvalItems.size > 32) state.approvalItems.delete(state.approvalItems.keys().next().value);
@@ -637,13 +635,13 @@ export class CodexAgentExecutor {
         this.#clearPending(state);
       }
     } else if (message.method === "turn/started" || message.method === "turn/completed") {
-      this.#applyTurnObservation(state, {
+      if (this.#applyTurnObservation(state, {
         source: message.method,
         method: message.method,
         turnId,
         status: turn?.status ?? (message.method === "turn/completed" ? "completed" : "inProgress"),
         turn,
-      });
+      }) === false) return;
     } else if (message.method === "thread/status/changed") {
       this.#applyTurnObservation(state, { statusType: message?.params?.status?.type });
     }
@@ -658,10 +656,10 @@ export class CodexAgentExecutor {
       request.reject({ code: -32602, message: `Agent server request could not be mapped to an active agent: ${request.method}` });
       return;
     }
-    if (turnId && !state.currentTurnId) state.currentTurnId = turnId;
+    if (turnId && !state.currentTurnId && state.status !== "running") state.currentTurnId = turnId;
     if (!state.latestTurnStatus) state.latestTurnStatus = "inProgress";
-    if (state.pendingApproval) {
-      request.reject({ code: -32000, message: `Agent already has a pending server request: ${String(state.pendingApproval.requestId)}` });
+    if (state.pendingApproval || turnId && !state.currentTurnId && ((state.status === "running" && turnId === state.previousTurnId) || state.status === "unknown" && (turnId === state.previousTurnId || state.events.some((event) => event.type === "turn/accepted" && event.turnId === turnId)))) {
+      request.reject({ code: -32000, message: state.pendingApproval ? `Agent already has a pending server request: ${String(state.pendingApproval.requestId)}` : "Agent server request belongs to a stale turn" });
       return;
     }
 
@@ -684,10 +682,10 @@ export class CodexAgentExecutor {
 
   async #ensureResourceReceipt(state) {
     if (!state?.currentTurnId || !TERMINAL_TURN_STATUSES.has(state.latestTurnStatus) || state.resourceReceipt?.turnId === state.currentTurnId) return state?.resourceReceipt ?? null;
-    if (state.resourceReceiptPromise) return await state.resourceReceiptPromise;
+    if (state.resourceReceiptPromise?.turnId === state.currentTurnId) return await state.resourceReceiptPromise;
 
     const turnId = state.currentTurnId;
-    state.resourceReceiptPromise = (async () => {
+    const receiptPromise = (async () => {
       let quotaSnapshot;
       try {
         quotaSnapshot = this.#resourceSnapshotProvider
@@ -702,12 +700,15 @@ export class CodexAgentExecutor {
         tokenUsage: state.latestTokenUsage,
         quotaSnapshot,
       });
+      if (state.currentTurnId !== turnId) return receipt;
       state.resourceReceipt = receipt;
       this.#appendEvent(state, { type: "resource-receipt/ready", turnId, at: Date.now() });
       return receipt;
     })();
-    try { return await state.resourceReceiptPromise; }
-    finally { state.resourceReceiptPromise = null; }
+    state.resourceReceiptPromise = Object.assign(receiptPromise, { turnId });
+    return await receiptPromise.finally(() => {
+      if (state.resourceReceiptPromise === receiptPromise) state.resourceReceiptPromise = null;
+    });
   }
 
   #snapshot(state, afterSeq, missing = null) {

@@ -440,10 +440,7 @@ export function registerAgentPreviewTools(server, {
         return ledger.freeze(record, ledger.terminalTaskPayload(record, "failed", error));
       }
       if (startAction && snapshot?.agentRef) ledger.bindAgent(record, snapshot.agentRef, snapshot.turnId ?? null);
-      if (!startAction) {
-        record.turnId = snapshot.turnId ?? null;
-        if (record.agentRef) ledger.bindAgent(record, record.agentRef, record.turnId);
-      }
+      if (!startAction) ledger.bindAgent(record, record.agentRef, snapshot.turnId ?? null);
       const payload = publicTaskSnapshot(record, snapshot);
       if (TERMINAL_STATUSES.has(payload.status)) return ledger.freeze(record, payload);
       ledger.persist(record, "active", payload);
