@@ -10,6 +10,7 @@ import { AGENT_TASK_CARD_URI, registerAgentTaskCardResource } from "./agent-card
 
 const EVENT_KEYS = new Set(["seq", "type", "at", "turnId", "status", "requestId"]);
 const PENDING_APPROVAL_KEYS = new Set(["requestId", "method", "itemId", "receivedAt", "reason", "details"]);
+const TERMINAL_STATUSES = new Set(["idle", "completed", "failed", "interrupted", "rejected", "lost"]);
 
 function publicEvent(event) {
   if (!event || typeof event !== "object") return null;
@@ -358,6 +359,28 @@ function consentRequiredSnapshot({ agentRef = null, consent, taskCard = null }) 
   return payload;
 }
 
+function pendingTaskSnapshot({ record, resolvedExecution = null }) {
+  const pending = consentRequiredSnapshot({
+    agentRef: record.agentRef,
+    consent: record.consent,
+    taskCard: record.taskCard,
+  });
+  pending.taskRef = record.taskRef;
+  pending.taskId = record.taskRef;
+  pending.turnId = null;
+  pending.timing = { startedAt: null, endedAt: null, durationMs: null };
+  pending.execution = {
+    requestedModel: typeof record.payload?.model === "string" ? record.payload.model : null,
+    ...(typeof record.payload?.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
+    resolvedModel: resolvedExecution?.resolvedModel ?? null,
+    modelProvider: resolvedExecution?.modelProvider ?? null,
+    serviceTier: resolvedExecution?.serviceTier ?? null,
+    reasoningEffort: resolvedExecution?.reasoningEffort ?? null,
+  };
+  pending.manualFallback = manualFallback(pending);
+  return pending;
+}
+
 const TASK_STORE_VERSION = 1;
 const DEFAULT_TASK_STORE_TTL_MS = 14 * 24 * 60 * 60_000;
 const DEFAULT_TASK_STORE_MAX_ENTRIES = 2_000;
@@ -454,7 +477,7 @@ export function createAgentPreviewState({
 }
 
 function isTerminalStatus(status) {
-  return new Set(["idle", "completed", "failed", "interrupted", "rejected", "lost"]).has(status);
+  return TERMINAL_STATUSES.has(status);
 }
 
 function terminalLabel(status) {
@@ -588,6 +611,30 @@ export function registerAgentPreviewTools(server, {
     };
   }
 
+  function createTaskRecord({ consent = null, requestId = null, action, payload, cwd = null, permissionProfile = null, agentRef = null, authorized = false }) {
+    const taskRef = `task_${randomUUID()}`;
+    const boundConsent = consent ?? { consentRef: null, requestId, quota: null };
+    const boundRequestId = boundConsent.requestId ?? requestId;
+    return {
+      taskRef,
+      taskId: taskRef,
+      consent: boundConsent,
+      action,
+      payload,
+      payloadHash: taskPayloadHash(action, payload, agentRef),
+      cwd,
+      permissionProfile,
+      subjectRef: agentRef,
+      agentRef,
+      authorized,
+      commitToken: authorized ? null : `commit_${randomUUID()}`,
+      turnId: null,
+      terminalSnapshot: null,
+      declinedAt: null,
+      taskCard: taskCardFor({ taskRef, requestId: boundRequestId, action, payload, cwd, permissionProfile, quota: boundConsent.quota }),
+    };
+  }
+
   function persistableSnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== "object") return null;
     const resultSummary = compactOneLine(snapshot.resultSummary ?? snapshot.finalResult ?? snapshot.latestError ?? "", 800);
@@ -642,7 +689,7 @@ export function registerAgentPreviewTools(server, {
     if (!taskPersistence || typeof taskRef !== "string" || !taskRef) return null;
     const persisted = taskPersistence.get(taskRef);
     if (!persisted) return null;
-    if (persisted.terminalSnapshot) return structuredClone(persisted.terminalSnapshot);
+    if (persisted.terminalSnapshot?.terminal === true) return structuredClone(persisted.terminalSnapshot);
     const now = Date.now();
     const lost = {
       taskRef,
@@ -694,59 +741,54 @@ export function registerAgentPreviewTools(server, {
   function rememberPrepared({ consent, action, payload, cwd = null, permissionProfile = null, agentRef = null }) {
     const existing = preparedMetered.get(consent.consentRef);
     if (existing) return existing;
-    const taskRef = `task_${randomUUID()}`;
-    const record = {
-      taskRef,
-      taskId: taskRef,
-      consent,
-      action,
-      payload,
-      payloadHash: taskPayloadHash(action, payload, agentRef),
-      cwd,
-      permissionProfile,
-      subjectRef: agentRef,
-      agentRef,
-      authorized: false,
-      commitToken: `commit_${randomUUID()}`,
-      turnId: null,
-      terminalSnapshot: null,
-      declinedAt: null,
-      taskCard: taskCardFor({ taskRef, requestId: consent.requestId, action, payload, cwd, permissionProfile, quota: consent.quota }),
-    };
+    const record = createTaskRecord({ consent, action, payload, cwd, permissionProfile, agentRef });
     preparedMetered.set(consent.consentRef, record);
-    taskRecords.set(taskRef, record);
+    taskRecords.set(record.taskRef, record);
     persistRecord(record, null, "pending");
     return record;
   }
 
   function directRecord({ action, payload, cwd = null, permissionProfile = null, agentRef = null, requestId }) {
-    const taskRef = `task_${randomUUID()}`;
-    const consent = { consentRef: null, requestId, quota: null };
-    const record = {
-      taskRef,
-      taskId: taskRef,
-      consent,
-      action,
-      payload,
-      payloadHash: taskPayloadHash(action, payload, agentRef),
-      cwd,
-      permissionProfile,
-      subjectRef: agentRef,
-      agentRef,
-      authorized: true,
-      commitToken: null,
-      turnId: null,
-      terminalSnapshot: null,
-      declinedAt: null,
-      taskCard: taskCardFor({ taskRef, requestId, action, payload, cwd, permissionProfile, quota: null }),
-    };
-    taskRecords.set(taskRef, record);
+    const record = createTaskRecord({ action, payload, cwd, permissionProfile, agentRef, requestId, authorized: true });
+    taskRecords.set(record.taskRef, record);
     persistRecord(record, null, "pending");
     return record;
   }
 
   function cardForAgent(agentRef) {
     return agentRef ? agentCards.get(agentRef) ?? null : null;
+  }
+
+  function publicTaskSnapshot(record, snapshot) {
+    return {
+      ...publicAgentSnapshot(snapshot, record.taskCard),
+      taskRef: record.taskRef,
+      taskId: record.taskRef,
+      meteredConsent: { status: "approved", quota: record.consent.quota },
+    };
+  }
+
+  function failedDispatchSnapshot(record, error) {
+    return {
+      agentRef: record.agentRef,
+      turnId: null,
+      status: "failed",
+      pendingApproval: null,
+      finalResult: null,
+      resourceReceipt: null,
+      timing: { startedAt: null, endedAt: Date.now(), durationMs: 0 },
+      execution: {
+        requestedModel: record.payload.model ?? null,
+        ...(typeof record.payload.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
+        resolvedModel: null,
+        modelProvider: null,
+        serviceTier: null,
+        reasoningEffort: null,
+      },
+      latestError: error instanceof Error ? error.message : String(error),
+      events: [], nextSeq: 0,
+      meteredConsent: { status: "approved", quota: record.consent.quota },
+    };
   }
 
   function freezeRecord(record, payload) {
@@ -798,44 +840,20 @@ export function registerAgentPreviewTools(server, {
       if (record.agentRef !== agentRef || record.terminalSnapshot) continue;
       if (!record.turnId && cardForAgent(agentRef)?.taskRef === record.taskRef) record.turnId = snapshot.turnId ?? null;
       if (!record.turnId || snapshot.turnId !== record.turnId) continue;
-      freezeRecord(record, {
-        ...publicAgentSnapshot(snapshot, record.taskCard),
-        taskRef: record.taskRef,
-        taskId: record.taskRef,
-        meteredConsent: { status: "approved", quota: record.consent.quota },
-      });
+      freezeRecord(record, publicTaskSnapshot(record, snapshot));
     }
   }
 
   async function preparedCardState(record) {
     if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
     if (!record.authorized) {
-      const pending = consentRequiredSnapshot({ agentRef: record.agentRef, consent: record.consent, taskCard: record.taskCard });
-      pending.taskRef = record.taskRef;
-      pending.taskId = record.taskRef;
-      pending.turnId = null;
-      pending.timing = { startedAt: null, endedAt: null, durationMs: null };
-      pending.execution = {
-        requestedModel: typeof record.payload?.model === "string" ? record.payload.model : null,
-        ...(typeof record.payload?.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
-        resolvedModel: null,
-        modelProvider: null,
-        serviceTier: null,
-        reasoningEffort: null,
-      };
-      pending.manualFallback = manualFallback(pending);
-      return pending;
+      return pendingTaskSnapshot({ record });
     }
     if (!record.agentRef) throw new Error("prepared Codex task is authorized but its agentRef is not available yet");
     const snapshot = await agentExecutor.show({ agentRef: record.agentRef, afterSeq: 0 });
     if (!record.turnId && snapshot.turnId) record.turnId = snapshot.turnId;
     if (record.turnId && snapshot.turnId !== record.turnId) return lostRecord(record);
-    const payload = {
-      ...publicAgentSnapshot(snapshot, record.taskCard),
-      taskRef: record.taskRef,
-      taskId: record.taskRef,
-      meteredConsent: { status: "approved", quota: record.consent.quota },
-    };
+    const payload = publicTaskSnapshot(record, snapshot);
     if (isTerminalStatus(payload.status)) return freezeRecord(record, payload);
     return payload;
   }
@@ -925,38 +943,14 @@ export function registerAgentPreviewTools(server, {
           reasoningEffort: record.payload.reasoningEffort ?? null,
         });
       } catch (error) {
-        return freezeRecord(record, {
-          agentRef: record.agentRef,
-          turnId: null,
-          status: "failed",
-          pendingApproval: null,
-          finalResult: null,
-          resourceReceipt: null,
-          timing: { startedAt: null, endedAt: Date.now(), durationMs: 0 },
-          execution: {
-            requestedModel: record.payload.model ?? null,
-            ...(typeof record.payload.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
-            resolvedModel: null,
-            modelProvider: null,
-            serviceTier: null,
-            reasoningEffort: null,
-          },
-          latestError: error instanceof Error ? error.message : String(error),
-          events: [], nextSeq: 0,
-          meteredConsent: { status: "approved", quota: record.consent.quota },
-        });
+        return freezeRecord(record, failedDispatchSnapshot(record, error));
       }
       if (snapshot?.agentRef) {
         record.agentRef = snapshot.agentRef;
         record.turnId = snapshot.turnId ?? null;
         agentCards.set(snapshot.agentRef, record.taskCard);
       }
-      const payload = {
-        ...publicAgentSnapshot(snapshot, record.taskCard),
-        taskRef: record.taskRef,
-        taskId: record.taskRef,
-        meteredConsent: { status: "approved", quota: record.consent.quota },
-      };
+      const payload = publicTaskSnapshot(record, snapshot);
       if (isTerminalStatus(payload.status)) return freezeRecord(record, payload);
       persistRecord(record, payload, "active");
       return payload;
@@ -973,35 +967,11 @@ export function registerAgentPreviewTools(server, {
         reasoningEffort: record.payload.reasoningEffort ?? null,
       });
     } catch (error) {
-      return freezeRecord(record, {
-        agentRef: record.agentRef,
-        turnId: null,
-        status: "failed",
-        pendingApproval: null,
-        finalResult: null,
-        resourceReceipt: null,
-        timing: { startedAt: null, endedAt: Date.now(), durationMs: 0 },
-        execution: {
-          requestedModel: record.payload.model ?? null,
-          ...(typeof record.payload.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
-          resolvedModel: null,
-          modelProvider: null,
-          serviceTier: null,
-          reasoningEffort: null,
-        },
-        latestError: error instanceof Error ? error.message : String(error),
-        events: [], nextSeq: 0,
-        meteredConsent: { status: "approved", quota: record.consent.quota },
-      });
+      return freezeRecord(record, failedDispatchSnapshot(record, error));
     }
     record.turnId = snapshot.turnId ?? null;
     if (record.agentRef) agentCards.set(record.agentRef, record.taskCard);
-    const payload = {
-      ...publicAgentSnapshot(snapshot, record.taskCard),
-      taskRef: record.taskRef,
-      taskId: record.taskRef,
-      meteredConsent: { status: "approved", quota: record.consent.quota },
-    };
+    const payload = publicTaskSnapshot(record, snapshot);
     if (isTerminalStatus(payload.status)) return freezeRecord(record, payload);
     persistRecord(record, payload, "active");
     return payload;
@@ -1085,21 +1055,7 @@ export function registerAgentPreviewTools(server, {
           permissionProfile: authority.permissionProfile,
         });
         if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
-        const pending = consentRequiredSnapshot({ consent: consent.consent, taskCard: record.taskCard });
-        pending.taskRef = record.taskRef;
-        pending.taskId = record.taskRef;
-        pending.turnId = null;
-        pending.timing = { startedAt: null, endedAt: null, durationMs: null };
-        pending.execution = {
-          requestedModel: payload.model ?? null,
-          ...(typeof payload.reasoningEffort === "string" ? { requestedReasoningEffort: payload.reasoningEffort } : {}),
-          resolvedModel: null,
-          modelProvider: null,
-          serviceTier: null,
-          reasoningEffort: null,
-        };
-        pending.manualFallback = manualFallback(pending);
-        return pending;
+        return pendingTaskSnapshot({ record });
       }
       const record = directRecord({
         action: "start",
@@ -1275,21 +1231,7 @@ export function registerAgentPreviewTools(server, {
           agentRef,
         });
         if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
-        const pending = consentRequiredSnapshot({ agentRef, consent: consent.consent, taskCard: record.taskCard });
-        pending.taskRef = record.taskRef;
-        pending.taskId = record.taskRef;
-        pending.turnId = null;
-        pending.timing = { startedAt: null, endedAt: null, durationMs: null };
-        pending.execution = {
-          requestedModel: payload.model ?? null,
-          ...(typeof payload.reasoningEffort === "string" ? { requestedReasoningEffort: payload.reasoningEffort } : {}),
-          resolvedModel: current.execution?.resolvedModel ?? null,
-          modelProvider: current.execution?.modelProvider ?? null,
-          serviceTier: current.execution?.serviceTier ?? null,
-          reasoningEffort: current.execution?.reasoningEffort ?? null,
-        };
-        pending.manualFallback = manualFallback(pending);
-        return pending;
+        return pendingTaskSnapshot({ record, resolvedExecution: current.execution });
       }
       const record = directRecord({
         action: "send",

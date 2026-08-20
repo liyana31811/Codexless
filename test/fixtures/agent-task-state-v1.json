@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "pending": {
+    "phase": "pending",
+    "terminalSnapshot": null
+  },
+  "terminal": {
+    "phase": "terminal",
+    "terminal": true
+  }
+}
