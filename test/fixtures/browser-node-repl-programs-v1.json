@@ -1,5 +1,0 @@
-{
-  "Check connected browser backends": { "sha256": "68bbb538475085a5745861d5530b002f5080992cc7d0fb1816fa542cbb741e59" },
-  "List current Chrome tabs": { "sha256": "cc124777c7d87f16680b9c76c5cc4e5394b280b6f615ad63b276e682424d21e8" },
-  "Prepare exact Chrome click": { "sha256": "308cd23e6d34d7665082df336b422d38278118e0c5908fb38cd3c5d6a17be61a" }
-}
