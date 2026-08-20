@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import path from "node:path";
 import test from "node:test";
 import { CodexBrowserExecutor } from "../src/codex-browser-executor.mjs";
 
@@ -102,16 +99,25 @@ test("transport uncertainty consumes the ref and never replays the mutation", as
   );
 });
 
-test("prepared Node REPL programs retain exact fixture bytes", async () => {
+test("prepared Browser calls use the closed operation kernel", async () => {
   const { browser, workbench } = makeBrowser();
   const listed = await browser.listTabs({ cwd });
   await browser.prepareClick({ tabRef: listed.tabs[0].tabRef, role: "button", name: "Send", cwd });
-  const fixture = JSON.parse(await readFile(path.join(import.meta.dirname, "fixtures", "browser-node-repl-programs-v1.json"), "utf8"));
-  for (const [title, expected] of Object.entries(fixture)) {
-    const call = workbench.calls.find((entry) => entry.arguments?.title === title);
-    assert.ok(call, `fixture call ${title} must be captured`);
-    const actual = createHash("sha256").update(call.arguments.code).digest("hex");
-    assert.equal(actual, expected.sha256, `${title} generated program bytes drifted`);
+  const calls = workbench.calls.filter((entry) => entry.arguments?.title);
+  assert.deepEqual(calls.map((entry) => entry.arguments.title), [
+    "Check connected browser backends",
+    "List current Chrome tabs",
+    "Check connected browser backends",
+    "Prepare exact Chrome click",
+  ]);
+  for (const call of calls) {
+    const code = call.arguments.code;
+    assert.match(code, /const __twInput = /);
+    assert.match(code, /__toolwireBrowserAgent/);
+    assert.match(code, /scripts\/browser-client\.mjs/);
+    assert.doesNotMatch(code, /new Function\s*\(|nodeRepl\.eval\s*\(/);
   }
+  assert.match(calls[0].arguments.code, /browsers\.list\(\)/);
+  assert.match(calls[1].arguments.code, /user\.openTabs\(\)/);
+  assert.match(calls[3].arguments.code, /getByRole\("button", \{ name: "Send", exact: true \}\)/);
 });
-

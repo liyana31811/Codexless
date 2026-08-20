@@ -25,6 +25,7 @@
     "test:agent-state": "node test/agent-task-state.mjs",
     "test:browser-reader": "node test/public-browser-adapter.mjs",
     "test:browser-operator": "node --test test/browser-household-parity.mjs test/browser-action-lifecycle.mjs",
+    "test:browser-kernel-model": "node test/browser-kernel-model.mjs",
     "test:public-registration": "node test/public-registration-allowlist.mjs",
     "test:public-runtime-cleanup": "node --experimental-test-module-mocks --test test/public-runtime-cleanup.mjs",
     "test:diagnostics": "node test/recent-call-diagnostics.mjs && node test/recent-call-http.mjs && node test/doctor-health.mjs",
