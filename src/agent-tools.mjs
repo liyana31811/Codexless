@@ -428,6 +428,11 @@ export function registerAgentPreviewTools(server, {
   const ledger = state.ledger;
   if (!ledger) throw new Error("Agent preview requires canonical task ledger state");
   const meteredConsent = state.meteredConsent;
+  // A request can reach this layer concurrently after both callers have
+  // awaited authority/model work. Share the one in-flight remote operation so
+  // a single task record can never dispatch twice before its terminal result
+  // is latched.
+  const inFlightDispatches = new Map();
   registerAgentTaskCardResource(server);
 
   async function fullModelCatalog() {
@@ -602,23 +607,7 @@ export function registerAgentPreviewTools(server, {
     return ledger.decline(record);
   }
 
-  function approvePrepared(record) {
-    if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
-    if (record.declinedAt) return { ...structuredClone(record.terminalSnapshot ?? lostRecord(record)), duplicate: true };
-    const approval = ledger.commitTask(record, {
-      action: record.action,
-      requestId: record.consent.requestId,
-      subjectRef: record.action === "send" ? record.agentRef : null,
-      payload: record.payload,
-      consentRef: record.consent.consentRef,
-    });
-    if (approval.duplicate && record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
-    return dispatchPrepared(record);
-  }
-
-  async function dispatchPrepared(record) {
-    if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
-    if (record.declinedAt) return structuredClone(record.terminalSnapshot ?? lostRecord(record));
+  async function validatePreparedDispatch(record) {
     if (record.action === "start") {
       const currentAuthority = await authorityExecutor.resolveAuthority({ cwd: record.cwd, access: "inherit" });
       if (currentAuthority.effectiveCwd !== record.cwd || currentAuthority.permissionProfile !== record.permissionProfile) {
@@ -630,6 +619,45 @@ export function registerAgentPreviewTools(server, {
         throw new Error("prepared Codex follow-up is stale because the agent advanced; prepare a new task card for the current turn");
       }
     }
+  }
+
+  async function approvePrepared(record) {
+    if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
+    if (record.declinedAt) return { ...structuredClone(record.terminalSnapshot ?? lostRecord(record)), duplicate: true };
+    // Revalidate authority/current-turn before consuming the server-side
+    // approval. A stale card must remain pending rather than becoming an
+    // unusable authorized record after a pre-dispatch rejection.
+    await validatePreparedDispatch(record);
+    const approval = ledger.commitTask(record, {
+      action: record.action,
+      requestId: record.consent.requestId,
+      subjectRef: record.action === "send" ? record.agentRef : null,
+      payload: record.payload,
+      consentRef: record.consent.consentRef,
+    });
+    if (approval.duplicate && record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
+    return dispatchPrepared(record, { preflighted: true });
+  }
+
+  async function dispatchPrepared(record, options = {}) {
+    const prior = inFlightDispatches.get(record?.taskRef);
+    if (prior) {
+      const result = await prior;
+      return { ...structuredClone(result), duplicate: true };
+    }
+    const operation = dispatchPreparedOnce(record, options);
+    inFlightDispatches.set(record.taskRef, operation);
+    try {
+      return await operation;
+    } finally {
+      if (inFlightDispatches.get(record.taskRef) === operation) inFlightDispatches.delete(record.taskRef);
+    }
+  }
+
+  async function dispatchPreparedOnce(record, { preflighted = false } = {}) {
+    if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
+    if (record.declinedAt) return structuredClone(record.terminalSnapshot ?? lostRecord(record));
+    if (!preflighted) await validatePreparedDispatch(record);
     if (!record.authorized) {
       throw new Error("Codex task is still pending user approval; dispatch is blocked until the prepared task is explicitly committed");
     }

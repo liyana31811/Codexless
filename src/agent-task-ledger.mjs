@@ -260,6 +260,10 @@ export function createAgentTaskLedger({
   const agentTaskIndex = new Map();
   const currentCard = new Map();
   const consentRequests = new Map();
+  // Public handlers await authority/model work before reaching the ledger.
+  // Share one in-flight preparation so identical concurrent calls cannot
+  // mint separate consent identities or commit capabilities.
+  const pendingAuthorizations = new Map();
 
   function indexRecord(record) {
     if (!record?.taskRef) return;
@@ -275,6 +279,33 @@ export function createAgentTaskLedger({
     if (record.agentRef) {
       if (!agentTaskIndex.has(record.agentRef)) agentTaskIndex.set(record.agentRef, new Set());
       agentTaskIndex.get(record.agentRef).add(record.taskRef);
+    }
+  }
+
+  function dropRecord(taskRef) {
+    if (!taskRef) return;
+    const record = records.get(taskRef);
+    records.delete(taskRef);
+    for (const [key, value] of requestIndex) if (value === taskRef) requestIndex.delete(key);
+    for (const [key, value] of consentIndex) if (value === taskRef) consentIndex.delete(key);
+    const portable = portableShortTaskId(taskRef);
+    const portableRefs = portableIndex.get(portable);
+    portableRefs?.delete(taskRef);
+    if (portableRefs?.size === 0) portableIndex.delete(portable);
+    if (record?.agentRef) {
+      const agentRefs = agentTaskIndex.get(record.agentRef);
+      agentRefs?.delete(taskRef);
+      if (agentRefs?.size === 0) agentTaskIndex.delete(record.agentRef);
+    }
+    for (const [agentRef, value] of currentCard) if (value === taskRef) currentCard.delete(agentRef);
+  }
+
+  function refreshIndexes() {
+    if (!persistence) return;
+    persistence.assertAvailable();
+    const persistedRefs = new Set(persistence.entries().map((entry) => entry.taskRef));
+    for (const taskRef of records.keys()) {
+      if (!persistedRefs.has(taskRef)) dropRecord(taskRef);
     }
   }
 
@@ -295,14 +326,19 @@ export function createAgentTaskLedger({
       agentRef: record.agentRef ?? null,
       turnId: record.turnId ?? null,
       phase: phase ?? (record.terminalSnapshot ? "terminal" : record.authorized ? "active" : "pending"),
-      terminalSnapshot: snapshot ? persistableSnapshot(snapshot) : record.terminalSnapshot ? persistableSnapshot(record.terminalSnapshot) : null,
+      // The terminal projection is already bounded by the public snapshot
+      // reducer. Persist that exact projection rather than rebuilding a
+      // smaller shape: a terminal replay after restart must be byte/field
+      // identical to the first terminal result (including event sequence and
+      // optional metadata).
+      terminalSnapshot: snapshot ? structuredClone(snapshot) : record.terminalSnapshot ? structuredClone(record.terminalSnapshot) : null,
     });
     record.persistenceWarning = null;
     return true;
   }
 
   function findRecord({ requestId, action, subjectRef = null, payload = null }) {
-    persistence?.assertAvailable();
+    refreshIndexes();
     const taskRef = requestIndex.get(requestKey({ requestId, action, subjectRef }));
     if (!taskRef) return null;
     const record = records.get(taskRef);
@@ -330,34 +366,49 @@ export function createAgentTaskLedger({
       if (prior.authorized) return { authorized: true, mode: "always", consentRef: prior.consentRef, duplicate: true };
       return consentRequired(prior, true);
     }
-    let quotaSnapshot;
-    try {
-      quotaSnapshot = quotaProvider
-        ? await quotaProvider()
-        : { status: "unavailable", observedAt: new Date().toISOString(), usage: { status: "unavailable" }, rateLimits: { status: "unavailable" } };
-    } catch (error) {
-      const projected = { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error) };
-      quotaSnapshot = {
-        status: "unavailable",
-        observedAt: new Date().toISOString(),
-        usage: { status: "unavailable", error: projected },
-        rateLimits: { status: "unavailable", error: projected },
-      };
+    const pending = pendingAuthorizations.get(key);
+    if (pending) {
+      const record = await pending;
+      if (record.requestHash !== hash) throw new Error(`requestId was already used for a different metered ${action} request: ${requestId}`);
+      return consentRequired(record, true);
     }
-    const record = {
-      action,
-      subjectRef,
-      requestId,
-      requestHash: hash,
-      consentRef: `consent_${randomUUID()}`,
-      quota: projectQuotaSnapshot(quotaSnapshot),
-      createdAt: Date.now(),
-      expiresAt: Date.now() + CONSENT_TTL_MS,
-      authorized: false,
-      authorizedAt: null,
-    };
-    consentRequests.set(key, record);
-    return consentRequired(record, false);
+    const preparation = (async () => {
+      let quotaSnapshot;
+      try {
+        quotaSnapshot = quotaProvider
+          ? await quotaProvider()
+          : { status: "unavailable", observedAt: new Date().toISOString(), usage: { status: "unavailable" }, rateLimits: { status: "unavailable" } };
+      } catch (error) {
+        const projected = { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error) };
+        quotaSnapshot = {
+          status: "unavailable",
+          observedAt: new Date().toISOString(),
+          usage: { status: "unavailable", error: projected },
+          rateLimits: { status: "unavailable", error: projected },
+        };
+      }
+      const record = {
+        action,
+        subjectRef,
+        requestId,
+        requestHash: hash,
+        consentRef: `consent_${randomUUID()}`,
+        quota: projectQuotaSnapshot(quotaSnapshot),
+        createdAt: Date.now(),
+        expiresAt: Date.now() + CONSENT_TTL_MS,
+        authorized: false,
+        authorizedAt: null,
+      };
+      consentRequests.set(key, record);
+      return record;
+    })();
+    pendingAuthorizations.set(key, preparation);
+    try {
+      const record = await preparation;
+      return consentRequired(record, false);
+    } finally {
+      if (pendingAuthorizations.get(key) === preparation) pendingAuthorizations.delete(key);
+    }
   }
 
   function approveConsent({ action, requestId, subjectRef = null, payload, consentRef }) {
@@ -381,9 +432,22 @@ export function createAgentTaskLedger({
   }
 
   function createTask({ consent = null, requestId = null, action, payload, cwd = null, permissionProfile = null, agentRef = null, authorized = false }) {
-    const taskRef = `task_${randomUUID()}`;
+    refreshIndexes();
     const boundConsent = consent ?? { consentRef: null, requestId, quota: null };
     const boundRequestId = boundConsent.requestId ?? requestId;
+    const subjectRef = agentRef ?? null;
+    const existingTaskRef = boundRequestId && action
+      ? requestIndex.get(requestKey({ requestId: boundRequestId, action, subjectRef }))
+      : null;
+    if (existingTaskRef) {
+      const existing = records.get(existingTaskRef);
+      const hash = taskPayloadHash(action, payload, subjectRef);
+      if (existing?.payloadHash && existing.payloadHash !== hash) {
+        throw new Error(`requestId ${boundRequestId} was already used for a different Codex task payload`);
+      }
+      return existing;
+    }
+    const taskRef = `task_${randomUUID()}`;
     const record = {
       taskRef,
       taskId: taskRef,
@@ -409,18 +473,18 @@ export function createAgentTaskLedger({
   }
 
   function taskByRef(taskRef) {
-    persistence?.assertAvailable();
+    refreshIndexes();
     return typeof taskRef === "string" && taskRef ? records.get(taskRef) ?? null : null;
   }
 
   function taskByConsent(consentRef) {
-    persistence?.assertAvailable();
+    refreshIndexes();
     const taskRef = consentIndex.get(consentRef);
     return taskRef ? records.get(taskRef) ?? null : null;
   }
 
   function taskByPortable(taskId) {
-    persistence?.assertAvailable();
+    refreshIndexes();
     const refs = portableIndex.get(taskId);
     if (!refs || refs.size !== 1) throw new Error("unknown, stale, or ambiguous Portable Card task ID");
     const record = records.get([...refs][0]);
@@ -429,7 +493,7 @@ export function createAgentTaskLedger({
   }
 
   function taskForAgent(agentRef) {
-    persistence?.assertAvailable();
+    refreshIndexes();
     const taskRef = currentCard.get(agentRef);
     return taskRef ? records.get(taskRef) ?? null : null;
   }
@@ -504,7 +568,7 @@ export function createAgentTaskLedger({
     persist(record, "terminal", lost);
     // Recovery returns the natural LOST projection once; later reads replay
     // the exact persisted terminal snapshot byte-for-byte.
-    record.terminalSnapshot = persistableSnapshot(lost);
+    record.terminalSnapshot = structuredClone(lost);
     return first;
   }
 
@@ -570,7 +634,7 @@ export function createAgentTaskLedger({
     taskPayloadHash,
     persistableSnapshot,
     records: () => {
-      persistence?.assertAvailable();
+      refreshIndexes();
       return [...records.values()];
     },
   };
