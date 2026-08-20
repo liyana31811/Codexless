@@ -1,5 +1,21 @@
-function integerOrNull(value) {
+export function integerOrNull(value) {
   return Number.isInteger(value) ? value : null;
+}
+
+export function unavailableQuotaSnapshot(error = null, includeDefaultError = false) {
+  const projected = error
+    ? { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error) }
+    : includeDefaultError ? { name: "Unavailable", message: "resource telemetry provider is not configured" } : null;
+  return {
+    status: "unavailable",
+    observedAt: new Date().toISOString(),
+    usage: { status: "unavailable", ...(projected ? { error: projected } : {}) },
+    rateLimits: { status: "unavailable", ...(projected ? { error: projected } : {}) },
+  };
+}
+
+function stringFields(value, fields) {
+  return Object.fromEntries(fields.map((field) => [field, typeof value?.[field] === "string" ? value[field] : null]));
 }
 
 function normalizeBreakdown(value) {
@@ -36,11 +52,7 @@ function projectError(error) {
 function projectLimit(limit) {
   const windows = Array.isArray(limit?.windows) ? limit.windows : [];
   return {
-    key: typeof limit?.key === "string" ? limit.key : null,
-    limitId: typeof limit?.limitId === "string" ? limit.limitId : null,
-    limitName: typeof limit?.limitName === "string" ? limit.limitName : null,
-    planType: typeof limit?.planType === "string" ? limit.planType : null,
-    rateLimitReachedType: typeof limit?.rateLimitReachedType === "string" ? limit.rateLimitReachedType : null,
+    ...stringFields(limit, ["key", "limitId", "limitName", "planType", "rateLimitReachedType"]),
     spendControlReached: typeof limit?.spendControlReached === "boolean" ? limit.spendControlReached : null,
     windows: windows.map((window) => ({
       kind: typeof window?.kind === "string" ? window.kind : null,

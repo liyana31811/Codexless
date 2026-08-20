@@ -1,33 +1,27 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { CodexAppServerClient } from "./codex-app-server-client.mjs";
-import { buildAgentResourceReceipt } from "./agent-resource.mjs";
+import { buildAgentResourceReceipt, unavailableQuotaSnapshot } from "./agent-resource.mjs";
 
 const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "interrupted"]);
 const DEFAULT_MAX_EVENTS = 128;
 const MAX_EVENT_TEXT_CHARS = 2_048;
 
+function digest(value) { return createHash("sha256").update(value, "utf8").digest("hex"); }
+
 function hashRequest(cwd, task, model = null, reasoningEffort = null) {
-  const base = `${cwd}\0${task}\0${model ?? ""}`;
-  const material = reasoningEffort === null ? base : `${base}\0reasoningEffort=${reasoningEffort}`;
-  return createHash("sha256").update(material, "utf8").digest("hex");
+  return digest(reasoningEffort === null ? `${cwd}\0${task}\0${model ?? ""}` : `${cwd}\0${task}\0${model ?? ""}\0reasoningEffort=${reasoningEffort}`);
 }
 
-function normalizeModel(model) {
-  if (model === null || model === undefined) return null;
-  if (typeof model !== "string" || !model.trim()) throw new Error("model must be a non-empty string when provided");
-  return model.trim();
-}
-
-function normalizeReasoningEffort(reasoningEffort) {
-  if (reasoningEffort === null || reasoningEffort === undefined) return null;
-  if (typeof reasoningEffort !== "string" || !reasoningEffort.trim()) {
-    throw new Error("reasoningEffort must be a non-empty string when provided");
-  }
-  const normalized = reasoningEffort.trim();
-  if (normalized.length > 128) throw new Error("reasoningEffort must be at most 128 characters");
+function normalizeSelection(value, label, maxLength = null) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be a non-empty string when provided`);
+  const normalized = value.trim();
+  if (maxLength !== null && normalized.length > maxLength) throw new Error(`${label} must be at most ${maxLength} characters`);
   return normalized;
 }
+
+export function stringOrNull(value) { return typeof value === "string" ? value : null; }
 
 function modelIdentity(entry) {
   return typeof entry?.model === "string" && entry.model
@@ -38,92 +32,90 @@ function modelIdentity(entry) {
 }
 
 function supportedReasoningEfforts(entry) {
-  return Array.isArray(entry?.supportedReasoningEfforts)
-    ? entry.supportedReasoningEfforts
-        .map((option) => typeof option?.reasoningEffort === "string" ? option.reasoningEffort : null)
-        .filter(Boolean)
-    : [];
+  return Array.isArray(entry?.supportedReasoningEfforts) ? entry.supportedReasoningEfforts.map((value) => typeof value === "string" ? value : stringOrNull(value?.reasoningEffort)).filter(Boolean) : [];
 }
 
+function projectFields(value, fields) { return Object.fromEntries(fields.map((key) => [key, stringOrNull(value?.[key])])); }
+function projectList(value, fields) { return Array.isArray(value) ? value.map((item) => projectFields(item, fields)) : []; }
+
 function projectModel(entry) {
-  if (!entry || typeof entry !== "object") return null;
-  const id = typeof entry.id === "string" ? entry.id : null;
-  const model = typeof entry.model === "string" ? entry.model : null;
-  if (!id && !model) return null;
+  const model = modelIdentity(entry);
+  if (!model) return null;
   return {
-    id,
-    model,
-    displayName: typeof entry.displayName === "string" ? entry.displayName : null,
-    description: typeof entry.description === "string" ? entry.description : null,
-    modelSpecialty: typeof entry.modelSpecialty === "string" ? entry.modelSpecialty : null,
+    id: stringOrNull(entry.id),
+    model: stringOrNull(entry.model),
+    displayName: typeof entry?.displayName === "string" && entry.displayName ? entry.displayName : null,
+    description: stringOrNull(entry.description),
+    modelSpecialty: stringOrNull(entry.modelSpecialty),
     hidden: entry.hidden === true,
     isDefault: entry.isDefault === true,
-    defaultReasoningEffort: typeof entry.defaultReasoningEffort === "string" ? entry.defaultReasoningEffort : null,
-    supportedReasoningEfforts: Array.isArray(entry.supportedReasoningEfforts)
-      ? entry.supportedReasoningEfforts.map((option) => ({
-          reasoningEffort: typeof option?.reasoningEffort === "string" ? option.reasoningEffort : null,
-          description: typeof option?.description === "string" ? option.description : null,
-        }))
-      : [],
-    serviceTiers: Array.isArray(entry.serviceTiers)
-      ? entry.serviceTiers.map((tier) => ({
-          id: typeof tier?.id === "string" ? tier.id : null,
-          name: typeof tier?.name === "string" ? tier.name : null,
-          description: typeof tier?.description === "string" ? tier.description : null,
-        }))
-      : [],
-    defaultServiceTier: typeof entry.defaultServiceTier === "string" ? entry.defaultServiceTier : null,
+    defaultReasoningEffort: typeof entry?.defaultReasoningEffort === "string" && entry.defaultReasoningEffort ? entry.defaultReasoningEffort : null,
+    supportedReasoningEfforts: projectList(entry.supportedReasoningEfforts, ["reasoningEffort", "description"]),
+    serviceTiers: projectList(entry.serviceTiers, ["id", "name", "description"]),
+    defaultServiceTier: stringOrNull(entry.defaultServiceTier),
   };
 }
 
-function normalizeAgentStatus(turnStatus) {
-  if (turnStatus === "inProgress" || turnStatus === "running") return "running";
-  if (turnStatus === "completed") return "idle";
-  if (turnStatus === "failed") return "failed";
-  if (turnStatus === "interrupted") return "interrupted";
-  return "unknown";
-}
+const AGENT_STATUS = new Map([["inProgress", "running"], ["running", "running"], ["completed", "idle"], ["failed", "failed"], ["interrupted", "interrupted"]]);
 
 function lastAgentMessage(turn) {
-  const items = Array.isArray(turn?.items) ? turn.items : [];
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index];
-    if (item?.type === "agentMessage" && typeof item.text === "string") return item.text;
+  return (Array.isArray(turn?.items) ? turn.items : []).findLast((item) => item?.type === "agentMessage" && typeof item.text === "string")?.text ?? null;
+}
+
+function notificationFields(message) {
+  const params = message?.params ?? {};
+  const turn = params.turn ?? null;
+  return {
+    threadId: params.threadId ?? params.thread?.id ?? null,
+    turnId: params.turnId ?? turn?.id ?? null,
+    requestId: params.requestId ?? null,
+    turn,
+  };
+}
+
+function requestKey(namespace, requestId) {
+  return `${namespace}\0${requestId}`;
+}
+
+export function projectExecution(state = null) {
+  return {
+    requestedModel: state?.requestedModel ?? null,
+    ...(state?.requestedReasoningEffort ? { requestedReasoningEffort: state.requestedReasoningEffort } : {}),
+    resolvedModel: state?.resolvedModel ?? null,
+    modelProvider: state?.modelProvider ?? null,
+    serviceTier: state?.serviceTier ?? null,
+    reasoningEffort: state?.reasoningEffort ?? null,
+  };
+}
+
+export async function collectModelCatalog(listModels, {
+  includeHidden = false,
+  maxPages = 10,
+  repeatedCursorMessage = "Codex model catalog pagination repeated a cursor",
+  limitMessage = "Codex model catalog exceeded the bounded pagination limit",
+} = {}) {
+  const models = [];
+  const seenCursors = new Set();
+  let cursor = null;
+  for (let page = 0; page < maxPages; page += 1) {
+    const result = await listModels({ cursor, limit: 200, includeHidden });
+    models.push(...(Array.isArray(result?.models) ? result.models : []));
+    if (!result?.nextCursor) return models;
+    if (seenCursors.has(result.nextCursor)) throw new Error(repeatedCursorMessage);
+    seenCursors.add(result.nextCursor);
+    cursor = result.nextCursor;
   }
-  return null;
-}
-
-function notificationThreadId(message) {
-  return message?.params?.threadId ?? message?.params?.thread?.id ?? null;
-}
-
-function notificationTurn(message) {
-  return message?.params?.turn ?? null;
-}
-
-function notificationTurnId(message) {
-  return message?.params?.turnId ?? notificationTurn(message)?.id ?? null;
-}
-
-function notificationRequestId(message) {
-  return message?.params?.requestId ?? null;
-}
-
-function controlRequestHash(action, agentRef, targetId) {
-  return createHash("sha256").update(`${action}\0${agentRef}\0${targetId ?? ""}`, "utf8").digest("hex");
+  throw new Error(limitMessage);
 }
 
 function approvalResponseFor(handle, decision) {
   const params = handle?.params && typeof handle.params === "object" ? handle.params : {};
-  if (handle?.method === "item/commandExecution/requestApproval") {
+  if (handle?.method === "item/commandExecution/requestApproval" || handle?.method === "item/fileChange/requestApproval") {
     const wanted = decision === "approve" ? "accept" : "decline";
-    if (Array.isArray(params.availableDecisions) && !params.availableDecisions.some((entry) => entry === wanted)) {
+    if (handle.method === "item/commandExecution/requestApproval" && Array.isArray(params.availableDecisions) && !params.availableDecisions.some((entry) => entry === wanted)) {
       throw new Error(`Codex approval does not offer ${wanted} for this command request`);
     }
     return { decision: wanted };
-  }
-  if (handle?.method === "item/fileChange/requestApproval") {
-    return { decision: decision === "approve" ? "accept" : "decline" };
   }
   if (handle?.method === "item/permissions/requestApproval") {
     return {
@@ -192,16 +184,11 @@ function approvalSummary(request, item = null) {
 
 function compactNotification(message) {
   const event = { type: message.method, at: Date.now() };
-  const turnId = notificationTurnId(message);
+  const { turnId } = notificationFields(message);
   if (turnId) event.turnId = turnId;
-  if (message.method === "item/agentMessage/delta") {
-    const delta = message?.params?.delta;
-    if (typeof delta === "string") event.text = delta.slice(-MAX_EVENT_TEXT_CHARS);
-  }
-  if (message.method === "item/mcpToolCall/progress") {
-    const messageText = message?.params?.message;
-    if (typeof messageText === "string") event.text = messageText.slice(-MAX_EVENT_TEXT_CHARS);
-  }
+  const text = message.method === "item/agentMessage/delta" ? message?.params?.delta
+    : message.method === "item/mcpToolCall/progress" ? message?.params?.message : null;
+  if (typeof text === "string") event.text = text.slice(-MAX_EVENT_TEXT_CHARS);
   if (message.method === "thread/tokenUsage/updated" && message?.params?.tokenUsage) {
     event.tokenUsage = message.params.tokenUsage;
   }
@@ -212,9 +199,7 @@ export class CodexAgentExecutor {
   #client;
   #defaultCwd;
   #agents = new Map();
-  #clientRequestIds = new Map();
-  #sendRequestIds = new Map();
-  #controlRequestIds = new Map();
+  #requestIndex = new Map();
   #unsubscribe = null;
   #opened = false;
   #closed = false;
@@ -265,10 +250,6 @@ export class CodexAgentExecutor {
         });
   }
 
-  get running() {
-    return this.#opened && !this.#closed && this.#client.running;
-  }
-
   async open() {
     if (this.#closed) throw new Error("CodexAgentExecutor is closed");
     if (this.#opened) return this.#client.initializedResult;
@@ -284,9 +265,7 @@ export class CodexAgentExecutor {
     this.#unsubscribe?.();
     this.#unsubscribe = null;
     this.#agents.clear();
-    this.#clientRequestIds.clear();
-    this.#sendRequestIds.clear();
-    this.#controlRequestIds.clear();
+    this.#requestIndex.clear();
     await this.#client.close();
   }
 
@@ -302,78 +281,38 @@ export class CodexAgentExecutor {
     });
     return {
       models: Array.isArray(result?.data) ? result.data.map(projectModel).filter(Boolean) : [],
-      nextCursor: typeof result?.nextCursor === "string" ? result.nextCursor : null,
+      nextCursor: stringOrNull(result?.nextCursor),
     };
   }
 
   async start({ cwd = this.#defaultCwd, task, clientRequestId = null, permissionProfile = null, model = null, reasoningEffort = null }) {
     this.#assertOpen();
     if (typeof task !== "string" || !task.trim()) throw new Error("task must be a non-empty string");
-    if (clientRequestId !== null && (typeof clientRequestId !== "string" || !clientRequestId.trim())) {
-      throw new Error("clientRequestId must be a non-empty string when provided");
-    }
+    if (clientRequestId !== null && (typeof clientRequestId !== "string" || !clientRequestId.trim())) throw new Error("clientRequestId must be a non-empty string when provided");
     if (permissionProfile !== null && (typeof permissionProfile !== "string" || !permissionProfile.trim())) {
       throw new Error("permissionProfile must be a non-empty string when provided");
     }
-    const requestedModel = normalizeModel(model);
-    const requestedReasoningEffort = normalizeReasoningEffort(reasoningEffort);
+    const requestedModel = normalizeSelection(model, "model");
+    const requestedReasoningEffort = normalizeSelection(reasoningEffort, "reasoningEffort", 128);
 
     const effectiveCwd = path.resolve(cwd);
     const requestHash = hashRequest(effectiveCwd, task, requestedModel, requestedReasoningEffort);
-    if (clientRequestId) {
-      const prior = this.#clientRequestIds.get(clientRequestId);
-      if (prior) {
-        if (prior.requestHash !== requestHash) throw new Error(`clientRequestId was already used for a different agent start: ${clientRequestId}`);
-        const state = this.#agents.get(prior.agentRef);
-        if (!state) return this.#unknown(prior.agentRef, "accepted start mapping is no longer available");
-        return { ...this.#snapshot(state, 0), duplicate: true };
-      }
-    }
+    const duplicate = this.#duplicateRequest("start", clientRequestId, requestHash, "accepted start mapping is no longer available");
+    if (duplicate) return duplicate;
 
-    let validatedReasoningModel = null;
-    if (requestedReasoningEffort) {
-      const validation = await this.#validateReasoningEffort({
-        requestedModel,
-        currentModel: null,
-        requestedReasoningEffort,
-      });
-      validatedReasoningModel = validation.effectiveModel;
-    }
+    const validatedReasoningModel = requestedReasoningEffort
+      ? (await this.#validateReasoningEffort({ requestedModel, currentModel: null, requestedReasoningEffort })).effectiveModel
+      : null;
 
     const agentRef = `agent_${randomUUID()}`;
     const state = {
       agentRef,
       cwd: effectiveCwd,
-      threadId: null,
-      currentTurnId: null,
-      status: "starting",
-      latestTurnStatus: null,
-      finalResult: null,
-      latestError: null,
-      pendingApproval: null,
-      pendingRequestHandle: null,
       approvalItems: new Map(),
-      latestTokenUsage: null,
-      resourceReceipt: null,
-      resourceReceiptTurnId: null,
-      resourceReceiptPromise: null,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      turnStartedAt: null,
-      turnEndedAt: null,
-      turnDurationMs: null,
-      lastCompletedTurnId: null,
-      permissionProfile,
-      requestedModel,
-      requestedReasoningEffort,
-      resolvedModel: null,
-      modelProvider: null,
-      serviceTier: null,
-      reasoningEffort: null,
       events: [],
     };
     this.#agents.set(agentRef, state);
-    if (clientRequestId) this.#clientRequestIds.set(clientRequestId, { agentRef, requestHash });
+    if (clientRequestId) this.#requestIndex.set(requestKey("start", clientRequestId), { agentRef, requestHash });
 
     try {
       const threadParams = { cwd: effectiveCwd, ephemeral: false };
@@ -388,396 +327,302 @@ export class CodexAgentExecutor {
         if (activeProfile !== permissionProfile) throw new Error(`thread/start authority mismatch: expected ${permissionProfile}, got ${String(activeProfile ?? "missing")}`);
       }
       const expectedModel = requestedModel ?? validatedReasoningModel;
-      const acceptedModel = typeof started?.model === "string" ? started.model : null;
+      const acceptedModel = stringOrNull(started?.model);
       if (expectedModel && acceptedModel !== expectedModel) {
         throw new Error(`CODEX_AGENT_SELECTION_MISMATCH: prepared model "${expectedModel}" was not honored by thread/start (observed ${acceptedModel ?? "missing"}); no Codex turn was started`);
       }
-      const acceptedReasoningEffort = typeof started?.reasoningEffort === "string" ? started.reasoningEffort : null;
+      const acceptedReasoningEffort = stringOrNull(started?.reasoningEffort);
       if (requestedReasoningEffort && acceptedReasoningEffort !== requestedReasoningEffort) {
         throw new Error(`CODEX_AGENT_SELECTION_MISMATCH: prepared reasoning effort "${requestedReasoningEffort}" was not honored by thread/start (observed ${acceptedReasoningEffort ?? "missing"}); no Codex turn was started`);
       }
       state.threadId = threadId;
       state.status = "idle";
-      state.resolvedModel = acceptedModel ?? requestedModel;
-      state.modelProvider = typeof started?.modelProvider === "string" ? started.modelProvider : null;
-      state.serviceTier = typeof started?.serviceTier === "string" ? started.serviceTier : null;
-      state.reasoningEffort = acceptedReasoningEffort;
-      state.updatedAt = Date.now();
+      this.#applyMetadata(state, { ...started, model: acceptedModel ?? requestedModel, reasoningEffort: acceptedReasoningEffort });
       this.#appendEvent(state, { type: "thread/accepted", threadId, model: state.resolvedModel, at: Date.now() });
     } catch (error) {
       this.#agents.delete(agentRef);
-      if (clientRequestId) this.#clientRequestIds.delete(clientRequestId);
+      if (clientRequestId) this.#requestIndex.delete(requestKey("start", clientRequestId));
       throw error;
     }
 
-    try {
-      state.turnStartedAt = Date.now();
-      state.turnEndedAt = null;
-      state.turnDurationMs = null;
-      const turnStarted = await this.#client.request("turn/start", {
-        threadId: state.threadId,
-        clientUserMessageId: clientRequestId ?? agentRef,
-        input: [{ type: "text", text: task }],
-        ...(requestedReasoningEffort ? { effort: requestedReasoningEffort } : {}),
-      });
-      const turn = turnStarted?.turn;
-      if (typeof turn?.id !== "string" || !turn.id) throw new Error("turn/start returned no turn id");
-      state.currentTurnId = turn.id;
-      state.latestTurnStatus = turn.status ?? "inProgress";
-      state.status = state.pendingApproval ? "awaitingApproval" : normalizeAgentStatus(state.latestTurnStatus);
-      if (state.status === "unknown") state.status = "running";
-      state.updatedAt = Date.now();
-      this.#appendEvent(state, { type: "turn/accepted", turnId: turn.id, status: turn.status ?? null, at: Date.now() });
-      return { ...this.#snapshot(state, 0), duplicate: false };
-    } catch (error) {
-      state.latestError = error instanceof Error ? error.message : String(error);
-      if (state.pendingApproval) {
-        if (!state.currentTurnId && state.pendingApproval.turnId) state.currentTurnId = state.pendingApproval.turnId;
-        if (!state.latestTurnStatus) state.latestTurnStatus = "inProgress";
-        state.status = "awaitingApproval";
-      } else state.status = "unknown";
-      state.updatedAt = Date.now();
-      this.#appendEvent(state, { type: "turn/acceptance-unknown", text: state.latestError, at: Date.now() });
-      return { ...this.#snapshot(state, 0), duplicate: false };
-    }
+    return this.#startTurn(state, {
+      text: task,
+      clientUserMessageId: clientRequestId ?? agentRef,
+      reasoningEffort: requestedReasoningEffort,
+    });
   }
 
   async show({ agentRef, afterSeq = 0 }) {
     this.#assertOpen();
     if (!Number.isInteger(afterSeq) || afterSeq < 0) throw new Error("afterSeq must be a non-negative integer");
     const state = this.#agents.get(agentRef);
-    if (!state) return this.#unknown(agentRef, "unknown agentRef");
+    if (!state) return this.#snapshot(null, 0, { agentRef, message: "unknown agentRef" });
     await this.#refreshFromOfficial(state);
     await this.#ensureResourceReceipt(state);
     return this.#snapshot(state, afterSeq);
   }
 
-  async resolvePendingRequest({ agentRef, requestId, result }) {
-    this.#assertOpen();
-    const state = this.#agents.get(agentRef);
-    if (!state) throw new Error(`unknown agentRef: ${agentRef}`);
-    if (!state.pendingApproval || !state.pendingRequestHandle) throw new Error(`agent has no pending server request: ${agentRef}`);
-    if (String(state.pendingApproval.requestId) !== String(requestId)) throw new Error(`server request is unknown or stale for agent ${agentRef}: ${String(requestId)}`);
-    state.pendingRequestHandle.resolve(result);
-    const resolvedId = state.pendingApproval.requestId;
-    state.pendingApproval = null;
-    state.pendingRequestHandle = null;
-    state.status = normalizeAgentStatus(state.latestTurnStatus);
-    if (state.status === "unknown") state.status = "running";
-    state.updatedAt = Date.now();
-    this.#appendEvent(state, { type: "server-request/resolved-local", requestId: resolvedId, at: Date.now() });
-    return this.#snapshot(state, 0);
+  async #startTurn(state, { text, clientUserMessageId, model = null, reasoningEffort = null }) {
+    state.currentTurnId = null;
+    state.latestTurnStatus = null;
+    state.latestTokenUsage = null;
+    state.resourceReceipt = null;
+    state.finalResult = null;
+    state.latestError = null;
+    state.status = "running";
+    state.requestedModel = model;
+    state.requestedReasoningEffort = reasoningEffort;
+    state.turnStartedAt = Date.now();
+    state.turnEndedAt = null;
+    try {
+      const response = await this.#client.request("turn/start", {
+        threadId: state.threadId,
+        clientUserMessageId,
+        input: [{ type: "text", text }],
+        ...(model ? { model } : {}),
+        ...(reasoningEffort ? { effort: reasoningEffort } : {}),
+      });
+      const turn = response?.turn;
+      if (typeof turn?.id !== "string" || !turn.id) throw new Error("turn/start returned no turn id");
+      this.#applyTurnObservation(state, { turnId: turn.id, status: turn.status ?? "inProgress", turn });
+      this.#appendEvent(state, {
+        type: "turn/accepted",
+        turnId: turn.id,
+        status: turn.status ?? null,
+        ...(model ? { model: state.resolvedModel } : {}),
+        at: Date.now(),
+      });
+    } catch (error) {
+      state.latestError = error instanceof Error ? error.message : String(error);
+      if (state.pendingApproval) {
+        state.currentTurnId ||= state.pendingApproval.turnId ?? null;
+        state.latestTurnStatus ||= "inProgress";
+      }
+      state.status = state.pendingApproval ? "awaitingApproval" : "unknown";
+      this.#appendEvent(state, { type: "turn/acceptance-unknown", text: state.latestError, at: Date.now() });
+    }
+    return { ...this.#snapshot(state, 0), duplicate: false };
   }
 
-  async rejectPendingRequest({ agentRef, requestId, error }) {
-    this.#assertOpen();
-    const state = this.#agents.get(agentRef);
-    if (!state) throw new Error(`unknown agentRef: ${agentRef}`);
-    if (!state.pendingApproval || !state.pendingRequestHandle) throw new Error(`agent has no pending server request: ${agentRef}`);
-    if (String(state.pendingApproval.requestId) !== String(requestId)) throw new Error(`server request is unknown or stale for agent ${agentRef}: ${String(requestId)}`);
-    state.pendingRequestHandle.reject(error);
-    const rejectedId = state.pendingApproval.requestId;
-    state.pendingApproval = null;
-    state.pendingRequestHandle = null;
-    state.status = normalizeAgentStatus(state.latestTurnStatus);
-    if (state.status === "unknown") state.status = "running";
-    state.updatedAt = Date.now();
-    this.#appendEvent(state, { type: "server-request/rejected-local", requestId: rejectedId, at: Date.now() });
-    return this.#snapshot(state, 0);
+  #duplicateRequest(namespace, requestId, requestHash, missingMessage) {
+    if (!requestId) return null;
+    const prior = this.#requestIndex.get(requestKey(namespace, requestId));
+    if (!prior) return null;
+    if (prior.requestHash !== requestHash) throw new Error(`clientRequestId was already used for a different agent ${namespace}: ${requestId}`);
+    const state = this.#agents.get(prior.agentRef);
+    return state ? { ...this.#snapshot(state, 0), duplicate: true } : this.#snapshot(null, 0, { agentRef: prior.agentRef, message: missingMessage });
   }
 
   async resolveApproval({ agentRef, approvalRequestId, clientRequestId, decision }) {
     this.#assertOpen();
-    if (!new Set(["approve", "reject"]).has(decision)) throw new Error("decision must be approve or reject");
+    if (decision !== "approve" && decision !== "reject") throw new Error("decision must be approve or reject");
     if (typeof approvalRequestId !== "string" || !approvalRequestId.trim()) throw new Error("approvalRequestId must be a non-empty string");
     if (typeof clientRequestId !== "string" || !clientRequestId.trim()) throw new Error("clientRequestId must be a non-empty string");
-    const hash = controlRequestHash(decision, agentRef, approvalRequestId);
-    const prior = this.#controlRequestIds.get(clientRequestId);
+    const hash = digest(`${decision}\0${agentRef}\0${approvalRequestId}`);
+    const prior = this.#requestIndex.get(requestKey("control", clientRequestId));
     if (prior) {
       if (prior.requestHash !== hash) throw new Error(`clientRequestId was already used for a different agent control action: ${clientRequestId}`);
       const priorState = this.#agents.get(prior.agentRef);
-      if (!priorState) return { ...this.#unknown(prior.agentRef, "accepted control mapping is no longer available"), duplicate: true };
+      if (!priorState) return { ...this.#snapshot(null, 0, { agentRef: prior.agentRef, message: "accepted control mapping is no longer available" }), duplicate: true };
       return { ...this.#snapshot(priorState, 0), duplicate: true };
     }
 
     const state = this.#agents.get(agentRef);
-    if (!state) return this.#unknown(agentRef, "unknown agentRef");
+    if (!state) return this.#snapshot(null, 0, { agentRef, message: "unknown agentRef" });
     if (!state.pendingApproval || !state.pendingRequestHandle) throw new Error(`agent has no pending Codex approval: ${agentRef}`);
     if (String(state.pendingApproval.requestId) !== approvalRequestId) throw new Error(`approval request is unknown or stale for agent ${agentRef}: ${approvalRequestId}`);
 
     const result = approvalResponseFor(state.pendingRequestHandle, decision);
-    const snapshot = await this.resolvePendingRequest({ agentRef, requestId: approvalRequestId, result });
-    this.#controlRequestIds.set(clientRequestId, { agentRef, requestHash: hash });
-    return { ...snapshot, duplicate: false };
+    state.pendingRequestHandle.resolve(result);
+    const resolvedId = state.pendingApproval.requestId;
+    this.#clearPending(state);
+    this.#appendEvent(state, { type: "server-request/resolved-local", requestId: resolvedId, at: Date.now() });
+    this.#requestIndex.set(requestKey("control", clientRequestId), { agentRef, requestHash: hash, action: decision, targetId: approvalRequestId, acceptance: "accepted" });
+    return { ...this.#snapshot(state, 0), duplicate: false };
   }
 
   async cancel({ agentRef, clientRequestId, expectedTurnId = null }) {
     this.#assertOpen();
     if (typeof clientRequestId !== "string" || !clientRequestId.trim()) throw new Error("clientRequestId must be a non-empty string");
     const state = this.#agents.get(agentRef);
-    if (!state) return this.#unknown(agentRef, "unknown agentRef");
+    if (!state) return this.#snapshot(null, 0, { agentRef, message: "unknown agentRef" });
     await this.#refreshFromOfficial(state);
     const targetTurnId = state.currentTurnId;
     if (expectedTurnId !== null && expectedTurnId !== targetTurnId) throw new Error(`agent task turn changed: expected ${expectedTurnId}, current ${String(targetTurnId ?? "none")}`);
-    const hash = controlRequestHash("cancel", agentRef, targetTurnId);
-    const prior = this.#controlRequestIds.get(clientRequestId);
+    const hash = digest(`cancel\0${agentRef}\0${targetTurnId ?? ""}`);
+    const prior = this.#requestIndex.get(requestKey("control", clientRequestId));
     if (prior) {
       if (prior.requestHash !== hash) throw new Error(`clientRequestId was already used for a different agent control action: ${clientRequestId}`);
       await this.#refreshFromOfficial(state);
       return { ...this.#snapshot(state, 0), duplicate: true, controlAcceptance: prior.acceptance ?? "accepted" };
     }
     if (!targetTurnId || !state.threadId || !["running", "awaitingApproval", "unknown"].includes(state.status)) throw new Error(`agent has no interruptible active turn: ${agentRef} (${state.status})`);
-    const earlierCancel = [...this.#controlRequestIds.entries()].find(([, entry]) =>
+    const earlierCancel = [...this.#requestIndex.entries()].find(([, entry]) =>
       entry?.action === "cancel" && entry?.agentRef === agentRef && entry?.targetId === targetTurnId && entry?.acceptance !== "rejected"
     );
     if (earlierCancel) throw new Error(`cancel was already dispatched for this turn under requestId ${earlierCancel[0]}; query agent_show or retry that exact requestId instead of replaying turn/interrupt`);
 
     const record = { agentRef, requestHash: hash, action: "cancel", targetId: targetTurnId, acceptance: "dispatching" };
-    this.#controlRequestIds.set(clientRequestId, record);
+    this.#requestIndex.set(requestKey("control", clientRequestId), record);
     this.#appendEvent(state, { type: "turn/interrupt-dispatched", turnId: targetTurnId, requestId: clientRequestId, at: Date.now() });
     try {
       await this.#client.request("turn/interrupt", { threadId: state.threadId, turnId: targetTurnId });
       record.acceptance = "accepted";
-      state.latestTurnStatus = "interrupted";
-      if (!state.pendingApproval) state.status = "interrupted";
-      state.latestError = null;
-      if (state.turnEndedAt === null) {
-        state.turnEndedAt = Date.now();
-        state.turnDurationMs = state.turnStartedAt === null ? null : Math.max(0, state.turnEndedAt - state.turnStartedAt);
-      }
-      state.updatedAt = Date.now();
+      this.#applyTurnObservation(state, { source: "turn/interrupt", turnId: targetTurnId, status: "interrupted" });
       this.#appendEvent(state, { type: "turn/interrupt-accepted", turnId: targetTurnId, requestId: clientRequestId, at: Date.now() });
-      await this.#ensureResourceReceipt(state);
-      return { ...this.#snapshot(state, 0), duplicate: false, controlAcceptance: "accepted" };
     } catch (error) {
       record.acceptance = "unknown";
       state.latestError = `turn/interrupt acceptance unknown; do not replay: ${error instanceof Error ? error.message : String(error)}`;
       state.status = "unknown";
-      state.updatedAt = Date.now();
       this.#appendEvent(state, { type: "turn/interrupt-acceptance-unknown", turnId: targetTurnId, requestId: clientRequestId, text: state.latestError, at: Date.now() });
       await this.#refreshFromOfficial(state);
-      if (state.latestTurnStatus === "interrupted") {
+      if (["interrupted", "completed", "failed"].includes(state.latestTurnStatus)) {
         record.acceptance = "accepted";
-        state.latestError = null;
-      } else if (["completed", "failed"].includes(state.latestTurnStatus)) record.acceptance = "accepted";
-      else state.status = "unknown";
-      await this.#ensureResourceReceipt(state);
-      return { ...this.#snapshot(state, 0), duplicate: false, controlAcceptance: record.acceptance };
+        if (state.latestTurnStatus === "interrupted") state.latestError = null;
+      } else state.status = "unknown";
     }
+    await this.#ensureResourceReceipt(state);
+    return { ...this.#snapshot(state, 0), duplicate: false, controlAcceptance: record.acceptance };
   }
 
   async send({ agentRef, message, clientRequestId = null, model = null, reasoningEffort = null }) {
     this.#assertOpen();
     if (typeof message !== "string" || !message.trim()) throw new Error("message must be a non-empty string");
     if (clientRequestId !== null && (typeof clientRequestId !== "string" || !clientRequestId.trim())) throw new Error("clientRequestId must be a non-empty string when provided");
-    const requestedModel = normalizeModel(model);
-    const requestedReasoningEffort = normalizeReasoningEffort(reasoningEffort);
-    const sendHashBase = `${agentRef}\0${message}\0${requestedModel ?? ""}`;
-    const sendHashMaterial = requestedReasoningEffort === null
-      ? sendHashBase
-      : `${sendHashBase}\0reasoningEffort=${requestedReasoningEffort}`;
-    const requestHash = createHash("sha256").update(sendHashMaterial, "utf8").digest("hex");
-    if (clientRequestId) {
-      const prior = this.#sendRequestIds.get(clientRequestId);
-      if (prior) {
-        if (prior.requestHash !== requestHash) throw new Error(`clientRequestId was already used for a different agent send: ${clientRequestId}`);
-        const priorState = this.#agents.get(prior.agentRef);
-        if (!priorState) return this.#unknown(prior.agentRef, "accepted send mapping is no longer available");
-        return { ...this.#snapshot(priorState, 0), duplicate: true };
-      }
-    }
+    const requestedModel = normalizeSelection(model, "model");
+    const requestedReasoningEffort = normalizeSelection(reasoningEffort, "reasoningEffort", 128);
+    const requestHash = hashRequest(agentRef, message, requestedModel, requestedReasoningEffort);
+    const duplicate = this.#duplicateRequest("send", clientRequestId, requestHash, "accepted send mapping is no longer available");
+    if (duplicate) return duplicate;
 
     const state = this.#agents.get(agentRef);
-    if (!state) return this.#unknown(agentRef, "unknown agentRef");
+    if (!state) return this.#snapshot(null, 0, { agentRef, message: "unknown agentRef" });
     await this.#refreshFromOfficial(state);
     if (state.pendingApproval) throw new Error(`agent ${agentRef} has a pending Codex approval`);
     if (state.status !== "idle") throw new Error(`agent ${agentRef} is not idle: ${state.status}`);
 
     const resumed = await this.#client.request("thread/resume", { threadId: state.threadId });
     if (resumed?.thread?.canAcceptDirectInput === false) throw new Error(`Codex thread cannot accept direct input: ${state.threadId}`);
-    if (typeof resumed?.model === "string") state.resolvedModel = resumed.model;
-    if (typeof resumed?.modelProvider === "string") state.modelProvider = resumed.modelProvider;
-    state.serviceTier = typeof resumed?.serviceTier === "string" ? resumed.serviceTier : state.serviceTier;
-    state.reasoningEffort = typeof resumed?.reasoningEffort === "string" ? resumed.reasoningEffort : state.reasoningEffort;
+    this.#applyMetadata(state, resumed);
 
-    if (requestedReasoningEffort) {
-      await this.#validateReasoningEffort({
-        requestedModel,
-        currentModel: typeof resumed?.model === "string" ? resumed.model : state.resolvedModel,
-        requestedReasoningEffort,
-      });
-    }
+    if (requestedReasoningEffort) await this.#validateReasoningEffort({
+      requestedModel,
+      currentModel: stringOrNull(resumed?.model) ?? state.resolvedModel,
+      requestedReasoningEffort,
+    });
 
-    if (clientRequestId) this.#sendRequestIds.set(clientRequestId, { agentRef, requestHash });
-
-    state.currentTurnId = null;
-    state.latestTurnStatus = null;
-    state.latestTokenUsage = null;
-    state.resourceReceipt = null;
-    state.resourceReceiptTurnId = null;
-    state.resourceReceiptPromise = null;
-    state.finalResult = null;
-    state.latestError = null;
-    state.status = "running";
-    state.requestedModel = requestedModel;
-    state.requestedReasoningEffort = requestedReasoningEffort;
-    state.turnStartedAt = Date.now();
-    state.turnEndedAt = null;
-    state.turnDurationMs = null;
-    state.updatedAt = Date.now();
-
-    try {
-      const turnStarted = await this.#client.request("turn/start", {
-        threadId: state.threadId,
-        clientUserMessageId: clientRequestId ?? `${agentRef}_${randomUUID()}`,
-        input: [{ type: "text", text: message }],
-        ...(requestedModel ? { model: requestedModel } : {}),
-        ...(requestedReasoningEffort ? { effort: requestedReasoningEffort } : {}),
-      });
-      const turn = turnStarted?.turn;
-      if (typeof turn?.id !== "string" || !turn.id) throw new Error("turn/start returned no turn id");
-      state.currentTurnId = turn.id;
-      state.latestTurnStatus = turn.status ?? "inProgress";
-      state.status = state.pendingApproval ? "awaitingApproval" : normalizeAgentStatus(state.latestTurnStatus);
-      if (state.status === "unknown") state.status = "running";
-      state.finalResult = null;
-      state.latestError = null;
-      if (requestedModel) state.resolvedModel = null;
-      state.updatedAt = Date.now();
-      this.#appendEvent(state, { type: "turn/accepted", turnId: turn.id, status: turn.status ?? null, model: state.resolvedModel, at: Date.now() });
-      return { ...this.#snapshot(state, 0), duplicate: false };
-    } catch (error) {
-      state.latestError = error instanceof Error ? error.message : String(error);
-      if (state.pendingApproval) {
-        if (!state.currentTurnId && state.pendingApproval.turnId) state.currentTurnId = state.pendingApproval.turnId;
-        if (!state.latestTurnStatus) state.latestTurnStatus = "inProgress";
-        state.status = "awaitingApproval";
-      } else state.status = "unknown";
-      state.updatedAt = Date.now();
-      this.#appendEvent(state, { type: "turn/acceptance-unknown", text: state.latestError, at: Date.now() });
-      return { ...this.#snapshot(state, 0), duplicate: false };
-    }
-  }
-
-  async #currentModelCatalog() {
-    const models = [];
-    const seenCursors = new Set();
-    let cursor = null;
-    for (let page = 0; page < 10; page += 1) {
-      const result = await this.listModels({ cursor, limit: 200, includeHidden: true });
-      models.push(...result.models);
-      if (!result.nextCursor) return models;
-      if (seenCursors.has(result.nextCursor)) throw new Error("Codex model catalog pagination repeated a cursor");
-      seenCursors.add(result.nextCursor);
-      cursor = result.nextCursor;
-    }
-    throw new Error("Codex model catalog exceeded the bounded pagination limit");
+    if (clientRequestId) this.#requestIndex.set(requestKey("send", clientRequestId), { agentRef, requestHash });
+    return this.#startTurn(state, {
+      text: message,
+      clientUserMessageId: clientRequestId ?? `${agentRef}_${randomUUID()}`,
+      model: requestedModel,
+      reasoningEffort: requestedReasoningEffort,
+    });
   }
 
   async #validateReasoningEffort({ requestedModel, currentModel, requestedReasoningEffort }) {
     let catalog;
     try {
-      catalog = await this.#currentModelCatalog();
+      catalog = await collectModelCatalog((params) => this.listModels(params), { includeHidden: true });
     } catch (error) {
       const modelLabel = requestedModel ?? currentModel ?? "<unresolved>";
-      throw new Error(
-        `reasoningEffort validation failed for model "${modelLabel}": requested effort "${requestedReasoningEffort}"; supported efforts unknown; current model catalog unavailable: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw new Error(`reasoningEffort validation failed for model "${modelLabel}": requested effort "${requestedReasoningEffort}"; supported efforts unknown; current model catalog unavailable: ${error instanceof Error ? error.message : String(error)}`);
     }
 
-    let effectiveModel = requestedModel ?? currentModel ?? null;
+    const defaults = catalog.filter((entry) => entry?.isDefault === true && modelIdentity(entry));
+    const effectiveModel = requestedModel ?? currentModel ?? (defaults.length === 1 ? modelIdentity(defaults[0]) : null);
     if (!effectiveModel) {
-      const defaults = catalog.filter((entry) => entry?.isDefault === true && modelIdentity(entry));
-      if (defaults.length === 1) effectiveModel = modelIdentity(defaults[0]);
-    }
-    if (!effectiveModel) {
-      throw new Error(
-        `reasoningEffort validation failed for model "<unresolved>": requested effort "${requestedReasoningEffort}"; supported efforts unknown; current/default model could not be resolved from the current Codex model catalog`
-      );
+      throw new Error(`reasoningEffort validation failed for model "<unresolved>": requested effort "${requestedReasoningEffort}"; supported efforts unknown; current/default model could not be resolved from the current Codex model catalog`);
     }
 
     const entry = catalog.find((candidate) => candidate?.model === effectiveModel || candidate?.id === effectiveModel) ?? null;
     if (!entry) {
-      throw new Error(
-        `reasoningEffort validation failed for model "${effectiveModel}": requested effort "${requestedReasoningEffort}"; supported efforts unknown; model is not present in the current Codex model catalog`
-      );
+      throw new Error(`reasoningEffort validation failed for model "${effectiveModel}": requested effort "${requestedReasoningEffort}"; supported efforts unknown; model is not present in the current Codex model catalog`);
     }
     const supported = supportedReasoningEfforts(entry);
-    if (!supported.includes(requestedReasoningEffort)) {
-      throw new Error(
-        `reasoningEffort validation failed for model "${effectiveModel}": requested effort "${requestedReasoningEffort}"; supported efforts: ${supported.length ? supported.join(", ") : "(none)"}`
-      );
-    }
+    if (!supported.includes(requestedReasoningEffort)) throw new Error(`reasoningEffort validation failed for model "${effectiveModel}": requested effort "${requestedReasoningEffort}"; supported efforts: ${supported.length ? supported.join(", ") : "(none)"}`);
     return { effectiveModel, supportedReasoningEfforts: supported };
   }
 
+  #applyTurnObservation(state, observation) {
+    const turnId = observation.turnId ?? observation.turn?.id ?? null;
+    if (turnId && state.currentTurnId && turnId !== state.currentTurnId) {
+      this.#appendEvent(state, {
+        type: "stale-turn-notification-ignored",
+        method: observation.method ?? observation.source ?? "observation",
+        turnId,
+        currentTurnId: state.currentTurnId,
+        at: Date.now(),
+      });
+      return;
+    }
+    if (turnId && !state.currentTurnId) state.currentTurnId = turnId;
+    if (TERMINAL_TURN_STATUSES.has(state.latestTurnStatus)) return;
+    if (observation.statusType) {
+      const next = observation.statusType === "active" ? (state.pendingApproval ? "awaitingApproval" : "running") : observation.statusType === "idle" && state.status === "running" ? "idle" : observation.statusType === "systemError" ? "failed" : null;
+      state.status = next ?? state.status;
+      return;
+    }
+    const status = observation.status ?? observation.turn?.status ?? null;
+    if (!status) return;
+    state.latestTurnStatus = status;
+    state.status = state.pendingApproval ? "awaitingApproval" : AGENT_STATUS.get(status) ?? "running";
+    if (status === "completed" || status === "interrupted") {
+      state.finalResult = lastAgentMessage(observation.turn) ?? state.finalResult;
+      state.latestError = null;
+    } else if (status === "failed") {
+      state.latestError = observation.turn?.error?.message ?? JSON.stringify(observation.turn?.error ?? "turn failed");
+    }
+    if (TERMINAL_TURN_STATUSES.has(status)) state.turnEndedAt ??= Date.now();
+  }
+
+  #applyMetadata(state, response) {
+    if (typeof response?.model === "string") state.resolvedModel = response.model;
+    if (typeof response?.modelProvider === "string") state.modelProvider = response.modelProvider;
+    state.serviceTier = stringOrNull(response?.serviceTier) ?? state.serviceTier;
+    state.reasoningEffort = stringOrNull(response?.reasoningEffort) ?? state.reasoningEffort;
+  }
+
+  #clearPending(state) {
+    state.pendingApproval = state.pendingRequestHandle = null;
+    state.status = AGENT_STATUS.get(state.latestTurnStatus) ?? "running";
+  }
+
   async #refreshFromOfficial(state) {
-    if (!state.threadId) return;
     try {
       const turns = await this.#client.request("thread/turns/list", { threadId: state.threadId, limit: 20 });
       const data = Array.isArray(turns?.data) ? turns.data : [];
       const turn = state.currentTurnId ? data.find((candidate) => candidate?.id === state.currentTurnId) : data[0];
       if (!turn) return;
-      const currentTurnAlreadyTerminal = state.turnEndedAt !== null || TERMINAL_TURN_STATUSES.has(state.latestTurnStatus);
       const officialTurnIsTerminal = TERMINAL_TURN_STATUSES.has(turn.status);
-      if (currentTurnAlreadyTerminal && !officialTurnIsTerminal) {
-        const resumed = await this.#client.request("thread/resume", { threadId: state.threadId });
-        if (typeof resumed?.model === "string") state.resolvedModel = resumed.model;
-        if (typeof resumed?.modelProvider === "string") state.modelProvider = resumed.modelProvider;
-        state.serviceTier = typeof resumed?.serviceTier === "string" ? resumed.serviceTier : state.serviceTier;
-        state.reasoningEffort = typeof resumed?.reasoningEffort === "string" ? resumed.reasoningEffort : state.reasoningEffort;
-        state.updatedAt = Date.now();
+      if (TERMINAL_TURN_STATUSES.has(state.latestTurnStatus) && !officialTurnIsTerminal) {
+        this.#applyMetadata(state, await this.#client.request("thread/resume", { threadId: state.threadId }));
         this.#appendEvent(state, { type: "nonterminal-official-refresh-ignored", turnId: turn.id, status: turn.status ?? null, at: Date.now() });
         return;
       }
-      state.currentTurnId = turn.id;
-      state.latestTurnStatus = turn.status ?? state.latestTurnStatus;
-      state.status = normalizeAgentStatus(turn.status);
-      if (state.pendingApproval) state.status = "awaitingApproval";
-      if (turn.status === "completed") {
-        state.lastCompletedTurnId = turn.id;
-        state.finalResult = lastAgentMessage(turn);
-        state.latestError = null;
-      } else if (turn.status === "failed") state.latestError = turn?.error?.message ?? JSON.stringify(turn?.error ?? "turn failed");
-      else if (turn.status === "interrupted") {
-        state.finalResult = lastAgentMessage(turn) ?? state.finalResult;
-        state.latestError = null;
-      }
-      if (TERMINAL_TURN_STATUSES.has(turn.status) && state.turnEndedAt === null) {
-        state.turnEndedAt = Date.now();
-        state.turnDurationMs = state.turnStartedAt === null ? null : Math.max(0, state.turnEndedAt - state.turnStartedAt);
-      }
-      if (TERMINAL_TURN_STATUSES.has(turn.status)) {
-        const resumed = await this.#client.request("thread/resume", { threadId: state.threadId });
-        if (typeof resumed?.model === "string") state.resolvedModel = resumed.model;
-        if (typeof resumed?.modelProvider === "string") state.modelProvider = resumed.modelProvider;
-        state.serviceTier = typeof resumed?.serviceTier === "string" ? resumed.serviceTier : state.serviceTier;
-        state.reasoningEffort = typeof resumed?.reasoningEffort === "string" ? resumed.reasoningEffort : state.reasoningEffort;
-      }
-      state.updatedAt = Date.now();
+      this.#applyTurnObservation(state, { source: "refresh", turnId: turn.id, status: turn.status, turn });
+      if (officialTurnIsTerminal) this.#applyMetadata(state, await this.#client.request("thread/resume", { threadId: state.threadId }));
     } catch (error) {
       state.latestError = error instanceof Error ? error.message : String(error);
-      if (state.status === "starting") state.status = "unknown";
-      state.updatedAt = Date.now();
       this.#appendEvent(state, { type: "official-refresh-error", text: state.latestError, at: Date.now() });
     }
   }
 
-  #onNotification(message) {
-    const threadId = notificationThreadId(message);
-    const turnId = notificationTurnId(message);
-    const requestId = notificationRequestId(message);
-    const state = [...this.#agents.values()].find((candidate) =>
+  #findAgent({ threadId = null, turnId = null, requestId = null } = {}) {
+    return [...this.#agents.values()].find((candidate) =>
       (threadId && candidate.threadId === threadId) ||
       (turnId && candidate.currentTurnId === turnId) ||
       (requestId !== null && candidate.pendingApproval && String(candidate.pendingApproval.requestId) === String(requestId))
-    );
+    ) ?? null;
+  }
+
+  #onNotification(message) {
+    const { threadId, turnId, requestId, turn } = notificationFields(message);
+    const state = this.#findAgent({ threadId, turnId, requestId });
     if (!state) return;
 
-    const turn = notificationTurn(message);
     if (["turn/started", "turn/completed"].includes(message.method) && turnId && state.currentTurnId && turnId !== state.currentTurnId) {
-      state.updatedAt = Date.now();
-      this.#appendEvent(state, { type: "stale-turn-notification-ignored", method: message.method, turnId, currentTurnId: state.currentTurnId, at: Date.now() });
+      this.#applyTurnObservation(state, { source: message.method, method: message.method, turnId });
       return;
     }
     if (turnId && !state.currentTurnId) state.currentTurnId = turnId;
@@ -789,53 +634,26 @@ export class CodexAgentExecutor {
     if (message.method === "item/completed" && message?.params?.item?.id) state.approvalItems.delete(message.params.item.id);
     if (message.method === "serverRequest/resolved") {
       if (state.pendingApproval && String(state.pendingApproval.requestId) === String(requestId)) {
-        state.pendingApproval = null;
-        state.pendingRequestHandle = null;
-        state.status = normalizeAgentStatus(state.latestTurnStatus);
-        if (state.status === "unknown") state.status = "running";
+        this.#clearPending(state);
       }
-    } else if (message.method === "turn/started") {
-      const currentTurnAlreadyTerminal = state.turnEndedAt !== null || TERMINAL_TURN_STATUSES.has(state.latestTurnStatus);
-      if (!currentTurnAlreadyTerminal) {
-        state.latestTurnStatus = turn?.status ?? "inProgress";
-        state.status = state.pendingApproval ? "awaitingApproval" : "running";
-        if (state.turnStartedAt === null) state.turnStartedAt = Date.now();
-      }
-    } else if (message.method === "turn/completed") {
-      const status = turn?.status ?? "completed";
-      state.latestTurnStatus = status;
-      state.status = normalizeAgentStatus(status);
-      if (status === "completed") {
-        state.lastCompletedTurnId = turn?.id ?? state.currentTurnId;
-        state.finalResult = lastAgentMessage(turn) ?? state.finalResult;
-        state.latestError = null;
-      } else if (status === "failed") state.latestError = turn?.error?.message ?? JSON.stringify(turn?.error ?? "turn failed");
-      else if (status === "interrupted") {
-        state.finalResult = lastAgentMessage(turn) ?? state.finalResult;
-        state.latestError = null;
-      }
-      if (TERMINAL_TURN_STATUSES.has(status) && state.turnEndedAt === null) {
-        state.turnEndedAt = Date.now();
-        state.turnDurationMs = state.turnStartedAt === null ? null : Math.max(0, state.turnEndedAt - state.turnStartedAt);
-      }
+    } else if (message.method === "turn/started" || message.method === "turn/completed") {
+      this.#applyTurnObservation(state, {
+        source: message.method,
+        method: message.method,
+        turnId,
+        status: turn?.status ?? (message.method === "turn/completed" ? "completed" : "inProgress"),
+        turn,
+      });
     } else if (message.method === "thread/status/changed") {
-      const type = message?.params?.status?.type;
-      const currentTurnTerminal = state.turnEndedAt !== null || TERMINAL_TURN_STATUSES.has(state.latestTurnStatus);
-      if (type === "active" && !currentTurnTerminal) state.status = state.pendingApproval ? "awaitingApproval" : "running";
-      if (type === "idle" && state.status === "running") state.status = "idle";
-      if (type === "systemError" && !currentTurnTerminal) state.status = "failed";
+      this.#applyTurnObservation(state, { statusType: message?.params?.status?.type });
     }
-    state.updatedAt = Date.now();
     this.#appendEvent(state, compactNotification(message));
   }
 
   #onServerRequest(request) {
-    const params = request?.params && typeof request.params === "object" ? request.params : {};
-    const threadId = params.threadId ?? null;
-    const turnId = params.turnId ?? null;
-    const state = [...this.#agents.values()].find((candidate) =>
-      (threadId && candidate.threadId === threadId) || (turnId && candidate.currentTurnId === turnId)
-    );
+    const { threadId, turnId } = notificationFields(request);
+    const params = request?.params ?? {};
+    const state = this.#findAgent({ threadId, turnId });
     if (!state) {
       request.reject({ code: -32602, message: `Agent server request could not be mapped to an active agent: ${request.method}` });
       return;
@@ -850,7 +668,6 @@ export class CodexAgentExecutor {
     state.pendingApproval = approvalSummary(request, state.approvalItems.get(params.itemId ?? params.item?.id ?? null) ?? null);
     state.pendingRequestHandle = request;
     state.status = "awaitingApproval";
-    state.updatedAt = Date.now();
     this.#appendEvent(state, {
       type: "server-request/pending",
       requestId: request.id,
@@ -866,8 +683,7 @@ export class CodexAgentExecutor {
   }
 
   async #ensureResourceReceipt(state) {
-    if (!state?.currentTurnId || !TERMINAL_TURN_STATUSES.has(state.latestTurnStatus)) return state?.resourceReceipt ?? null;
-    if (state.resourceReceipt && state.resourceReceiptTurnId === state.currentTurnId) return state.resourceReceipt;
+    if (!state?.currentTurnId || !TERMINAL_TURN_STATUSES.has(state.latestTurnStatus) || state.resourceReceipt?.turnId === state.currentTurnId) return state?.resourceReceipt ?? null;
     if (state.resourceReceiptPromise) return await state.resourceReceiptPromise;
 
     const turnId = state.currentTurnId;
@@ -876,20 +692,9 @@ export class CodexAgentExecutor {
       try {
         quotaSnapshot = this.#resourceSnapshotProvider
           ? await this.#resourceSnapshotProvider({ agentRef: state.agentRef, threadId: state.threadId, turnId, cwd: state.cwd })
-          : {
-              status: "unavailable",
-              observedAt: new Date().toISOString(),
-              usage: { status: "unavailable", error: { name: "Unavailable", message: "resource telemetry provider is not configured" } },
-              rateLimits: { status: "unavailable", error: { name: "Unavailable", message: "resource telemetry provider is not configured" } },
-            };
+          : unavailableQuotaSnapshot(null, true);
       } catch (error) {
-        const projected = { name: error instanceof Error ? error.name : "Error", message: error instanceof Error ? error.message : String(error) };
-        quotaSnapshot = {
-          status: "unavailable",
-          observedAt: new Date().toISOString(),
-          usage: { status: "unavailable", error: projected },
-          rateLimits: { status: "unavailable", error: projected },
-        };
+        quotaSnapshot = unavailableQuotaSnapshot(error, true);
       }
       const receipt = buildAgentResourceReceipt({
         turnId,
@@ -898,8 +703,6 @@ export class CodexAgentExecutor {
         quotaSnapshot,
       });
       state.resourceReceipt = receipt;
-      state.resourceReceiptTurnId = turnId;
-      state.updatedAt = Date.now();
       this.#appendEvent(state, { type: "resource-receipt/ready", turnId, at: Date.now() });
       return receipt;
     })();
@@ -907,56 +710,22 @@ export class CodexAgentExecutor {
     finally { state.resourceReceiptPromise = null; }
   }
 
-  #snapshot(state, afterSeq) {
-    const events = state.events.filter((event) => event.seq > afterSeq);
-    const nextSeq = state.events.length ? state.events[state.events.length - 1].seq : afterSeq;
+  #snapshot(state, afterSeq, missing = null) {
+    const events = state ? state.events.filter((event) => event.seq > afterSeq) : [];
+    const nextSeq = state?.events?.length ? state.events[state.events.length - 1].seq : afterSeq;
     return {
-      agentRef: state.agentRef,
-      threadId: state.threadId,
-      turnId: state.currentTurnId,
-      status: state.status,
-      latestTurnStatus: state.latestTurnStatus,
-      canSend: state.status === "idle" && !state.pendingApproval,
-      pendingApproval: state.pendingApproval ? { ...state.pendingApproval } : null,
-      finalResult: state.finalResult,
-      resourceReceipt: state.resourceReceipt ? structuredClone(state.resourceReceipt) : null,
-      latestError: state.latestError,
-      lastCompletedTurnId: state.lastCompletedTurnId,
-      createdAt: state.createdAt,
-      updatedAt: state.updatedAt,
-      timing: { startedAt: state.turnStartedAt, endedAt: state.turnEndedAt, durationMs: state.turnDurationMs },
-      execution: {
-        requestedModel: state.requestedModel,
-        ...(state.requestedReasoningEffort ? { requestedReasoningEffort: state.requestedReasoningEffort } : {}),
-        resolvedModel: state.resolvedModel,
-        modelProvider: state.modelProvider,
-        serviceTier: state.serviceTier,
-        reasoningEffort: state.reasoningEffort,
-      },
+      agentRef: typeof (state?.agentRef ?? missing?.agentRef) === "string" ? (state?.agentRef ?? missing.agentRef) : null,
+      turnId: state?.currentTurnId ?? null,
+      status: state?.status ?? "unknown",
+      canSend: state ? state.status === "idle" && !state.pendingApproval : false,
+      pendingApproval: state?.pendingApproval ? { ...state.pendingApproval } : null,
+      finalResult: state?.finalResult ?? null,
+      resourceReceipt: state?.resourceReceipt ? structuredClone(state.resourceReceipt) : null,
+      latestError: missing?.message ?? state?.latestError ?? null,
+      timing: { startedAt: state?.turnStartedAt ?? null, endedAt: state?.turnEndedAt ?? null, durationMs: state?.turnStartedAt !== null && state?.turnEndedAt !== null ? Math.max(0, state.turnEndedAt - state.turnStartedAt) : null },
+      execution: projectExecution(state),
       events,
       nextSeq,
-      serverRequestMethods: this.#client.serverRequestMethods,
-    };
-  }
-
-  #unknown(agentRef, message) {
-    return {
-      agentRef: typeof agentRef === "string" ? agentRef : null,
-      threadId: null,
-      turnId: null,
-      status: "unknown",
-      latestTurnStatus: null,
-      canSend: false,
-      pendingApproval: null,
-      finalResult: null,
-      resourceReceipt: null,
-      latestError: message,
-      lastCompletedTurnId: null,
-      timing: { startedAt: null, endedAt: null, durationMs: null },
-      execution: { requestedModel: null, resolvedModel: null, modelProvider: null, serviceTier: null, reasoningEffort: null },
-      events: [],
-      nextSeq: 0,
-      serverRequestMethods: this.#client.serverRequestMethods,
     };
   }
 
