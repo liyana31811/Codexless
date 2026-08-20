@@ -3,15 +3,10 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createPublicServerFactory } from "../src/public-server-factory.mjs";
+import { createAgentPreviewState } from "../src/agent-tools.mjs";
 
 const fixture = JSON.parse(await readFile(path.join(import.meta.dirname, "fixtures", "public-tools-v1.json"), "utf8"));
-const agentPreviewState = {
-  meteredConsent: { mode: "always" },
-  preparedMetered: new Map(),
-  agentCards: new Map(),
-  taskRecords: new Map(),
-  taskPersistence: {},
-};
+const agentPreviewState = createAgentPreviewState({ meteredConsentMode: "always" });
 const recentCallDiagnostics = { wrapHandler: (name, handler) => handler };
 
 const createServer = createPublicServerFactory({
@@ -44,4 +39,3 @@ try {
   await client.close();
   await server.close();
 }
-

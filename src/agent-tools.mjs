@@ -1,12 +1,14 @@
 import { createRequire } from "node:module";
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import path from "node:path";
 
 const require = createRequire(import.meta.url);
 const z = require("zod/v4");
-import { MeteredConsentGate } from "./metered-consent.mjs";
 import { AGENT_TASK_CARD_URI, registerAgentTaskCardResource } from "./agent-card-ui.mjs";
+import {
+  createAgentTaskLedger,
+  DEFAULT_TASK_STORE_MAX_ENTRIES,
+  DEFAULT_TASK_STORE_TTL_MS,
+  portableShortTaskId as ledgerPortableShortTaskId,
+} from "./agent-task-ledger.mjs";
 
 const EVENT_KEYS = new Set(["seq", "type", "at", "turnId", "status", "requestId"]);
 const PENDING_APPROVAL_KEYS = new Set(["requestId", "method", "itemId", "receivedAt", "reason", "details"]);
@@ -86,8 +88,7 @@ function quotaFallbackText(window, index) {
 }
 
 function portableShortTaskId(taskRef) {
-  const digest = createHash("sha256").update(String(taskRef), "utf8").digest("hex").slice(0, 10).toUpperCase();
-  return `C-${digest}`;
+  return ledgerPortableShortTaskId(taskRef);
 }
 
 function portableLocale() {
@@ -381,85 +382,6 @@ function pendingTaskSnapshot({ record, resolvedExecution = null }) {
   return pending;
 }
 
-const TASK_STORE_VERSION = 1;
-const DEFAULT_TASK_STORE_TTL_MS = 14 * 24 * 60 * 60_000;
-const DEFAULT_TASK_STORE_MAX_ENTRIES = 2_000;
-
-function createTaskPersistence({ filePath = null, ttlMs = DEFAULT_TASK_STORE_TTL_MS, maxEntries = DEFAULT_TASK_STORE_MAX_ENTRIES } = {}) {
-  if (!filePath) return null;
-  if (!Number.isInteger(ttlMs) || ttlMs < 60_000) throw new Error("agent task-state ttlMs must be at least 60000");
-  if (!Number.isInteger(maxEntries) || maxEntries < 10 || maxEntries > 100_000) throw new Error("agent task-state maxEntries must be 10..100000");
-  const resolvedPath = path.resolve(filePath);
-  const records = new Map();
-  let blockedError = null;
-
-  if (existsSync(resolvedPath)) {
-    try {
-      const parsed = JSON.parse(readFileSync(resolvedPath, "utf8"));
-      if (parsed?.version !== TASK_STORE_VERSION || !Array.isArray(parsed.records)) {
-        throw new Error(`unsupported task-state schema version ${String(parsed?.version ?? "missing")}`);
-      }
-      for (const entry of parsed.records) {
-        if (!entry || typeof entry !== "object" || typeof entry.taskRef !== "string") continue;
-        records.set(entry.taskRef, entry);
-      }
-    } catch (error) {
-      blockedError = `agent task-state file is unreadable or corrupt: ${error instanceof Error ? error.message : String(error)}`;
-    }
-  }
-
-  function assertAvailable() {
-    if (blockedError) throw new Error(blockedError);
-  }
-
-  function trim(now = Date.now()) {
-    for (const [key, entry] of records) {
-      const updatedAt = Number.isFinite(entry?.updatedAt) ? entry.updatedAt : 0;
-      if (!updatedAt || now - updatedAt > ttlMs) records.delete(key);
-    }
-    if (records.size <= maxEntries) return;
-    const oldest = [...records.entries()].sort((a, b) => (a[1]?.updatedAt ?? 0) - (b[1]?.updatedAt ?? 0));
-    for (let index = 0; index < oldest.length - maxEntries; index += 1) records.delete(oldest[index][0]);
-  }
-
-  function flush() {
-    assertAvailable();
-    trim();
-    mkdirSync(path.dirname(resolvedPath), { recursive: true });
-    const tmp = `${resolvedPath}.tmp-${randomUUID()}`;
-    writeFileSync(tmp, JSON.stringify({ version: TASK_STORE_VERSION, records: [...records.values()] }), { encoding: "utf8", mode: 0o600 });
-    renameSync(tmp, resolvedPath);
-  }
-
-  trim();
-  return {
-    filePath: resolvedPath,
-    get(taskRef) {
-      assertAvailable();
-      trim();
-      const entry = records.get(taskRef);
-      return entry ? structuredClone(entry) : null;
-    },
-    findByRequest({ requestId, action, agentRef = null }) {
-      assertAvailable();
-      trim();
-      let found = null;
-      for (const entry of records.values()) {
-        if (entry?.requestId !== requestId || entry?.action !== action) continue;
-        if ((entry?.subjectRef ?? null) !== agentRef) continue;
-        if (!found || (entry.updatedAt ?? 0) > (found.updatedAt ?? 0)) found = entry;
-      }
-      return found ? structuredClone(found) : null;
-    },
-    put(entry) {
-      assertAvailable();
-      if (!entry || typeof entry.taskRef !== "string" || !entry.taskRef) throw new Error("persisted agent task entry requires taskRef");
-      records.set(entry.taskRef, { ...structuredClone(entry), updatedAt: Date.now() });
-      flush();
-    },
-  };
-}
-
 export function createAgentPreviewState({
   meteredConsentMode = "off",
   meteredQuotaProvider = null,
@@ -467,13 +389,17 @@ export function createAgentPreviewState({
   taskStateTtlMs = DEFAULT_TASK_STORE_TTL_MS,
   taskStateMaxEntries = DEFAULT_TASK_STORE_MAX_ENTRIES,
 } = {}) {
-  return {
-    meteredConsent: new MeteredConsentGate({ mode: meteredConsentMode, quotaProvider: meteredQuotaProvider }),
-    preparedMetered: new Map(),
-    agentCards: new Map(),
-    taskRecords: new Map(),
-    taskPersistence: createTaskPersistence({ filePath: taskStateFile, ttlMs: taskStateTtlMs, maxEntries: taskStateMaxEntries }),
-  };
+  const ledger = createAgentTaskLedger({
+    mode: meteredConsentMode,
+    quotaProvider: meteredQuotaProvider,
+    taskStateFile,
+    taskStateTtlMs,
+    taskStateMaxEntries,
+  });
+  // A read-only mode view keeps description interpolation compatible while
+  // leaving the ledger as the sole mutable owner of Agent state.
+  const meteredConsent = Object.freeze({ get mode() { return ledger.mode; } });
+  return { ledger, meteredConsent };
 }
 
 function isTerminalStatus(status) {
@@ -499,20 +425,10 @@ export function registerAgentPreviewTools(server, {
     throw new Error("Agent preview requires both agentExecutor and authorityExecutor");
   }
   const state = agentPreviewState ?? createAgentPreviewState({ meteredConsentMode, meteredQuotaProvider });
-  const { meteredConsent, preparedMetered, agentCards, taskRecords, taskPersistence } = state;
+  const ledger = state.ledger;
+  if (!ledger) throw new Error("Agent preview requires canonical task ledger state");
+  const meteredConsent = state.meteredConsent;
   registerAgentTaskCardResource(server);
-
-  function summaryFor(action, payload) {
-    const text = action === "start" ? payload.prompt : payload.message;
-    const clean = String(text ?? "").replace(/\s+/g, " ").trim();
-    return clean.length > 120 ? clean.slice(0, 117) + "..." : clean;
-  }
-
-  function titleFor(action, payload) {
-    const text = action === "start" ? payload.prompt : payload.message;
-    const firstLine = String(text ?? "").split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "Codex task";
-    return firstLine.length > 72 ? firstLine.slice(0, 69) + "..." : firstLine;
-  }
 
   async function fullModelCatalog() {
     const models = [];
@@ -572,191 +488,25 @@ export function registerAgentPreviewTools(server, {
     };
   }
 
-  function taskPayloadHash(action, payload, agentRef = null) {
-    const hasCallerModel = Object.hasOwn(payload ?? {}, "callerModel");
-    const hasCallerEffort = Object.hasOwn(payload ?? {}, "callerReasoningEffort");
-    const bound = {
-      action,
-      agentRef,
-      prompt: action === "start" ? payload?.prompt ?? null : null,
-      message: action === "send" ? payload?.message ?? null : null,
-      cwd: action === "start" ? payload?.cwd ?? null : null,
-      permissionProfile: action === "start" ? payload?.permissionProfile ?? null : null,
-      model: hasCallerModel ? payload?.callerModel ?? null : payload?.model ?? null,
-    };
-    if (hasCallerEffort) bound.reasoningEffort = payload?.callerReasoningEffort ?? null;
-    else if (!hasCallerModel && Object.hasOwn(payload ?? {}, "reasoningEffort")) bound.reasoningEffort = payload.reasoningEffort ?? null;
-    return createHash("sha256").update(JSON.stringify(bound), "utf8").digest("hex");
-  }
-
-  function taskCardFor({ taskRef, requestId, action, payload, cwd = null, permissionProfile = null, quota = null }) {
-    return {
-      kind: "codex_task",
-      taskRef,
-      taskId: taskRef,
-      requestId,
-      action,
-      title: titleFor(action, payload),
-      summary: summaryFor(action, payload),
-      requestedModel: Object.hasOwn(payload ?? {}, "callerModel")
-        ? (typeof payload?.callerModel === "string" ? payload.callerModel : null)
-        : (typeof payload?.model === "string" ? payload.model : null),
-      ...(Object.hasOwn(payload ?? {}, "callerReasoningEffort")
-        ? (typeof payload?.callerReasoningEffort === "string" ? { requestedReasoningEffort: payload.callerReasoningEffort } : {})
-        : (typeof payload?.reasoningEffort === "string" ? { requestedReasoningEffort: payload.reasoningEffort } : {})),
-      ...(payload?.modelSelection && typeof payload.modelSelection === "object" ? { modelSelection: structuredClone(payload.modelSelection) } : {}),
-      cwd,
-      permissionProfile,
-      quota,
-    };
-  }
-
-  function createTaskRecord({ consent = null, requestId = null, action, payload, cwd = null, permissionProfile = null, agentRef = null, authorized = false }) {
-    const taskRef = `task_${randomUUID()}`;
-    const boundConsent = consent ?? { consentRef: null, requestId, quota: null };
-    const boundRequestId = boundConsent.requestId ?? requestId;
-    return {
-      taskRef,
-      taskId: taskRef,
-      consent: boundConsent,
-      action,
-      payload,
-      payloadHash: taskPayloadHash(action, payload, agentRef),
-      cwd,
-      permissionProfile,
-      subjectRef: agentRef,
-      agentRef,
-      authorized,
-      commitToken: authorized ? null : `commit_${randomUUID()}`,
-      turnId: null,
-      terminalSnapshot: null,
-      declinedAt: null,
-      taskCard: taskCardFor({ taskRef, requestId: boundRequestId, action, payload, cwd, permissionProfile, quota: boundConsent.quota }),
-    };
-  }
-
-  function persistableSnapshot(snapshot) {
-    if (!snapshot || typeof snapshot !== "object") return null;
-    const resultSummary = compactOneLine(snapshot.resultSummary ?? snapshot.finalResult ?? snapshot.latestError ?? "", 800);
-    return {
-      taskRef: snapshot.taskRef ?? snapshot.taskId ?? snapshot.taskCard?.taskRef ?? null,
-      taskId: snapshot.taskRef ?? snapshot.taskId ?? snapshot.taskCard?.taskRef ?? null,
-      agentRef: snapshot.agentRef ?? null,
-      turnId: snapshot.turnId ?? null,
-      status: snapshot.status ?? "lost",
-      canSend: false,
-      pendingApproval: null,
-      taskCard: snapshot.taskCard ? structuredClone(snapshot.taskCard) : null,
-      meteredConsent: snapshot.meteredConsent ? structuredClone(snapshot.meteredConsent) : null,
-      finalResult: resultSummary || null,
-      resultSummary: resultSummary || null,
-      resourceReceipt: snapshot.resourceReceipt ? structuredClone(snapshot.resourceReceipt) : null,
-      timing: snapshot.timing ? structuredClone(snapshot.timing) : { startedAt: null, endedAt: null, durationMs: null },
-      execution: snapshot.execution ? structuredClone(snapshot.execution) : { requestedModel: null, resolvedModel: null, modelProvider: null, serviceTier: null, reasoningEffort: null },
-      latestError: snapshot.latestError ? compactOneLine(snapshot.latestError, 800) : null,
-      terminal: snapshot.terminal === true,
-      terminalAt: Number.isFinite(snapshot.terminalAt) ? snapshot.terminalAt : null,
-      events: [],
-      nextSeq: 0,
-    };
-  }
-
-  function persistRecord(record, snapshot = null, phase = null) {
-    if (!taskPersistence || !record?.taskRef) return true;
-    try {
-      taskPersistence.put({
-        taskRef: record.taskRef,
-        consentRef: record.consent?.consentRef ?? null,
-        requestId: record.consent?.requestId ?? record.taskCard?.requestId ?? null,
-        action: record.action,
-        payloadHash: record.payloadHash ?? null,
-        taskCard: structuredClone(record.taskCard),
-        subjectRef: record.subjectRef ?? null,
-        agentRef: record.agentRef ?? null,
-        turnId: record.turnId ?? null,
-        phase: phase ?? (record.terminalSnapshot ? "terminal" : record.authorized ? "active" : "pending"),
-        terminalSnapshot: snapshot ? persistableSnapshot(snapshot) : record.terminalSnapshot ? persistableSnapshot(record.terminalSnapshot) : null,
-      });
-      record.persistenceWarning = null;
-      return true;
-    } catch (error) {
-      record.persistenceWarning = `Task-card persistence unavailable: ${error instanceof Error ? error.message : String(error)}`;
-      return false;
-    }
-  }
-
-  function recoveredTaskState(taskRef) {
-    if (!taskPersistence || typeof taskRef !== "string" || !taskRef) return null;
-    const persisted = taskPersistence.get(taskRef);
-    if (!persisted) return null;
-    if (persisted.terminalSnapshot?.terminal === true) return structuredClone(persisted.terminalSnapshot);
-    const now = Date.now();
-    const lost = {
-      taskRef,
-      taskId: taskRef,
-      agentRef: persisted.agentRef ?? null,
-      turnId: persisted.turnId ?? null,
-      status: "lost",
-      canSend: false,
-      pendingApproval: null,
-      taskCard: persisted.taskCard ? structuredClone(persisted.taskCard) : null,
-      meteredConsent: { status: "unavailable", quota: persisted.taskCard?.quota ?? null },
-      finalResult: null,
-      resourceReceipt: null,
-      timing: { startedAt: null, endedAt: now, durationMs: null },
-      execution: {
-        requestedModel: persisted.taskCard?.requestedModel ?? null,
-        ...(typeof persisted.taskCard?.requestedReasoningEffort === "string" ? { requestedReasoningEffort: persisted.taskCard.requestedReasoningEffort } : {}),
-        resolvedModel: null,
-        modelProvider: null,
-        serviceTier: null,
-        reasoningEffort: null,
-      },
-      latestError: "Task control state was lost across Codexless restart. The original task will not be replayed.",
-      terminal: true,
-      terminalAt: now,
-      resultSummary: "Task control state was lost across Codexless restart. The original task will not be replayed.",
-      events: [],
-      nextSeq: 0,
-    };
-    try {
-      taskPersistence.put({ ...persisted, phase: "terminal", terminalSnapshot: persistableSnapshot(lost) });
-    } catch {}
-    return lost;
-  }
-
   async function existingRequestState({ requestId, action, payload, agentRef = null }) {
-    if (!taskPersistence) return null;
-    const persisted = taskPersistence.findByRequest({ requestId, action, agentRef });
-    if (!persisted) return null;
-    const payloadHash = taskPayloadHash(action, payload, agentRef);
-    if (persisted.payloadHash && persisted.payloadHash !== payloadHash) {
-      throw new Error(`requestId ${requestId} was already used for a different Codex task payload`);
-    }
-    const live = taskRecords.get(persisted.taskRef);
-    if (live) return preparedCardState(live);
-    return recoveredTaskState(persisted.taskRef);
+    const record = ledger.findRecord({ requestId, action, subjectRef: agentRef, payload });
+    if (!record) return null;
+    if (!record.payload && !record.terminalSnapshot) return ledger.recover(record.taskRef);
+    return preparedCardState(record);
   }
 
   function rememberPrepared({ consent, action, payload, cwd = null, permissionProfile = null, agentRef = null }) {
-    const existing = preparedMetered.get(consent.consentRef);
+    const existing = ledger.taskByConsent(consent.consentRef);
     if (existing) return existing;
-    const record = createTaskRecord({ consent, action, payload, cwd, permissionProfile, agentRef });
-    preparedMetered.set(consent.consentRef, record);
-    taskRecords.set(record.taskRef, record);
-    persistRecord(record, null, "pending");
-    return record;
+    return ledger.createTask({ consent, action, payload, cwd, permissionProfile, agentRef, authorized: false });
   }
 
   function directRecord({ action, payload, cwd = null, permissionProfile = null, agentRef = null, requestId }) {
-    const record = createTaskRecord({ action, payload, cwd, permissionProfile, agentRef, requestId, authorized: true });
-    taskRecords.set(record.taskRef, record);
-    persistRecord(record, null, "pending");
-    return record;
+    return ledger.createTask({ action, payload, cwd, permissionProfile, agentRef, requestId, authorized: true });
   }
 
   function cardForAgent(agentRef) {
-    return agentRef ? agentCards.get(agentRef) ?? null : null;
+    return ledger.taskForAgent(agentRef)?.taskCard ?? null;
   }
 
   function publicTaskSnapshot(record, snapshot) {
@@ -764,7 +514,7 @@ export function registerAgentPreviewTools(server, {
       ...publicAgentSnapshot(snapshot, record.taskCard),
       taskRef: record.taskRef,
       taskId: record.taskRef,
-      meteredConsent: { status: "approved", quota: record.consent.quota },
+      meteredConsent: { status: "approved", quota: record.consent?.quota ?? record.taskCard?.quota ?? null },
     };
   }
 
@@ -778,8 +528,8 @@ export function registerAgentPreviewTools(server, {
       resourceReceipt: null,
       timing: { startedAt: null, endedAt: Date.now(), durationMs: 0 },
       execution: {
-        requestedModel: record.payload.model ?? null,
-        ...(typeof record.payload.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
+        requestedModel: record.payload?.model ?? record.taskCard?.requestedModel ?? null,
+        ...(typeof record.payload?.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
         resolvedModel: null,
         modelProvider: null,
         serviceTier: null,
@@ -787,25 +537,12 @@ export function registerAgentPreviewTools(server, {
       },
       latestError: error instanceof Error ? error.message : String(error),
       events: [], nextSeq: 0,
-      meteredConsent: { status: "approved", quota: record.consent.quota },
+      meteredConsent: { status: "approved", quota: record.consent?.quota ?? record.taskCard?.quota ?? null },
     };
   }
 
   function freezeRecord(record, payload) {
-    if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
-    const frozen = {
-      ...structuredClone(payload),
-      taskRef: record.taskRef,
-      taskId: record.taskRef,
-      taskCard: structuredClone(record.taskCard),
-      canSend: false,
-      terminal: true,
-      terminalAt: Date.now(),
-    };
-    frozen.resultSummary = compactOneLine(frozen.finalResult ?? frozen.latestError ?? terminalLabel(frozen.status), 600);
-    record.terminalSnapshot = frozen;
-    persistRecord(record, frozen, "terminal");
-    return structuredClone(frozen);
+    return ledger.freeze(record, payload);
   }
 
   function lostRecord(record) {
@@ -818,8 +555,8 @@ export function registerAgentPreviewTools(server, {
       resourceReceipt: null,
       timing: { startedAt: null, endedAt: Date.now(), durationMs: null },
       execution: {
-        requestedModel: typeof record.payload?.model === "string" ? record.payload.model : null,
-        ...(typeof record.payload?.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
+        requestedModel: typeof record.payload?.model === "string" ? record.payload.model : record.taskCard?.requestedModel ?? null,
+        ...(typeof record.payload?.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : typeof record.taskCard?.requestedReasoningEffort === "string" ? { requestedReasoningEffort: record.taskCard.requestedReasoningEffort } : {}),
         resolvedModel: null,
         modelProvider: null,
         serviceTier: null,
@@ -828,7 +565,7 @@ export function registerAgentPreviewTools(server, {
       latestError: "Task-specific terminal state was not observed before this agent advanced. The original task will not be replayed.",
       events: [],
       nextSeq: 0,
-      meteredConsent: { status: "approved", quota: record.consent.quota },
+      meteredConsent: { status: "approved", quota: record.consent?.quota ?? record.taskCard?.quota ?? null },
     });
   }
 
@@ -836,7 +573,7 @@ export function registerAgentPreviewTools(server, {
     if (!agentRef) return;
     const snapshot = await agentExecutor.show({ agentRef, afterSeq: 0 });
     if (!isTerminalStatus(snapshot?.status)) return;
-    for (const record of taskRecords.values()) {
+    for (const record of ledger.records()) {
       if (record.agentRef !== agentRef || record.terminalSnapshot) continue;
       if (!record.turnId && cardForAgent(agentRef)?.taskRef === record.taskRef) record.turnId = snapshot.turnId ?? null;
       if (!record.turnId || snapshot.turnId !== record.turnId) continue;
@@ -846,9 +583,8 @@ export function registerAgentPreviewTools(server, {
 
   async function preparedCardState(record) {
     if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
-    if (!record.authorized) {
-      return pendingTaskSnapshot({ record });
-    }
+    if (!record.payload && record.persisted) return ledger.recover(record.taskRef);
+    if (!record.authorized) return pendingTaskSnapshot({ record });
     if (!record.agentRef) throw new Error("prepared Codex task is authorized but its agentRef is not available yet");
     const snapshot = await agentExecutor.show({ agentRef: record.agentRef, afterSeq: 0 });
     if (!record.turnId && snapshot.turnId) record.turnId = snapshot.turnId;
@@ -859,63 +595,30 @@ export function registerAgentPreviewTools(server, {
   }
 
   function preparedRecordByPortableTaskId(taskId) {
-    const matches = [...taskRecords.values()].filter((record) => portableShortTaskId(record.taskRef) === taskId);
-    if (matches.length !== 1) throw new Error("unknown, stale, or ambiguous Portable Card task ID");
-    const record = matches[0];
-    if (!record.consent?.consentRef) throw new Error("Portable Card task ID is not bound to a prepared metered task");
-    return record;
+    return ledger.taskByPortable(taskId);
   }
 
   function declinePrepared(record) {
-    if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
-    if (record.authorized) throw new Error("prepared Codex task already started and cannot be declined as a pre-call task");
-    record.declinedAt = Date.now();
-    return freezeRecord(record, {
-      agentRef: record.agentRef,
-      turnId: null,
-      status: "rejected",
-      pendingApproval: null,
-      finalResult: null,
-      resourceReceipt: null,
-      timing: { startedAt: null, endedAt: record.declinedAt, durationMs: 0 },
-      execution: {
-        requestedModel: record.payload?.model ?? null,
-        ...(typeof record.payload?.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
-        resolvedModel: null,
-        modelProvider: null,
-        serviceTier: null,
-        reasoningEffort: null,
-      },
-      latestError: null,
-      events: [],
-      nextSeq: 0,
-      meteredConsent: { status: "rejected", quota: record.consent.quota },
-    });
+    return ledger.decline(record);
   }
 
   function approvePrepared(record) {
     if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
     if (record.declinedAt) return { ...structuredClone(record.terminalSnapshot ?? lostRecord(record)), duplicate: true };
-    const consentRef = record.consent?.consentRef;
-    if (!consentRef) throw new Error("prepared Codex task is missing its metered consentRef");
-    const approval = meteredConsent.approve({
+    const approval = ledger.commitTask(record, {
       action: record.action,
       requestId: record.consent.requestId,
       subjectRef: record.action === "send" ? record.agentRef : null,
       payload: record.payload,
-      consentRef,
+      consentRef: record.consent.consentRef,
     });
-    if (!approval.authorized) throw new Error("prepared Codex task approval did not authorize dispatch");
-    record.authorized = true;
+    if (approval.duplicate && record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
     return dispatchPrepared(record);
   }
 
   async function dispatchPrepared(record) {
     if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
     if (record.declinedAt) return structuredClone(record.terminalSnapshot ?? lostRecord(record));
-    if (taskPersistence && !persistRecord(record, null, record.authorized ? "active" : "pending")) {
-      throw new Error("Codex task was not started because durable Task Card state could not be recorded safely");
-    }
     if (record.action === "start") {
       const currentAuthority = await authorityExecutor.resolveAuthority({ cwd: record.cwd, access: "inherit" });
       if (currentAuthority.effectiveCwd !== record.cwd || currentAuthority.permissionProfile !== record.permissionProfile) {
@@ -930,6 +633,8 @@ export function registerAgentPreviewTools(server, {
     if (!record.authorized) {
       throw new Error("Codex task is still pending user approval; dispatch is blocked until the prepared task is explicitly committed");
     }
+    // The durable active marker is the last local boundary before a remote call.
+    ledger.markActive(record);
 
     if (record.action === "start") {
       let snapshot;
@@ -945,14 +650,10 @@ export function registerAgentPreviewTools(server, {
       } catch (error) {
         return freezeRecord(record, failedDispatchSnapshot(record, error));
       }
-      if (snapshot?.agentRef) {
-        record.agentRef = snapshot.agentRef;
-        record.turnId = snapshot.turnId ?? null;
-        agentCards.set(snapshot.agentRef, record.taskCard);
-      }
+      if (snapshot?.agentRef) ledger.bindAgent(record, snapshot.agentRef, snapshot.turnId ?? null);
       const payload = publicTaskSnapshot(record, snapshot);
       if (isTerminalStatus(payload.status)) return freezeRecord(record, payload);
-      persistRecord(record, payload, "active");
+      ledger.persist(record, "active", payload);
       return payload;
     }
 
@@ -970,10 +671,10 @@ export function registerAgentPreviewTools(server, {
       return freezeRecord(record, failedDispatchSnapshot(record, error));
     }
     record.turnId = snapshot.turnId ?? null;
-    if (record.agentRef) agentCards.set(record.agentRef, record.taskCard);
+    if (record.agentRef) ledger.bindAgent(record, record.agentRef, record.turnId);
     const payload = publicTaskSnapshot(record, snapshot);
     if (isTerminalStatus(payload.status)) return freezeRecord(record, payload);
-    persistRecord(record, payload, "active");
+    ledger.persist(record, "active", payload);
     return payload;
   }
 
@@ -1045,7 +746,7 @@ export function registerAgentPreviewTools(server, {
         ...(typeof preparedSelection.selectedReasoningEffort === "string" ? { reasoningEffort: preparedSelection.selectedReasoningEffort } : {}),
         modelSelection: preparedSelection,
       } : callerPayload;
-      const consent = await meteredConsent.authorize({ action: "start", requestId, payload });
+      const consent = await ledger.authorize({ action: "start", requestId, payload });
       if (!consent.authorized) {
         const record = rememberPrepared({
           consent: consent.consent,
@@ -1085,12 +786,12 @@ export function registerAgentPreviewTools(server, {
     },
     async ({ consentRef }) => structuredCard(
       async () => {
-        const record = preparedMetered.get(consentRef);
+        const record = ledger.taskByConsent(consentRef);
         if (!record) throw new Error("unknown or stale prepared metered consentRef");
         return preparedCardState(record);
       },
       () => {
-        const record = preparedMetered.get(consentRef);
+        const record = ledger.taskByConsent(consentRef);
         return record?.commitToken ? { codexlessCommitToken: record.commitToken } : {};
       },
       (payload) => payload?.manualFallback?.text ?? null
@@ -1114,19 +815,19 @@ export function registerAgentPreviewTools(server, {
       async () => {
         if (!taskRef && !consentRef) throw new Error("taskRef or consentRef is required");
         if (taskRef) {
-          const live = taskRecords.get(taskRef);
+          const live = ledger.taskByRef(taskRef);
           if (live) return preparedCardState(live);
-          const recovered = recoveredTaskState(taskRef);
+          const recovered = ledger.recover(taskRef);
           if (recovered) return recovered;
         }
         if (consentRef) {
-          const legacy = preparedMetered.get(consentRef);
+          const legacy = ledger.taskByConsent(consentRef);
           if (legacy) return preparedCardState(legacy);
         }
         throw new Error("unknown or stale Codex task card reference");
       },
       () => {
-        const live = taskRef ? taskRecords.get(taskRef) : consentRef ? preparedMetered.get(consentRef) : null;
+        const live = taskRef ? ledger.taskByRef(taskRef) : consentRef ? ledger.taskByConsent(consentRef) : null;
         return live?.commitToken ? { codexlessCommitToken: live.commitToken } : {};
       }
     )
@@ -1220,7 +921,7 @@ export function registerAgentPreviewTools(server, {
         parentTurnId: current.turnId,
         permissionProfile: parentCard?.permissionProfile ?? null,
       };
-      const consent = await meteredConsent.authorize({ action: "send", requestId, subjectRef: agentRef, payload });
+      const consent = await ledger.authorize({ action: "send", requestId, subjectRef: agentRef, payload });
       if (!consent.authorized) {
         const record = rememberPrepared({
           consent: consent.consent,
@@ -1262,7 +963,7 @@ export function registerAgentPreviewTools(server, {
       if (portableMode === (typeof consentRef === "string")) {
         throw new Error("provide exactly one of consentRef (Rich Card) or taskId (Portable Card)");
       }
-      const record = portableMode ? preparedRecordByPortableTaskId(taskId) : preparedMetered.get(consentRef);
+      const record = portableMode ? preparedRecordByPortableTaskId(taskId) : ledger.taskByConsent(consentRef);
       if (!record) throw new Error("unknown or stale prepared metered Codex task");
       return declinePrepared(record);
     })
@@ -1292,7 +993,7 @@ export function registerAgentPreviewTools(server, {
       if (!consentRef || !commitToken) {
         throw new Error("Rich Task Card commit requires both consentRef and commitToken");
       }
-      const record = preparedMetered.get(consentRef);
+      const record = ledger.taskByConsent(consentRef);
       if (!record) throw new Error("unknown or stale prepared metered consentRef");
       if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
       if (record.declinedAt) return { ...structuredClone(record.terminalSnapshot ?? lostRecord(record)), duplicate: true };

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { MeteredConsentGate } from "../src/metered-consent.mjs";
+import { createAgentTaskLedger } from "../src/agent-task-ledger.mjs";
 
 const quotaProvider = async () => ({
   status: "ok",
@@ -8,7 +8,7 @@ const quotaProvider = async () => ({
   rateLimits: { status: "ok", limits: [] },
 });
 
-const gate = new MeteredConsentGate({ mode: "always", quotaProvider });
+const gate = createAgentTaskLedger({ mode: "always", quotaProvider });
 const payload = {
   prompt: "consent hardening probe",
   cwd: "/tmp/project",
@@ -38,7 +38,7 @@ assert.equal(replayWithoutApproval.duplicate, true);
 assert.equal(replayWithoutApproval.consent.consentRef, first.consent.consentRef);
 
 assert.throws(
-  () => gate.approve({
+  () => gate.approveConsent({
     action: "start",
     requestId: "req-consent-hardening-1",
     payload,
@@ -47,7 +47,7 @@ assert.throws(
   /does not match/i,
 );
 
-const approved = gate.approve({
+const approved = gate.approveConsent({
   action: "start",
   requestId: "req-consent-hardening-1",
   payload,
@@ -56,7 +56,7 @@ const approved = gate.approve({
 assert.equal(approved.authorized, true);
 assert.equal(approved.duplicate, false);
 
-const approvedAgain = gate.approve({
+const approvedAgain = gate.approveConsent({
   action: "start",
   requestId: "req-consent-hardening-1",
   payload,
@@ -65,9 +65,9 @@ const approvedAgain = gate.approve({
 assert.equal(approvedAgain.authorized, true);
 assert.equal(approvedAgain.duplicate, true);
 
-const offGate = new MeteredConsentGate({ mode: "off" });
+const offGate = createAgentTaskLedger({ mode: "off" });
 const off = await offGate.authorize({ action: "start", requestId: "req-off", payload });
 assert.equal(off.authorized, true);
 assert.equal(off.mode, "off");
 
-console.log("metered consent hardening PASS");
+console.log("agent task ledger consent hardening PASS");
