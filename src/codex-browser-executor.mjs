@@ -33,6 +33,167 @@ const BROWSER_MUTATION_DEFINITIVE_RESPONSE_CODES = new Set([
   "BROWSER_TAB_STALE",
 ]);
 
+const PREPARED_ACTION_METADATA = Object.freeze({
+  close_tab: Object.freeze({
+    invalidReferenceMessage: "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_close_tab",
+    expiredReferenceMessage: "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared tab close",
+    expiredNextActions: Object.freeze(["Call codex.browser_tabs and codex.browser_prepare_close_tab again only if the exact tab still needs to be closed."]),
+    generationMessage: "The prepared tab close belongs to an older Codex Workbench generation and cannot be dispatched",
+    generationNextActions: Object.freeze(["Call codex.browser_tabs and prepare the close again from the current Browser runtime only if the tab still needs to be closed."]),
+    tabMessage: "The prepared tab close no longer matches a current Browser runtime tab",
+    tabNextActions: Object.freeze(["Call codex.browser_tabs and prepare a fresh close only for the exact current tab that still needs closing."]),
+  }),
+  open_tab: Object.freeze({
+    invalidReferenceMessage: "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_open_tab",
+    expiredReferenceMessage: "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared new-tab action",
+    expiredNextActions: Object.freeze(["Call codex.browser_prepare_open_tab again to prepare a fresh exact URL."]),
+    generationMessage: "The prepared new-tab action belongs to an older Codex Workbench generation and cannot be dispatched",
+    generationNextActions: Object.freeze(["Prepare the new tab again from the current Browser runtime."]),
+  }),
+  navigate: Object.freeze({
+    invalidReferenceMessage: "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_navigate",
+    expiredReferenceMessage: "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared navigation",
+    expiredNextActions: Object.freeze(["Call codex.browser_tabs and codex.browser_prepare_navigate again to prepare a fresh exact navigation."]),
+    generationMessage: "The prepared navigation belongs to an older Codex Workbench generation and cannot be dispatched",
+    generationNextActions: Object.freeze(["Call codex.browser_tabs and prepare the navigation again from current page state."]),
+    tabMessage: "The prepared navigation no longer matches a current Browser runtime tab",
+    tabNextActions: Object.freeze(["Call codex.browser_tabs and prepare the navigation again from current page state."]),
+  }),
+  click: Object.freeze({
+    invalidReferenceMessage: "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_click",
+    expiredReferenceMessage: "actionApprovalRef is invalid, expired, or already consumed",
+    expiredNextActions: Object.freeze(["Call codex.browser_tabs and codex.browser_prepare_click again to prepare a fresh exact click."]),
+    generationMessage: "The prepared click belongs to an older Codex Workbench generation and cannot be dispatched",
+    generationNextActions: Object.freeze(["Call codex.browser_tabs and prepare the click again from current page state."]),
+    tabMessage: "The prepared click no longer matches a current Browser runtime tab",
+    tabNextActions: Object.freeze(["Call codex.browser_tabs and prepare the click again from current page state."]),
+  }),
+  download: Object.freeze({
+    invalidReferenceMessage: "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_download",
+    expiredReferenceMessage: "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared download",
+    expiredNextActions: Object.freeze(["Call codex.browser_tabs and codex.browser_prepare_download again to prepare a fresh exact download."]),
+    generationMessage: "The prepared download belongs to an older Codex Workbench generation and cannot be dispatched",
+    generationNextActions: Object.freeze(["Call codex.browser_tabs and prepare the download again from current page state."]),
+    tabMessage: "The prepared download no longer matches a current Browser runtime tab",
+    tabNextActions: Object.freeze(["Call codex.browser_tabs and prepare the download again from current page state."]),
+  }),
+  upload: Object.freeze({
+    invalidReferenceMessage: "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_upload",
+    expiredReferenceMessage: "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared upload",
+    expiredNextActions: Object.freeze(["Call codex.browser_tabs and codex.browser_prepare_upload again to prepare a fresh exact upload."]),
+    generationMessage: "The prepared upload belongs to an older Codex Workbench generation and cannot be dispatched",
+    generationNextActions: Object.freeze(["Call codex.browser_tabs and prepare the upload again from current page state."]),
+    tabMessage: "The prepared upload no longer matches a current Browser runtime tab",
+    tabNextActions: Object.freeze(["Call codex.browser_tabs and prepare the upload again from current page state."]),
+  }),
+  fill: Object.freeze({
+    invalidReferenceMessage: "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_fill",
+    expiredReferenceMessage: "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared fill",
+    expiredNextActions: Object.freeze(["Call codex.browser_tabs and codex.browser_prepare_fill again to prepare a fresh exact fill."]),
+    generationMessage: "The prepared fill belongs to an older Codex Workbench generation and cannot be dispatched",
+    generationNextActions: Object.freeze(["Call codex.browser_tabs and prepare the fill again from current page state."]),
+    tabMessage: "The prepared fill no longer matches a current Browser runtime tab",
+    tabNextActions: Object.freeze(["Call codex.browser_tabs and prepare the fill again from current page state."]),
+  }),
+});
+
+const BROWSER_MUTATION_UNCERTAINTY = Object.freeze({
+  click: Object.freeze({
+    marker: "TOOLWIRE_BROWSER_CLICK_RESULT_UNCERTAIN",
+    code: "BROWSER_CLICK_RESULT_UNCERTAIN",
+    messagePrefix: "Browser click result is uncertain: ",
+    directNextActions: Object.freeze([
+      "Do not retry this click automatically. The remote action may already have happened even though its MCP response was lost or unreadable.",
+      "Re-read current tab/page state first, then prepare a fresh click only if the intended action is still needed.",
+    ]),
+    classifiedNextActions: Object.freeze(["Do not retry this click automatically. Re-read current tab/page state first, then prepare a fresh click only if the intended action is still needed."]),
+  }),
+  fill: Object.freeze({
+    marker: "TOOLWIRE_BROWSER_FILL_RESULT_UNCERTAIN",
+    code: "BROWSER_FILL_RESULT_UNCERTAIN",
+    messagePrefix: "Browser fill result is uncertain: ",
+    directNextActions: Object.freeze([
+      "Do not retry this fill automatically. The remote action may already have happened even though its MCP response was lost or unreadable.",
+      "Re-read current tab/page state first, then prepare a fresh fill only if the intended action is still needed.",
+    ]),
+    classifiedNextActions: Object.freeze(["Do not retry this fill automatically. Re-read current tab/page state first, then prepare a fresh fill only if the intended text is still needed."]),
+  }),
+  navigate: Object.freeze({
+    marker: "TOOLWIRE_BROWSER_NAVIGATE_RESULT_UNCERTAIN",
+    code: "BROWSER_NAVIGATE_RESULT_UNCERTAIN",
+    messagePrefix: "Browser navigation result is uncertain: ",
+    directNextActions: Object.freeze([
+      "Do not retry this navigate automatically. The remote action may already have happened even though its MCP response was lost or unreadable.",
+      "Re-read current tab/page state first, then prepare a fresh navigate only if the intended action is still needed.",
+    ]),
+    classifiedNextActions: Object.freeze(["Do not retry this navigation automatically. Re-read current tab/page state first, then prepare a fresh navigation only if the intended destination is still needed."]),
+  }),
+  open_tab: Object.freeze({
+    marker: "TOOLWIRE_BROWSER_OPEN_TAB_RESULT_UNCERTAIN",
+    code: "BROWSER_OPEN_TAB_RESULT_UNCERTAIN",
+    messagePrefix: "Browser new-tab result is uncertain: ",
+    directNextActions: Object.freeze([
+      "Do not retry this open_tab automatically. The remote action may already have happened even though its MCP response was lost or unreadable.",
+      "Re-read current tab/page state first, then prepare a fresh open_tab only if the intended action is still needed.",
+    ]),
+    classifiedNextActions: Object.freeze(["Do not open another tab automatically. Call codex.browser_tabs first and inspect whether the requested URL is already open before preparing a fresh new-tab action."]),
+  }),
+  close_tab: Object.freeze({
+    marker: "TOOLWIRE_BROWSER_CLOSE_RESULT_UNCERTAIN",
+    code: "BROWSER_CLOSE_RESULT_UNCERTAIN",
+    messagePrefix: "Browser tab-close result is uncertain: ",
+    directNextActions: Object.freeze([
+      "Do not retry this close_tab automatically. The remote action may already have happened even though its MCP response was lost or unreadable.",
+      "Call codex.browser_tabs to inspect current tab state. Do not close again automatically; prepare a fresh close only if the exact intended tab is still present and still needs closing.",
+    ]),
+    classifiedNextActions: Object.freeze(["Do not close again automatically. Call codex.browser_tabs to inspect current tab state, then prepare a fresh close only if the exact intended tab is still present and still needs closing."]),
+  }),
+  scroll: Object.freeze({
+    marker: "TOOLWIRE_BROWSER_SCROLL_RESULT_UNCERTAIN",
+    code: "BROWSER_SCROLL_RESULT_UNCERTAIN",
+    messagePrefix: "Browser scroll result is uncertain: ",
+    directNextActions: Object.freeze([
+      "Do not retry this scroll automatically. The remote action may already have happened even though its MCP response was lost or unreadable.",
+      "Re-read current tab/page state first, then scroll again only if more loaded content is still needed.",
+    ]),
+    classifiedNextActions: Object.freeze(["Re-read the current tab first. Scroll again only if more loaded content is still needed; do not blindly repeat the previous scroll."]),
+  }),
+  keypress: Object.freeze({
+    marker: "TOOLWIRE_BROWSER_KEYPRESS_RESULT_UNCERTAIN",
+    code: "BROWSER_KEYPRESS_RESULT_UNCERTAIN",
+    messagePrefix: "Browser keypress result is uncertain: ",
+    directNextActions: Object.freeze([
+      "Do not retry this keypress automatically. The remote action may already have happened even though its MCP response was lost or unreadable.",
+      "Re-read current tab/page state first. Press the key again only if the intended effect is clearly still needed; never blindly repeat Enter/Tab/Escape.",
+    ]),
+    classifiedNextActions: Object.freeze(["Do not retry Enter/Tab/Escape automatically. Re-read the current tab/page state first, then press again only if the intended effect is clearly still needed."]),
+  }),
+  download: Object.freeze({
+    marker: "TOOLWIRE_BROWSER_DOWNLOAD_RESULT_UNCERTAIN",
+    code: "BROWSER_DOWNLOAD_RESULT_UNCERTAIN",
+    messagePrefix: "Browser download result is uncertain: ",
+    directNextActions: Object.freeze([
+      "Do not retry this download automatically. The remote action may already have happened even though its MCP response was lost or unreadable.",
+      "Do not start another download automatically. Inspect the browser's download location or current task state first because the file may already have been created.",
+    ]),
+    classifiedNextActions: Object.freeze(["Do not retry this download automatically. The target click may already have created a file in the browser's configured download location; inspect current state first."]),
+  }),
+  upload: Object.freeze({
+    marker: "TOOLWIRE_BROWSER_UPLOAD_RESULT_UNCERTAIN",
+    code: "BROWSER_UPLOAD_RESULT_UNCERTAIN",
+    messagePrefix: "Browser upload result is uncertain: ",
+    directNextActions: Object.freeze([
+      "Do not retry this upload automatically. The remote action may already have happened even though its MCP response was lost or unreadable.",
+      "Do not re-select the file automatically. The webpage may already have received the file selection/change event or started an upload; inspect page state first.",
+    ]),
+    classifiedNextActions: Object.freeze([
+      "Do not retry this upload automatically. The webpage may already have received the file selection/change event or started an upload; inspect current page state first.",
+      "If Chromium file-chooser integration is unavailable, Google Chrome requires enabling 'Allow access to file URLs' for the ChatGPT browser extension before retrying a fresh, user-authorized upload.",
+    ]),
+  }),
+});
+const PREPARED_ACTION_KINDS = new Set(Object.keys(PREPARED_ACTION_METADATA));
+
 export function canonicalizeContentEditableParagraphText(element) {
   if (!element) return null;
   const contentEditableAttr = typeof element.getAttribute === "function" ? element.getAttribute("contenteditable") : null;
@@ -330,9 +491,7 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
 
   async readTab({ tabRef, cwd = this.#defaultCwd, maxChars = DEFAULT_MAX_SNAPSHOT_CHARS }) {
     const effectiveCwd = path.resolve(cwd);
-    if (typeof tabRef !== "string" || !tabRef) {
-      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
-    }
+    this.#assertTabRef(tabRef);
     if (!Number.isInteger(maxChars) || maxChars < 1_000 || maxChars > MAX_SNAPSHOT_CHARS) {
       throw new BrowserPreviewError(
         "BROWSER_MAX_CHARS_INVALID",
@@ -340,14 +499,7 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
       );
     }
     await this.#requireReady(effectiveCwd);
-    const state = this.#tabs.get(tabRef);
-    if (!state) {
-      throw new BrowserPreviewError(
-        "BROWSER_TAB_REF_UNKNOWN",
-        `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
-      );
-    }
+    const state = this.#requireKnownTab(tabRef);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
     const result = await this.#runJson(effectiveCwd, `
@@ -399,18 +551,9 @@ nodeRepl.write(JSON.stringify(__twPayload));
 
   async screenshotTab({ tabRef, cwd = this.#defaultCwd }) {
     const effectiveCwd = path.resolve(cwd);
-    if (typeof tabRef !== "string" || !tabRef) {
-      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
-    }
+    this.#assertTabRef(tabRef);
     await this.#requireReady(effectiveCwd);
-    const state = this.#tabs.get(tabRef);
-    if (!state) {
-      throw new BrowserPreviewError(
-        "BROWSER_TAB_REF_UNKNOWN",
-        `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
-      );
-    }
+    const state = this.#requireKnownTab(tabRef);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
     const result = await this.#runJson(effectiveCwd, `
@@ -489,18 +632,9 @@ nodeRepl.write(JSON.stringify(__twPayload));
 
   async prepareCloseTab({ tabRef, cwd = this.#defaultCwd }) {
     const effectiveCwd = path.resolve(cwd);
-    if (typeof tabRef !== "string" || !tabRef) {
-      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
-    }
+    this.#assertTabRef(tabRef);
     await this.#requireReady(effectiveCwd);
-    const state = this.#tabs.get(tabRef);
-    if (!state) {
-      throw new BrowserPreviewError(
-        "BROWSER_TAB_REF_UNKNOWN",
-        `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
-      );
-    }
+    const state = this.#requireKnownTab(tabRef);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
     const result = await this.#runJson(effectiveCwd, `
@@ -531,20 +665,14 @@ nodeRepl.write(JSON.stringify({
       seenAt: Date.now(),
     };
     this.#tabs.set(tabRef, current);
-    this.#cleanupActionApprovals();
-    const actionApprovalRef = `browser_action_${randomUUID()}`;
-    const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
-    const prepared = {
-      actionApprovalRef,
-      kind: "close_tab",
+    const prepared = this.#storePreparedAction("close_tab", {
       tabRef,
       providerTabId: state.providerTabId,
       expectedUrl: currentUrl,
       cwd: effectiveCwd,
       workbenchGeneration: state.workbenchGeneration,
-      expiresAt,
-    };
-    this.#actionApprovals.set(actionApprovalRef, prepared);
+    });
+    const { actionApprovalRef, expiresAt } = prepared;
     return {
       status: "prepared",
       actionApprovalRef,
@@ -559,39 +687,11 @@ nodeRepl.write(JSON.stringify({
   }
 
   async closeTab({ actionApprovalRef }) {
-    this.#cleanupActionApprovals();
-    if (typeof actionApprovalRef !== "string" || !actionApprovalRef.startsWith("browser_action_")) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_INVALID",
-        "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_close_tab"
-      );
-    }
-    const prepared = this.#actionApprovals.get(actionApprovalRef);
-    if (!prepared || prepared.kind !== "close_tab") {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_EXPIRED",
-        "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared tab close",
-        ["Call codex.browser_tabs and codex.browser_prepare_close_tab again only if the exact tab still needs to be closed."]
-      );
-    }
-    this.#actionApprovals.delete(actionApprovalRef);
+    const prepared = this.#takePreparedAction(actionApprovalRef, "close_tab");
     const effectiveCwd = prepared.cwd;
     await this.#requireReady(effectiveCwd);
-    if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_RUNTIME_RESTARTED",
-        "The prepared tab close belongs to an older Codex Workbench generation and cannot be dispatched",
-        ["Call codex.browser_tabs and prepare the close again from the current Browser runtime only if the tab still needs to be closed."]
-      );
-    }
-    const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_TAB_STALE",
-        "The prepared tab close no longer matches a current Browser runtime tab",
-        ["Call codex.browser_tabs and prepare a fresh close only for the exact current tab that still needs closing."]
-      );
-    }
+    this.#assertPreparedGeneration(prepared);
+    const state = this.#requirePreparedTab(prepared);
 
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
@@ -663,18 +763,12 @@ nodeRepl.write(JSON.stringify(__twPayload));
     const effectiveCwd = path.resolve(cwd);
     const targetUrl = normalizeBrowserHttpUrl(url);
     await this.#requireReady(effectiveCwd);
-    this.#cleanupActionApprovals();
-    const actionApprovalRef = `browser_action_${randomUUID()}`;
-    const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
-    const prepared = {
-      actionApprovalRef,
-      kind: "open_tab",
+    const prepared = this.#storePreparedAction("open_tab", {
       targetUrl,
       cwd: effectiveCwd,
       workbenchGeneration: this.#workbenchGeneration,
-      expiresAt,
-    };
-    this.#actionApprovals.set(actionApprovalRef, prepared);
+    });
+    const { actionApprovalRef, expiresAt } = prepared;
     return {
       status: "prepared",
       actionApprovalRef,
@@ -688,31 +782,10 @@ nodeRepl.write(JSON.stringify(__twPayload));
   }
 
   async openTab({ actionApprovalRef }) {
-    this.#cleanupActionApprovals();
-    if (typeof actionApprovalRef !== "string" || !actionApprovalRef.startsWith("browser_action_")) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_INVALID",
-        "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_open_tab"
-      );
-    }
-    const prepared = this.#actionApprovals.get(actionApprovalRef);
-    if (!prepared || prepared.kind !== "open_tab") {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_EXPIRED",
-        "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared new-tab action",
-        ["Call codex.browser_prepare_open_tab again to prepare a fresh exact URL."]
-      );
-    }
-    this.#actionApprovals.delete(actionApprovalRef);
+    const prepared = this.#takePreparedAction(actionApprovalRef, "open_tab");
     const effectiveCwd = prepared.cwd;
     await this.#requireReady(effectiveCwd);
-    if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_RUNTIME_RESTARTED",
-        "The prepared new-tab action belongs to an older Codex Workbench generation and cannot be dispatched",
-        ["Prepare the new tab again from the current Browser runtime."]
-      );
-    }
+    this.#assertPreparedGeneration(prepared);
 
     const targetUrlLiteral = JSON.stringify(prepared.targetUrl);
     const result = await this.#runJson(effectiveCwd, `
@@ -789,9 +862,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
 
   async scrollTab({ tabRef, direction = "down", amount = "page", cwd = this.#defaultCwd, maxChars = DEFAULT_MAX_SNAPSHOT_CHARS }) {
     const effectiveCwd = path.resolve(cwd);
-    if (typeof tabRef !== "string" || !tabRef) {
-      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
-    }
+    this.#assertTabRef(tabRef);
     if (direction !== "down" && direction !== "up") {
       throw new BrowserPreviewError("BROWSER_SCROLL_DIRECTION_INVALID", "direction must be exactly down or up");
     }
@@ -805,14 +876,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     await this.#requireReady(effectiveCwd);
-    const state = this.#tabs.get(tabRef);
-    if (!state) {
-      throw new BrowserPreviewError(
-        "BROWSER_TAB_REF_UNKNOWN",
-        `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
-      );
-    }
+    const state = this.#requireKnownTab(tabRef);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
     const expectedUrlLiteral = JSON.stringify(state.url);
@@ -917,9 +981,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
 
   async keypressTab({ tabRef, key, cwd = this.#defaultCwd, maxChars = DEFAULT_MAX_SNAPSHOT_CHARS }) {
     const effectiveCwd = path.resolve(cwd);
-    if (typeof tabRef !== "string" || !tabRef) {
-      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
-    }
+    this.#assertTabRef(tabRef);
     if (!BROWSER_FIXED_KEYS.has(key)) {
       throw new BrowserPreviewError("BROWSER_KEYPRESS_KEY_INVALID", "key must be exactly Enter, Tab, or Escape");
     }
@@ -930,14 +992,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     await this.#requireReady(effectiveCwd);
-    const state = this.#tabs.get(tabRef);
-    if (!state) {
-      throw new BrowserPreviewError(
-        "BROWSER_TAB_REF_UNKNOWN",
-        `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
-      );
-    }
+    const state = this.#requireKnownTab(tabRef);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
     const expectedUrlLiteral = JSON.stringify(state.url);
@@ -1046,19 +1101,10 @@ nodeRepl.write(JSON.stringify(__twPayload));
 
   async prepareNavigate({ tabRef, url, cwd = this.#defaultCwd }) {
     const effectiveCwd = path.resolve(cwd);
-    if (typeof tabRef !== "string" || !tabRef) {
-      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
-    }
+    this.#assertTabRef(tabRef);
     const targetUrl = normalizeBrowserHttpUrl(url);
     await this.#requireReady(effectiveCwd);
-    const state = this.#tabs.get(tabRef);
-    if (!state) {
-      throw new BrowserPreviewError(
-        "BROWSER_TAB_REF_UNKNOWN",
-        `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
-      );
-    }
+    const state = this.#requireKnownTab(tabRef);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
     const result = await this.#runJson(effectiveCwd, `
@@ -1081,21 +1127,15 @@ nodeRepl.write(JSON.stringify({
         ["Use codex.browser_read for the current page, or prepare an explicit page action instead of reloading it implicitly."]
       );
     }
-    this.#cleanupActionApprovals();
-    const actionApprovalRef = `browser_action_${randomUUID()}`;
-    const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
-    const prepared = {
-      actionApprovalRef,
-      kind: "navigate",
+    const prepared = this.#storePreparedAction("navigate", {
       tabRef,
       providerTabId: state.providerTabId,
       expectedUrl: currentUrl,
       targetUrl,
       cwd: effectiveCwd,
       workbenchGeneration: state.workbenchGeneration,
-      expiresAt,
-    };
-    this.#actionApprovals.set(actionApprovalRef, prepared);
+    });
+    const { actionApprovalRef, expiresAt } = prepared;
     return {
       status: "prepared",
       actionApprovalRef,
@@ -1116,39 +1156,11 @@ nodeRepl.write(JSON.stringify({
   }
 
   async navigate({ actionApprovalRef }) {
-    this.#cleanupActionApprovals();
-    if (typeof actionApprovalRef !== "string" || !actionApprovalRef.startsWith("browser_action_")) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_INVALID",
-        "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_navigate"
-      );
-    }
-    const prepared = this.#actionApprovals.get(actionApprovalRef);
-    if (!prepared || prepared.kind !== "navigate") {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_EXPIRED",
-        "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared navigation",
-        ["Call codex.browser_tabs and codex.browser_prepare_navigate again to prepare a fresh exact navigation."]
-      );
-    }
-    this.#actionApprovals.delete(actionApprovalRef);
+    const prepared = this.#takePreparedAction(actionApprovalRef, "navigate");
     const effectiveCwd = prepared.cwd;
     await this.#requireReady(effectiveCwd);
-    if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_RUNTIME_RESTARTED",
-        "The prepared navigation belongs to an older Codex Workbench generation and cannot be dispatched",
-        ["Call codex.browser_tabs and prepare the navigation again from current page state."]
-      );
-    }
-    const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_TAB_STALE",
-        "The prepared navigation no longer matches a current Browser runtime tab",
-        ["Call codex.browser_tabs and prepare the navigation again from current page state."]
-      );
-    }
+    this.#assertPreparedGeneration(prepared);
+    const state = this.#requirePreparedTab(prepared);
 
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
@@ -1234,9 +1246,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
 
   async prepareClick({ tabRef, role, name, text, scopeUrl, cwd = this.#defaultCwd }) {
     const effectiveCwd = path.resolve(cwd);
-    if (typeof tabRef !== "string" || !tabRef) {
-      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
-    }
+    this.#assertTabRef(tabRef);
     const normalizedRole = typeof role === "string" ? role.trim() : "";
     const normalizedName = typeof name === "string" ? name.trim() : "";
     const normalizedText = typeof text === "string" ? text.trim() : "";
@@ -1273,14 +1283,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
           ...(normalizedScopeUrl ? { scopeUrl: normalizedScopeUrl } : {}),
         };
     await this.#requireReady(effectiveCwd);
-    const state = this.#tabs.get(tabRef);
-    if (!state) {
-      throw new BrowserPreviewError(
-        "BROWSER_TAB_REF_UNKNOWN",
-        `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
-      );
-    }
+    const state = this.#requireKnownTab(tabRef);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
     const clickLocatorSetupSource = browserClickLocatorSetupSource(clickTarget);
@@ -1317,12 +1320,7 @@ try {
 nodeRepl.write(JSON.stringify(__twPayload));
 `, "Prepare exact Chrome click", { expectedGeneration: state.workbenchGeneration });
 
-    this.#cleanupActionApprovals();
-    const actionApprovalRef = `browser_action_${randomUUID()}`;
-    const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
-    const prepared = {
-      actionApprovalRef,
-      kind: "click",
+    const prepared = this.#storePreparedAction("click", {
       tabRef,
       providerTabId: state.providerTabId,
       expectedUrl: stringOrNull(result?.url) ?? state.url,
@@ -1332,9 +1330,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ? browserTextBindingFromPrepareResult(result)
         : null,
       workbenchGeneration: state.workbenchGeneration,
-      expiresAt,
-    };
-    this.#actionApprovals.set(actionApprovalRef, prepared);
+    });
+    const { actionApprovalRef, expiresAt } = prepared;
     return {
       status: "prepared",
       actionApprovalRef,
@@ -1361,39 +1358,11 @@ nodeRepl.write(JSON.stringify(__twPayload));
   }
 
   async click({ actionApprovalRef }) {
-    this.#cleanupActionApprovals();
-    if (typeof actionApprovalRef !== "string" || !actionApprovalRef.startsWith("browser_action_")) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_INVALID",
-        "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_click"
-      );
-    }
-    const prepared = this.#actionApprovals.get(actionApprovalRef);
-    if (!prepared || prepared.kind !== "click") {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_EXPIRED",
-        "actionApprovalRef is invalid, expired, or already consumed",
-        ["Call codex.browser_tabs and codex.browser_prepare_click again to prepare a fresh exact click."]
-      );
-    }
-    this.#actionApprovals.delete(actionApprovalRef);
+    const prepared = this.#takePreparedAction(actionApprovalRef, "click");
     const effectiveCwd = prepared.cwd;
     await this.#requireReady(effectiveCwd);
-    if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_RUNTIME_RESTARTED",
-        "The prepared click belongs to an older Codex Workbench generation and cannot be dispatched",
-        ["Call codex.browser_tabs and prepare the click again from current page state."]
-      );
-    }
-    const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_TAB_STALE",
-        "The prepared click no longer matches a current Browser runtime tab",
-        ["Call codex.browser_tabs and prepare the click again from current page state."]
-      );
-    }
+    this.#assertPreparedGeneration(prepared);
+    const state = this.#requirePreparedTab(prepared);
 
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
@@ -1531,14 +1500,13 @@ nodeRepl.write(JSON.stringify(__twPayload));
 
   async prepareDownload({ tabRef, role, name, text, cwd = this.#defaultCwd }) {
     const preparedClick = await this.prepareClick({ tabRef, role, name, text, cwd });
-    const prepared = this.#actionApprovals.get(preparedClick.actionApprovalRef);
-    if (!prepared || prepared.kind !== "click") {
+    const prepared = this.#promotePreparedClick(preparedClick.actionApprovalRef, "download");
+    if (!prepared) {
       throw new BrowserPreviewError(
         "BROWSER_DOWNLOAD_PREPARE_FAILED",
         "Browser download preparation could not bind the exact target"
       );
     }
-    prepared.kind = "download";
     return {
       ...preparedClick,
       action: {
@@ -1550,39 +1518,11 @@ nodeRepl.write(JSON.stringify(__twPayload));
   }
 
   async download({ actionApprovalRef }) {
-    this.#cleanupActionApprovals();
-    if (typeof actionApprovalRef !== "string" || !actionApprovalRef.startsWith("browser_action_")) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_INVALID",
-        "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_download"
-      );
-    }
-    const prepared = this.#actionApprovals.get(actionApprovalRef);
-    if (!prepared || prepared.kind !== "download") {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_EXPIRED",
-        "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared download",
-        ["Call codex.browser_tabs and codex.browser_prepare_download again to prepare a fresh exact download."]
-      );
-    }
-    this.#actionApprovals.delete(actionApprovalRef);
+    const prepared = this.#takePreparedAction(actionApprovalRef, "download");
     const effectiveCwd = prepared.cwd;
     await this.#requireReady(effectiveCwd);
-    if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_RUNTIME_RESTARTED",
-        "The prepared download belongs to an older Codex Workbench generation and cannot be dispatched",
-        ["Call codex.browser_tabs and prepare the download again from current page state."]
-      );
-    }
-    const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_TAB_STALE",
-        "The prepared download no longer matches a current Browser runtime tab",
-        ["Call codex.browser_tabs and prepare the download again from current page state."]
-      );
-    }
+    this.#assertPreparedGeneration(prepared);
+    const state = this.#requirePreparedTab(prepared);
 
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
@@ -1747,21 +1687,21 @@ nodeRepl.write(JSON.stringify(__twPayload));
       text,
       cwd: authorizedFile.cwd,
     });
-    const prepared = this.#actionApprovals.get(preparedClick.actionApprovalRef);
-    if (!prepared || prepared.kind !== "click") {
+    const prepared = this.#promotePreparedClick(preparedClick.actionApprovalRef, "upload", {
+      uploadFile: {
+        path: authorizedFile.path,
+        fileName: path.basename(authorizedFile.path),
+        byteLength: authorizedFile.byteLength,
+        sha256: authorizedFile.sha256,
+        trustedAncestor: authorizedFile.trustedAncestor,
+      },
+    });
+    if (!prepared) {
       throw new BrowserPreviewError(
         "BROWSER_UPLOAD_PREPARE_FAILED",
         "Browser upload preparation could not bind the exact file chooser target"
       );
     }
-    prepared.kind = "upload";
-    prepared.uploadFile = {
-      path: authorizedFile.path,
-      fileName: path.basename(authorizedFile.path),
-      byteLength: authorizedFile.byteLength,
-      sha256: authorizedFile.sha256,
-      trustedAncestor: authorizedFile.trustedAncestor,
-    };
     return {
       ...preparedClick,
       action: {
@@ -1776,22 +1716,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
   }
 
   async upload({ actionApprovalRef }) {
-    this.#cleanupActionApprovals();
-    if (typeof actionApprovalRef !== "string" || !actionApprovalRef.startsWith("browser_action_")) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_INVALID",
-        "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_upload"
-      );
-    }
-    const prepared = this.#actionApprovals.get(actionApprovalRef);
-    if (!prepared || prepared.kind !== "upload" || !prepared.uploadFile?.path) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_EXPIRED",
-        "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared upload",
-        ["Call codex.browser_tabs and codex.browser_prepare_upload again to prepare a fresh exact upload."]
-      );
-    }
-    this.#actionApprovals.delete(actionApprovalRef);
+    const prepared = this.#takePreparedAction(actionApprovalRef, "upload");
     const effectiveCwd = prepared.cwd;
     let currentUploadFile;
     try {
@@ -1821,21 +1746,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     await this.#requireReady(effectiveCwd);
-    if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_RUNTIME_RESTARTED",
-        "The prepared upload belongs to an older Codex Workbench generation and cannot be dispatched",
-        ["Call codex.browser_tabs and prepare the upload again from current page state."]
-      );
-    }
-    const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_TAB_STALE",
-        "The prepared upload no longer matches a current Browser runtime tab",
-        ["Call codex.browser_tabs and prepare the upload again from current page state."]
-      );
-    }
+    this.#assertPreparedGeneration(prepared);
+    const state = this.#requirePreparedTab(prepared);
 
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
@@ -1997,9 +1909,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
 
   async prepareFill({ tabRef, role, name, placeholder, scopeUrl, text, cwd = this.#defaultCwd }) {
     const effectiveCwd = path.resolve(cwd);
-    if (typeof tabRef !== "string" || !tabRef) {
-      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
-    }
+    this.#assertTabRef(tabRef);
     if (typeof role !== "string" || !role.trim()) {
       throw new BrowserPreviewError("BROWSER_ROLE_REQUIRED", "role is required and must come from the current DOM/accessibility description");
     }
@@ -2039,14 +1949,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ? { kind: "placeholder", role: normalizedRole, placeholder: normalizedPlaceholder }
         : { kind: "scope-role", role: normalizedRole, scopeUrl: normalizedScopeUrl };
     await this.#requireReady(effectiveCwd);
-    const state = this.#tabs.get(tabRef);
-    if (!state) {
-      throw new BrowserPreviewError(
-        "BROWSER_TAB_REF_UNKNOWN",
-        `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
-      );
-    }
+    const state = this.#requireKnownTab(tabRef);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
     const fillLocatorSetupSource = browserFillLocatorSetupSource(fillTarget);
@@ -2143,12 +2046,7 @@ try {
 nodeRepl.write(JSON.stringify(__twPayload));
 `, "Prepare exact Chrome fill", { expectedGeneration: state.workbenchGeneration });
 
-    this.#cleanupActionApprovals();
-    const actionApprovalRef = `browser_action_${randomUUID()}`;
-    const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
-    const prepared = {
-      actionApprovalRef,
-      kind: "fill",
+    const prepared = this.#storePreparedAction("fill", {
       tabRef,
       providerTabId: state.providerTabId,
       expectedUrl: stringOrNull(result?.url) ?? state.url,
@@ -2158,9 +2056,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
       fillStrategy: result?.fillStrategy === "type" ? "type" : "fill",
       targetMeta: result?.targetMeta ?? null,
       workbenchGeneration: state.workbenchGeneration,
-      expiresAt,
-    };
-    this.#actionApprovals.set(actionApprovalRef, prepared);
+    });
+    const { actionApprovalRef, expiresAt } = prepared;
     return {
       status: "prepared",
       actionApprovalRef,
@@ -2190,39 +2087,11 @@ nodeRepl.write(JSON.stringify(__twPayload));
   }
 
   async fill({ actionApprovalRef }) {
-    this.#cleanupActionApprovals();
-    if (typeof actionApprovalRef !== "string" || !actionApprovalRef.startsWith("browser_action_")) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_INVALID",
-        "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_fill"
-      );
-    }
-    const prepared = this.#actionApprovals.get(actionApprovalRef);
-    if (!prepared || prepared.kind !== "fill") {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_REF_EXPIRED",
-        "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared fill",
-        ["Call codex.browser_tabs and codex.browser_prepare_fill again to prepare a fresh exact fill."]
-      );
-    }
-    this.#actionApprovals.delete(actionApprovalRef);
+    const prepared = this.#takePreparedAction(actionApprovalRef, "fill");
     const effectiveCwd = prepared.cwd;
     await this.#requireReady(effectiveCwd);
-    if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_RUNTIME_RESTARTED",
-        "The prepared fill belongs to an older Codex Workbench generation and cannot be dispatched",
-        ["Call codex.browser_tabs and prepare the fill again from current page state."]
-      );
-    }
-    const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
-      throw new BrowserPreviewError(
-        "BROWSER_ACTION_TAB_STALE",
-        "The prepared fill no longer matches a current Browser runtime tab",
-        ["Call codex.browser_tabs and prepare the fill again from current page state."]
-      );
-    }
+    this.#assertPreparedGeneration(prepared);
+    const state = this.#requirePreparedTab(prepared);
 
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
@@ -2943,6 +2812,98 @@ if (globalThis.__toolwireBrowserAgent?.browsers == null) {
       );
     }
     return this.#browserClientUrl;
+  }
+
+  #assertTabRef(tabRef) {
+    if (typeof tabRef !== "string" || !tabRef) {
+      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
+    }
+  }
+
+  #requireKnownTab(tabRef) {
+    const state = this.#tabs.get(tabRef);
+    if (!state) {
+      throw new BrowserPreviewError(
+        "BROWSER_TAB_REF_UNKNOWN",
+        `unknown or expired browser tabRef: ${tabRef}`,
+        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
+      );
+    }
+    return state;
+  }
+
+  #storePreparedAction(kind, fields) {
+    if (!PREPARED_ACTION_KINDS.has(kind)) throw new Error(`Unsupported prepared Browser action kind: ${kind}`);
+    this.#cleanupActionApprovals();
+    const actionApprovalRef = `browser_action_${randomUUID()}`;
+    const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
+    const prepared = {
+      actionApprovalRef,
+      kind,
+      ...fields,
+      expiresAt,
+    };
+    this.#actionApprovals.set(actionApprovalRef, prepared);
+    return prepared;
+  }
+
+  #takePreparedAction(actionApprovalRef, expectedKind) {
+    const metadata = PREPARED_ACTION_METADATA[expectedKind];
+    if (!metadata) throw new Error(`Unsupported prepared Browser action kind: ${expectedKind}`);
+    this.#cleanupActionApprovals();
+    if (typeof actionApprovalRef !== "string" || !actionApprovalRef.startsWith("browser_action_")) {
+      throw new BrowserPreviewError("BROWSER_ACTION_REF_INVALID", metadata.invalidReferenceMessage);
+    }
+    const prepared = this.#actionApprovals.get(actionApprovalRef);
+    const validPrepared = prepared?.kind === expectedKind
+      && (expectedKind !== "upload" || Boolean(prepared.uploadFile?.path));
+    if (!validPrepared) {
+      throw new BrowserPreviewError(
+        "BROWSER_ACTION_REF_EXPIRED",
+        metadata.expiredReferenceMessage,
+        [...metadata.expiredNextActions]
+      );
+    }
+    // This deletion intentionally stays before the first await at every execution callsite.
+    this.#actionApprovals.delete(actionApprovalRef);
+    return prepared;
+  }
+
+  #promotePreparedClick(actionApprovalRef, newKind, extraFields = {}) {
+    if (newKind !== "download" && newKind !== "upload") {
+      throw new Error(`Unsupported prepared Browser click promotion: ${newKind}`);
+    }
+    const prepared = this.#actionApprovals.get(actionApprovalRef);
+    if (!prepared || prepared.kind !== "click") return null;
+    prepared.kind = newKind;
+    Object.assign(prepared, extraFields);
+    return prepared;
+  }
+
+  #assertPreparedGeneration(prepared) {
+    const metadata = PREPARED_ACTION_METADATA[prepared?.kind];
+    if (!metadata) throw new Error(`Unsupported prepared Browser action kind: ${prepared?.kind}`);
+    if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
+      throw new BrowserPreviewError(
+        "BROWSER_ACTION_RUNTIME_RESTARTED",
+        metadata.generationMessage,
+        [...metadata.generationNextActions]
+      );
+    }
+  }
+
+  #requirePreparedTab(prepared) {
+    const metadata = PREPARED_ACTION_METADATA[prepared?.kind];
+    if (!metadata?.tabMessage) throw new Error(`Prepared Browser action has no tab binding: ${prepared?.kind}`);
+    const state = this.#tabs.get(prepared.tabRef);
+    if (!state || state.providerTabId !== prepared.providerTabId) {
+      throw new BrowserPreviewError(
+        "BROWSER_ACTION_TAB_STALE",
+        metadata.tabMessage,
+        [...metadata.tabNextActions]
+      );
+    }
+    return state;
   }
 
   #cleanupActionApprovals() {
@@ -3673,42 +3634,12 @@ function browserUnavailable(error) {
 }
 
 function browserMutationResultUncertain(kind, message) {
-  const normalizedKind = ["fill", "navigate", "open_tab", "close_tab", "scroll", "keypress", "download", "upload"].includes(kind) ? kind : "click";
-  const errorCode = normalizedKind === "fill"
-    ? "BROWSER_FILL_RESULT_UNCERTAIN"
-    : normalizedKind === "navigate"
-      ? "BROWSER_NAVIGATE_RESULT_UNCERTAIN"
-      : normalizedKind === "open_tab"
-        ? "BROWSER_OPEN_TAB_RESULT_UNCERTAIN"
-        : normalizedKind === "close_tab"
-          ? "BROWSER_CLOSE_RESULT_UNCERTAIN"
-          : normalizedKind === "scroll"
-            ? "BROWSER_SCROLL_RESULT_UNCERTAIN"
-            : normalizedKind === "keypress"
-              ? "BROWSER_KEYPRESS_RESULT_UNCERTAIN"
-              : normalizedKind === "download"
-                ? "BROWSER_DOWNLOAD_RESULT_UNCERTAIN"
-                : normalizedKind === "upload"
-                  ? "BROWSER_UPLOAD_RESULT_UNCERTAIN"
-                  : "BROWSER_CLICK_RESULT_UNCERTAIN";
+  const normalizedKind = Object.hasOwn(BROWSER_MUTATION_UNCERTAINTY, kind) ? kind : "click";
+  const metadata = BROWSER_MUTATION_UNCERTAINTY[normalizedKind];
   return new BrowserPreviewError(
-    errorCode,
+    metadata.code,
     message,
-    [
-      `Do not retry this ${normalizedKind} automatically. The remote action may already have happened even though its MCP response was lost or unreadable.`,
-      normalizedKind === "close_tab"
-        ? "Call codex.browser_tabs to inspect current tab state. Do not close again automatically; prepare a fresh close only if the exact intended tab is still present and still needs closing."
-        : normalizedKind === "scroll"
-          ? "Re-read current tab/page state first, then scroll again only if more loaded content is still needed."
-          : normalizedKind === "keypress"
-            ? "Re-read current tab/page state first. Press the key again only if the intended effect is clearly still needed; never blindly repeat Enter/Tab/Escape."
-            : normalizedKind === "download"
-              ? "Do not start another download automatically. Inspect the browser's download location or current task state first because the file may already have been created."
-              : normalizedKind === "upload"
-                ? "Do not re-select the file automatically. The webpage may already have received the file selection/change event or started an upload; inspect page state first."
-                : `Re-read current tab/page state first, then prepare a fresh ${normalizedKind} only if the intended action is still needed.`,
-
-    ]
+    [...metadata.directNextActions]
   );
 }
 
@@ -3778,70 +3709,12 @@ function classifyBrowserError(error) {
       ["Refresh/reload the Browser surface so it injects x-codex-turn-metadata automatically."]
     );
   }
-  if (/TOOLWIRE_BROWSER_NAVIGATE_RESULT_UNCERTAIN/i.test(message)) {
+  for (const metadata of Object.values(BROWSER_MUTATION_UNCERTAINTY)) {
+    if (!new RegExp(metadata.marker, "i").test(message)) continue;
     return new BrowserPreviewError(
-      "BROWSER_NAVIGATE_RESULT_UNCERTAIN",
-      message.replace(/^.*TOOLWIRE_BROWSER_NAVIGATE_RESULT_UNCERTAIN:/, "Browser navigation result is uncertain: "),
-      ["Do not retry this navigation automatically. Re-read current tab/page state first, then prepare a fresh navigation only if the intended destination is still needed."]
-    );
-  }
-  if (/TOOLWIRE_BROWSER_OPEN_TAB_RESULT_UNCERTAIN/i.test(message)) {
-    return new BrowserPreviewError(
-      "BROWSER_OPEN_TAB_RESULT_UNCERTAIN",
-      message.replace(/^.*TOOLWIRE_BROWSER_OPEN_TAB_RESULT_UNCERTAIN:/, "Browser new-tab result is uncertain: "),
-      ["Do not open another tab automatically. Call codex.browser_tabs first and inspect whether the requested URL is already open before preparing a fresh new-tab action."]
-    );
-  }
-  if (/TOOLWIRE_BROWSER_CLOSE_RESULT_UNCERTAIN/i.test(message)) {
-    return new BrowserPreviewError(
-      "BROWSER_CLOSE_RESULT_UNCERTAIN",
-      message.replace(/^.*TOOLWIRE_BROWSER_CLOSE_RESULT_UNCERTAIN:/, "Browser tab-close result is uncertain: "),
-      ["Do not close again automatically. Call codex.browser_tabs to inspect current tab state, then prepare a fresh close only if the exact intended tab is still present and still needs closing."]
-    );
-  }
-  if (/TOOLWIRE_BROWSER_SCROLL_RESULT_UNCERTAIN/i.test(message)) {
-    return new BrowserPreviewError(
-      "BROWSER_SCROLL_RESULT_UNCERTAIN",
-      message.replace(/^.*TOOLWIRE_BROWSER_SCROLL_RESULT_UNCERTAIN:/, "Browser scroll result is uncertain: "),
-      ["Re-read the current tab first. Scroll again only if more loaded content is still needed; do not blindly repeat the previous scroll."]
-    );
-  }
-  if (/TOOLWIRE_BROWSER_KEYPRESS_RESULT_UNCERTAIN/i.test(message)) {
-    return new BrowserPreviewError(
-      "BROWSER_KEYPRESS_RESULT_UNCERTAIN",
-      message.replace(/^.*TOOLWIRE_BROWSER_KEYPRESS_RESULT_UNCERTAIN:/, "Browser keypress result is uncertain: "),
-      ["Do not retry Enter/Tab/Escape automatically. Re-read the current tab/page state first, then press again only if the intended effect is clearly still needed."]
-    );
-  }
-  if (/TOOLWIRE_BROWSER_UPLOAD_RESULT_UNCERTAIN/i.test(message)) {
-    return new BrowserPreviewError(
-      "BROWSER_UPLOAD_RESULT_UNCERTAIN",
-      message.replace(/^.*TOOLWIRE_BROWSER_UPLOAD_RESULT_UNCERTAIN:/, "Browser upload result is uncertain: "),
-      [
-        "Do not retry this upload automatically. The webpage may already have received the file selection/change event or started an upload; inspect current page state first.",
-        "If Chromium file-chooser integration is unavailable, Google Chrome requires enabling 'Allow access to file URLs' for the ChatGPT browser extension before retrying a fresh, user-authorized upload.",
-      ]
-    );
-  }
-  if (/TOOLWIRE_BROWSER_DOWNLOAD_RESULT_UNCERTAIN/i.test(message)) {
-    return new BrowserPreviewError(
-      "BROWSER_DOWNLOAD_RESULT_UNCERTAIN",
-      message.replace(/^.*TOOLWIRE_BROWSER_DOWNLOAD_RESULT_UNCERTAIN:/, "Browser download result is uncertain: "),
-      ["Do not retry this download automatically. The target click may already have created a file in the browser's configured download location; inspect current state first."]
-    );
-  }
-  if (/TOOLWIRE_BROWSER_CLICK_RESULT_UNCERTAIN/i.test(message)) {
-    return new BrowserPreviewError(
-      "BROWSER_CLICK_RESULT_UNCERTAIN",
-      message.replace(/^.*TOOLWIRE_BROWSER_CLICK_RESULT_UNCERTAIN:/, "Browser click result is uncertain: "),
-      ["Do not retry this click automatically. Re-read current tab/page state first, then prepare a fresh click only if the intended action is still needed."]
-    );
-  }
-  if (/TOOLWIRE_BROWSER_FILL_RESULT_UNCERTAIN/i.test(message)) {
-    return new BrowserPreviewError(
-      "BROWSER_FILL_RESULT_UNCERTAIN",
-      message.replace(/^.*TOOLWIRE_BROWSER_FILL_RESULT_UNCERTAIN:/, "Browser fill result is uncertain: "),
-      ["Do not retry this fill automatically. Re-read current tab/page state first, then prepare a fresh fill only if the intended text is still needed."]
+      metadata.code,
+      message.replace(new RegExp(`^.*${metadata.marker}:`), metadata.messagePrefix),
+      [...metadata.classifiedNextActions]
     );
   }
   if (/TOOLWIRE_BROWSER_FILL_NOT_APPLIED/i.test(message)) {
