@@ -219,6 +219,11 @@ staleClient.deferTurnStart = true;
 const staleSendPromise = staleExecutor.send({ agentRef: staleStart.agentRef, message: "fresh turn", clientRequestId: "stale-send" });
 await new Promise((resolve) => setImmediate(resolve));
 staleClient.notify("turn/completed", { id: staleStart.turnId, status: "completed", items: [{ type: "agentMessage", text: "late old terminal" }] });
+staleClient.notifications?.({ method: "thread/status/changed", params: { threadId: "thread-1", status: { type: "idle" } } });
+staleClient.current = null;
+const stalePending = await staleExecutor.show({ agentRef: staleStart.agentRef });
+assert.equal(stalePending.status, "running");
+staleClient.notify("turn/started", { id: "turn-2", status: "inProgress", items: [] });
 staleClient.notifications?.({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: staleStart.turnId, tokenUsage: { last: { totalTokens: 999 } } } });
 releaseStaleTurn();
 const staleSend = await staleSendPromise;
@@ -230,6 +235,68 @@ staleClient.notify("turn/completed", { id: staleSend.turnId, status: "completed"
 const staleTerminal = await staleExecutor.show({ agentRef: staleStart.agentRef });
 assert.equal(staleTerminal.resourceReceipt?.tokenUsage, null);
 await staleExecutor.close();
+
+// Acceptance-unknown must reject a late approval for the previous turn before
+// it can claim the pending slot needed by the accepted follow-up.
+const staleApprovalClient = new ProtocolClient();
+let staleApprovalHandler;
+const staleApprovalExecutor = new CodexAgentExecutor({
+  defaultCwd: path.resolve("."),
+  clientFactory: ({ serverRequestHandler }) => {
+    staleApprovalHandler = serverRequestHandler;
+    return staleApprovalClient;
+  },
+});
+await staleApprovalExecutor.open();
+const staleApprovalStart = await staleApprovalExecutor.start({ task: "approval baseline", clientRequestId: "approval-start" });
+staleApprovalClient.notify("turn/completed", { id: staleApprovalStart.turnId, status: "completed", items: [{ type: "agentMessage", text: "A" }] });
+let terminalApprovalRejection = null;
+staleApprovalHandler({
+  id: "late-terminal-A",
+  method: "item/commandExecution/requestApproval",
+  params: { threadId: "thread-1", turnId: staleApprovalStart.turnId, itemId: "terminal-item" },
+  resolve() {},
+  reject(error) { terminalApprovalRejection = error; },
+});
+assert.match(terminalApprovalRejection?.message ?? "", /stale turn/);
+staleApprovalClient.failTurnStart = true;
+const staleApprovalUnknown = await staleApprovalExecutor.send({ agentRef: staleApprovalStart.agentRef, message: "approval B", clientRequestId: "approval-send" });
+assert.equal(staleApprovalUnknown.status, "unknown");
+let staleApprovalRejection = null;
+staleApprovalHandler({
+  id: "late-A",
+  method: "item/commandExecution/requestApproval",
+  params: { threadId: "thread-1", turnId: staleApprovalStart.turnId, itemId: "old-item" },
+  resolve() {},
+  reject(error) { staleApprovalRejection = error; },
+});
+assert.match(staleApprovalRejection?.message ?? "", /stale turn/);
+const staleApprovalSnapshot = await staleApprovalExecutor.show({ agentRef: staleApprovalStart.agentRef });
+assert.equal(staleApprovalSnapshot.pendingApproval, null);
+await staleApprovalExecutor.close();
+
+// Request hashes must be unambiguous and include authority profile payload.
+const collisionClient = new ProtocolClient();
+const collisionRequest = collisionClient.request.bind(collisionClient);
+collisionClient.request = async (method, params = {}) => {
+  const result = await collisionRequest(method, params);
+  if (method === "thread/start" && params.model) result.model = params.model;
+  if (method === "thread/start" && params.permissions) result.activePermissionProfile = { id: params.permissions };
+  return result;
+};
+const collisionExecutor = new CodexAgentExecutor({ defaultCwd: path.resolve("."), clientFactory: () => collisionClient });
+await collisionExecutor.open();
+await collisionExecutor.start({ task: "a\0b", clientRequestId: "collision-key" });
+await assert.rejects(
+  collisionExecutor.start({ task: "a", model: "b\0", clientRequestId: "collision-key" }),
+  /already used for a different agent start/
+);
+await collisionExecutor.start({ task: "profile", permissionProfile: "profile-A", clientRequestId: "profile-key" });
+await assert.rejects(
+  collisionExecutor.start({ task: "profile", permissionProfile: "profile-B", clientRequestId: "profile-key" }),
+  /already used for a different agent start/
+);
+await collisionExecutor.close();
 
 // A receipt promise for terminal turn A must never be reused for terminal
 // turn B when a follow-up begins while A's telemetry is still pending.

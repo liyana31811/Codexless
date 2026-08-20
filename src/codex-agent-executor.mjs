@@ -9,9 +9,7 @@ const MAX_EVENT_TEXT_CHARS = 2_048;
 
 function digest(value) { return createHash("sha256").update(value, "utf8").digest("hex"); }
 
-function hashRequest(cwd, task, model = null, reasoningEffort = null) {
-  return digest(reasoningEffort === null ? `${cwd}\0${task}\0${model ?? ""}` : `${cwd}\0${task}\0${model ?? ""}\0reasoningEffort=${reasoningEffort}`);
-}
+function hashRequest(cwd, task, model = null, reasoningEffort = null, permissionProfile = null) { return digest(JSON.stringify([cwd, task, model, reasoningEffort, permissionProfile])); }
 
 function normalizeSelection(value, label, maxLength = null) {
   if (value === null || value === undefined) return null;
@@ -296,7 +294,7 @@ export class CodexAgentExecutor {
     const requestedReasoningEffort = normalizeSelection(reasoningEffort, "reasoningEffort", 128);
 
     const effectiveCwd = path.resolve(cwd);
-    const requestHash = hashRequest(effectiveCwd, task, requestedModel, requestedReasoningEffort);
+    const requestHash = hashRequest(effectiveCwd, task, requestedModel, requestedReasoningEffort, permissionProfile);
     const duplicate = this.#duplicateRequest("start", clientRequestId, requestHash, "accepted start mapping is no longer available");
     if (duplicate) return duplicate;
 
@@ -418,7 +416,7 @@ export class CodexAgentExecutor {
     if (decision !== "approve" && decision !== "reject") throw new Error("decision must be approve or reject");
     if (typeof approvalRequestId !== "string" || !approvalRequestId.trim()) throw new Error("approvalRequestId must be a non-empty string");
     if (typeof clientRequestId !== "string" || !clientRequestId.trim()) throw new Error("clientRequestId must be a non-empty string");
-    const hash = digest(`${decision}\0${agentRef}\0${approvalRequestId}`);
+    const hash = digest(JSON.stringify([decision, agentRef, approvalRequestId]));
     const prior = this.#requestIndex.get(requestKey("control", clientRequestId));
     if (prior) {
       if (prior.requestHash !== hash) throw new Error(`clientRequestId was already used for a different agent control action: ${clientRequestId}`);
@@ -449,7 +447,7 @@ export class CodexAgentExecutor {
     await this.#refreshFromOfficial(state);
     const targetTurnId = state.currentTurnId;
     if (expectedTurnId !== null && expectedTurnId !== targetTurnId) throw new Error(`agent task turn changed: expected ${expectedTurnId}, current ${String(targetTurnId ?? "none")}`);
-    const hash = digest(`cancel\0${agentRef}\0${targetTurnId ?? ""}`);
+    const hash = digest(JSON.stringify(["cancel", agentRef, targetTurnId]));
     const prior = this.#requestIndex.get(requestKey("control", clientRequestId));
     if (prior) {
       if (prior.requestHash !== hash) throw new Error(`clientRequestId was already used for a different agent control action: ${clientRequestId}`);
@@ -549,7 +547,7 @@ export class CodexAgentExecutor {
 
   #applyTurnObservation(state, observation) {
     const turnId = observation.turnId ?? observation.turn?.id ?? null;
-    if (turnId && ((state.status === "running" && !state.currentTurnId && observation.source) || state.status === "unknown" && !state.currentTurnId && observation.source && (turnId === state.previousTurnId || state.events.some((event) => event.type === "turn/accepted" && event.turnId === turnId)) || state.currentTurnId && turnId !== state.currentTurnId)) {
+    if (turnId && ((state.status === "running" && !state.currentTurnId && observation.source && turnId === state.previousTurnId) || state.status === "unknown" && !state.currentTurnId && observation.source && (turnId === state.previousTurnId || state.events.some((event) => event.type === "turn/accepted" && event.turnId === turnId)) || state.currentTurnId && turnId !== state.currentTurnId)) {
       this.#appendEvent(state, {
         type: "stale-turn-notification-ignored",
         method: observation.method ?? observation.source ?? "observation",
@@ -562,6 +560,7 @@ export class CodexAgentExecutor {
     if (turnId && !state.currentTurnId) state.currentTurnId = turnId;
     if (TERMINAL_TURN_STATUSES.has(state.latestTurnStatus)) return;
     if (observation.statusType) {
+      if (observation.statusType === "idle" && state.status === "running" && !state.currentTurnId) return;
       const next = observation.statusType === "active" ? (state.pendingApproval ? "awaitingApproval" : "running") : observation.statusType === "idle" && state.status === "running" ? "idle" : observation.statusType === "systemError" ? "failed" : null;
       state.status = next ?? state.status;
       return;
@@ -656,12 +655,12 @@ export class CodexAgentExecutor {
       request.reject({ code: -32602, message: `Agent server request could not be mapped to an active agent: ${request.method}` });
       return;
     }
-    if (turnId && !state.currentTurnId && state.status !== "running") state.currentTurnId = turnId;
-    if (!state.latestTurnStatus) state.latestTurnStatus = "inProgress";
-    if (state.pendingApproval || turnId && !state.currentTurnId && ((state.status === "running" && turnId === state.previousTurnId) || state.status === "unknown" && (turnId === state.previousTurnId || state.events.some((event) => event.type === "turn/accepted" && event.turnId === turnId)))) {
+    if (TERMINAL_TURN_STATUSES.has(state.latestTurnStatus) || state.pendingApproval || turnId && !state.currentTurnId && ((state.status === "running" && turnId === state.previousTurnId) || state.status === "unknown" && (turnId === state.previousTurnId || state.events.some((event) => event.type === "turn/accepted" && event.turnId === turnId)))) {
       request.reject({ code: -32000, message: state.pendingApproval ? `Agent already has a pending server request: ${String(state.pendingApproval.requestId)}` : "Agent server request belongs to a stale turn" });
       return;
     }
+    if (turnId && !state.currentTurnId && state.status !== "running") state.currentTurnId = turnId;
+    if (!state.latestTurnStatus) state.latestTurnStatus = "inProgress";
 
     state.pendingApproval = approvalSummary(request, state.approvalItems.get(params.itemId ?? params.item?.id ?? null) ?? null);
     state.pendingRequestHandle = request;
