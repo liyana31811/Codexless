@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import { browserKernelSource, BROWSER_KERNEL_OPERATIONS as KERNEL } from "../src/browser-operation-kernel.mjs";
 
 const fixedOps = Object.values(KERNEL);
@@ -35,6 +36,148 @@ const fillRepair = browserKernelSource(KERNEL.repairFill, mutationCases.find(([o
 assert.match(fillRepair, /__twResolveFreshTarget/);
 assert.match(fillRepair, /repairDispatched/);
 assert.equal((fillRepair.match(/\.fill\(/g) ?? []).length <= 2, true, "fill repair source exposes no unbounded fill loop");
+
+// Flair exact-text bindings are resolved on the option node but authorized by
+// the enclosing selector's single hidden template-id input.  The dispatch
+// source must climb the recorded selector depth instead of probing the `<li>`
+// itself (which would silently reject every legitimate old-Reddit option).
+const flairClick = browserKernelSource(KERNEL.click, {
+  providerTabId: "p",
+  expectedUrl: "https://example.test/",
+  target: { kind: "text", text: "Funny" },
+  binding: { kind: "flair-template-option", selectorDepth: 3, templateId: "template-id" },
+});
+assert.match(flairClick, /__twFlairSelector = __twLocator/);
+assert.match(flairClick, /__twDepth < 3/);
+assert.match(flairClick, /input\[type="hidden"\]\[name="flair_template_id"\]/);
+assert.doesNotMatch(flairClick, /__twFlairHidden = __twLocator\.locator/);
+
+// Every supported fill target shape must compile as one isolated kernel body.
+// In particular, scope-role fill used to emit two const declarations for the
+// fixed strategy, which only failed once a real node_repl parsed the body.
+for (const target of [
+  { kind: "role", role: "textbox", name: "Search" },
+  { kind: "placeholder", role: "textbox", placeholder: "Search" },
+  { kind: "scope-role", role: "textbox", scopeUrl: "https://example.test/comment/1" },
+]) {
+  for (const operation of [KERNEL.prepareFill, KERNEL.fill, KERNEL.repairFill]) {
+    const source = browserKernelSource(operation, {
+      providerTabId: "p",
+      expectedUrl: "https://example.test/",
+      target,
+      text: "needle",
+      fillStrategy: "fill",
+    });
+    assert.doesNotThrow(
+      () => new vm.Script(`(async () => {\n${source}\n})()`),
+      `${operation} ${target.kind} source must parse as one node_repl body`
+    );
+  }
+}
+
+// Execute the generated bodies against a tiny deterministic browser double to
+// prove that a confirmed dispatch remains confirmed when only settle/readback
+// or finalisation fails.  The event/chooser receipt is the one-shot boundary;
+// failures before it remain uncertain and are handled by the shared envelope.
+async function executeKernel(operation, input, options = {}) {
+  const info = { providerTabId: "p", title: "Fixture", url: "https://example.test/" };
+  let written = null;
+  let finalizeCalls = 0;
+  const locator = {
+    count: async () => 1,
+    isVisible: async () => true,
+    isEnabled: async () => true,
+    click: async () => {},
+    press: async () => {},
+  };
+  const tab = {
+    url: async () => info.url,
+    title: async () => info.title,
+    close: async () => {},
+    dom_cua: { keypress: async () => {} },
+    playwright: {
+      locator: () => ({ press: async () => {} }),
+      getByRole: () => locator,
+      waitForTimeout: async () => {
+        if (options.settleError) throw new Error(options.settleError);
+      },
+      domSnapshot: async () => "fixture snapshot",
+      waitForEvent: async (event) => {
+        if (event === "download") {
+          return {
+            path: async () => {
+              if (options.pathError) throw new Error(options.pathError);
+              return "/trusted/download.bin";
+            },
+          };
+        }
+        if (event === "filechooser") {
+          return { isMultiple: () => false, setFiles: async () => {} };
+        }
+        throw new Error(`unexpected event ${event}`);
+      },
+    },
+  };
+  const browser = {
+    user: {
+      openTabs: async () => [info],
+      claimTab: async () => tab,
+    },
+    tabs: {
+      finalize: async () => {
+        finalizeCalls += 1;
+        if (options.finalizeError) throw new Error(options.finalizeError);
+      },
+    },
+  };
+  const context = vm.createContext({
+    globalThis: { __toolwireBrowserAgent: { browsers: { get: async () => browser } } },
+    nodeRepl: { write: (text) => { written = JSON.parse(text); } },
+  });
+  const source = browserKernelSource(operation, input);
+  await new vm.Script(`(async () => {\n${source}\n})()`).runInContext(context);
+  return { written, finalizeCalls };
+}
+
+const scrollReceipt = await executeKernel(KERNEL.scroll, {
+  providerTabId: "p", expectedUrl: "https://example.test/", direction: "down", amount: "page",
+}, { settleError: "scroll settle failed" });
+assert.equal(scrollReceipt.written.scrollReturned, true);
+assert.match(scrollReceipt.written.settleError, /scroll settle failed/);
+assert.equal(scrollReceipt.written.cleanupStatus, "released");
+
+const keypressReceipt = await executeKernel(KERNEL.keypress, {
+  providerTabId: "p", expectedUrl: "https://example.test/", key: "Enter",
+}, { settleError: "keypress readback failed" });
+assert.equal(keypressReceipt.written.keypressReturned, true);
+assert.match(keypressReceipt.written.settleError, /keypress readback failed/);
+
+const downloadReceipt = await executeKernel(KERNEL.download, {
+  providerTabId: "p", expectedUrl: "https://example.test/", target: { kind: "role", role: "button", name: "Download" },
+}, { pathError: "download path unavailable", settleError: "download readback failed" });
+assert.equal(downloadReceipt.written.downloadConfirmed, true);
+assert.match(downloadReceipt.written.pathError, /download path unavailable/);
+assert.match(downloadReceipt.written.readbackError, /download readback failed/);
+
+const uploadReceipt = await executeKernel(KERNEL.upload, {
+  providerTabId: "p", expectedUrl: "https://example.test/", target: { kind: "role", role: "button", name: "Upload" }, filePath: "/trusted/file.txt",
+}, { settleError: "upload readback failed" });
+assert.equal(uploadReceipt.written.chooserConfirmed, true);
+assert.equal(uploadReceipt.written.setFilesReturned, true);
+assert.match(uploadReceipt.written.readbackError, /upload readback failed/);
+
+const cleanupReceipt = await executeKernel(KERNEL.scroll, {
+  providerTabId: "p", expectedUrl: "https://example.test/", direction: "down", amount: "page",
+}, { finalizeError: "release failed" });
+assert.equal(cleanupReceipt.written.scrollReturned, true);
+assert.equal(cleanupReceipt.written.cleanupStatus, "uncertain");
+assert.match(cleanupReceipt.written.cleanupError, /release failed/);
+
+const closeReceipt = await executeKernel(KERNEL.close, {
+  providerTabId: "p", expectedUrl: "https://example.test/",
+}, { finalizeError: "release must not run after close dispatch" });
+assert.equal(closeReceipt.written.closed, true);
+assert.equal(closeReceipt.finalizeCalls, 0, "close must not release/finalize after dispatch");
 
 // Prepared-ref reference model: wrong-kind lookup does not consume; the first
 // matching execution consumes synchronously, so no later replay is possible.
