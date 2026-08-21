@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resolveBrowserRuntimeCompatibility } from "../src/browser-runtime-compat.mjs";
@@ -37,11 +37,13 @@ try {
   assert.equal(resolved.status, "ok");
   assert.equal(resolved.source, "codex-skills-list");
   assert.equal(resolved.build, build);
-  assert.equal(path.resolve(resolved.chromeSkillPath), path.resolve(skillPath));
-  assert.equal(path.resolve(resolved.browserClientPath), path.resolve(clientPath));
-  assert.equal(path.resolve(resolved.browserServicePath), path.resolve(servicePath));
-  assert.equal(path.resolve(resolved.chromeManifestPath), path.resolve(chromeManifestPath));
-  assert.equal(path.resolve(resolved.browserManifestPath), path.resolve(browserManifestPath));
+  // `realpath` canonicalizes macOS's `/var` symlink to `/private/var`; compare
+  // against the same host-canonical form rather than a lexical path spelling.
+  assert.equal(resolved.chromeSkillPath, realpathSync(skillPath));
+  assert.equal(resolved.browserClientPath, realpathSync(clientPath));
+  assert.equal(resolved.browserServicePath, realpathSync(servicePath));
+  assert.equal(resolved.chromeManifestPath, realpathSync(chromeManifestPath));
+  assert.equal(resolved.browserManifestPath, realpathSync(browserManifestPath));
   assert.match(resolved.browserClientSha256, /^[a-f0-9]{64}$/);
   assert.equal(resolved.overrides.length, 4);
   assert.match(resolved.overrides.join("\n"), new RegExp(build.replaceAll(".", "\\.")));

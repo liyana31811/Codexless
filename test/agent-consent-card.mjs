@@ -202,7 +202,7 @@ assert.match(portableCard.content?.[0]?.text ?? "", /5h/);
 assert.match(portableCard.content?.[0]?.text ?? "", /73%/);
 assert.match(portableCard.content?.[0]?.text ?? "", /7d/);
 assert.match(portableCard.content?.[0]?.text ?? "", /59%/);
-assert.match(portableCard.content?.[0]?.text ?? "", /unavailable|未提供|提供なし/i);
+assert.match(portableCard.content?.[0]?.text ?? "", /unavailable|not provided|未提供|提供なし/i);
 const portableTaskId = portableCard.structuredContent.manualFallback?.taskId;
 assert.match(portableTaskId ?? "", /^C-[A-F0-9]{10}$/);
 assert.equal((portableCard.content?.[0]?.text ?? "").includes(portableTaskId), false, "short task id stays in structured content, not the user-facing fallback text");

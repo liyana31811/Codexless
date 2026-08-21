@@ -40,6 +40,20 @@ function tomlValue(value) {
   throw new Error(`unsupported Browser MCP config value type: ${typeof value}`);
 }
 
+async function closeStartedPublicRuntimeComponents({ agentExecutor, browserContext, publicContext }) {
+  let cleanupFailed = false;
+  let lastCleanupError;
+  for (const component of [agentExecutor, browserContext, publicContext]) {
+    try {
+      await component?.close();
+    } catch (error) {
+      cleanupFailed = true;
+      lastCleanupError = error;
+    }
+  }
+  if (cleanupFailed) throw lastCleanupError;
+}
+
 export function browserMcpIsolationOverride(nodeReplConfig) {
   const isolated = nodeReplConfig && typeof nodeReplConfig === "object" && !Array.isArray(nodeReplConfig)
     ? { node_repl: nodeReplConfig }
@@ -200,15 +214,7 @@ export async function createPublicRuntime({ env = process.env } = {}) {
     async function close() {
       if (closed) return;
       closed = true;
-      try {
-        await agentExecutor?.close();
-      } finally {
-        try {
-          await browserContext?.close();
-        } finally {
-          await publicContext?.close();
-        }
-      }
+      await closeStartedPublicRuntimeComponents({ agentExecutor, browserContext, publicContext });
     }
 
     return {
@@ -223,11 +229,7 @@ export async function createPublicRuntime({ env = process.env } = {}) {
       recentCallDiagnostics,
     };
   } catch (error) {
-    try {
-      await agentExecutor?.close();
-    } finally {
-      await publicContext?.close();
-    }
+    await closeStartedPublicRuntimeComponents({ agentExecutor, browserContext, publicContext });
     throw error;
   }
 }

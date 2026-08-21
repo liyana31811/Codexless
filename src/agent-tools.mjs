@@ -1,19 +1,71 @@
 import { createRequire } from "node:module";
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import path from "node:path";
 
 const require = createRequire(import.meta.url);
 const z = require("zod/v4");
-import { MeteredConsentGate } from "./metered-consent.mjs";
+const AGENT_REF = z.string().min(1).max(512);
+const APPROVAL_REQUEST_ID = z.string().min(1).max(512).describe("Exact pendingApproval.requestId from codex.agent_show/start/send.");
 import { AGENT_TASK_CARD_URI, registerAgentTaskCardResource } from "./agent-card-ui.mjs";
+import {
+  createAgentTaskLedger,
+  DEFAULT_TASK_STORE_MAX_ENTRIES,
+  DEFAULT_TASK_STORE_TTL_MS,
+  portableShortTaskId,
+} from "./agent-task-ledger.mjs";
+import { integerOrNull } from "./agent-resource.mjs";
+import { collectModelCatalog, projectExecution, stringOrNull } from "./codex-agent-executor.mjs";
 
 const EVENT_KEYS = new Set(["seq", "type", "at", "turnId", "status", "requestId"]);
 const PENDING_APPROVAL_KEYS = new Set(["requestId", "method", "itemId", "receivedAt", "reason", "details"]);
+const TERMINAL_STATUSES = new Set(["idle", "completed", "failed", "interrupted", "rejected", "lost"]);
+const TERMINAL_LABELS = { failed: "FAILED", interrupted: "STOPPED", rejected: "REJECTED", lost: "UNCERTAIN" };
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const MUTATING = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true };
 
-function publicEvent(event) {
-  if (!event || typeof event !== "object") return null;
-  return Object.fromEntries(Object.entries(event).filter(([key]) => EVENT_KEYS.has(key)));
+function compactModelOption(entry) {
+  const model = typeof entry?.model === "string" && entry.model ? entry.model : typeof entry?.id === "string" && entry.id ? entry.id : null;
+  if (!model) return null;
+  return {
+    model,
+    displayName: typeof entry?.displayName === "string" && entry.displayName ? entry.displayName : null,
+    isDefault: entry?.isDefault === true,
+    defaultReasoningEffort: typeof entry?.defaultReasoningEffort === "string" && entry.defaultReasoningEffort ? entry.defaultReasoningEffort : null,
+    supportedReasoningEfforts: Array.isArray(entry?.supportedReasoningEfforts) ? entry.supportedReasoningEfforts.map((option) => typeof option === "string" ? option : typeof option?.reasoningEffort === "string" ? option.reasoningEffort : null).filter(Boolean) : [],
+  };
+}
+
+function resolveReasoningSelection({ entry, requested = null, current = null, preserveCurrent = false } = {}) {
+  const option = compactModelOption(entry);
+  const model = option?.model ?? null;
+  const supported = option?.supportedReasoningEfforts ?? [];
+  let effort = typeof requested === "string" && requested.trim() ? requested.trim() : null;
+  let source = effort ? "explicit" : null;
+  if (!effort && preserveCurrent && model && current && supported.includes(current)) [effort, source] = [current, "current"];
+  if (!effort && entry?.defaultReasoningEffort) [effort, source] = [entry.defaultReasoningEffort, "default"];
+  if (source === "explicit" && !supported.includes(effort)) throw new Error(`reasoningEffort validation failed for model "${model}": requested effort "${effort}"; supported efforts: ${supported.length ? supported.join(", ") : "(none)"}`);
+  if (source === "default" && supported.length && !supported.includes(effort)) throw new Error(`codex.model_list returned default reasoning effort "${effort}" outside the supported efforts for model "${model}"`);
+  return { effort, source, supportedReasoningEfforts: supported };
+}
+
+function selectedPayload(payload, model, reasoningEffort, selection) {
+  if (!selection) return payload;
+  return {
+    ...payload,
+    callerModel: model ?? null,
+    ...(reasoningEffort !== undefined ? { callerReasoningEffort: reasoningEffort } : {}),
+    model: selection.selectedModel,
+    ...(stringOrNull(selection.selectedReasoningEffort) !== null ? { reasoningEffort: selection.selectedReasoningEffort } : {}),
+    modelSelection: selection,
+  };
+}
+
+function controlInputSchema(kind) {
+  const requestId = z.string().min(1).max(512).describe(`Stable caller-generated idempotency key for this logical ${kind}.`);
+  if (kind === "cancel") return z.object({
+    agentRef: AGENT_REF,
+    expectedTurnId: z.string().min(1).max(512).optional().describe("Optional task-bound turn id. When supplied, cancel fails closed if the agent has advanced to another turn."),
+    requestId,
+  }).strict();
+  return z.object({ agentRef: AGENT_REF, approvalRequestId: APPROVAL_REQUEST_ID, requestId }).strict();
 }
 
 function publicPendingApproval(pendingApproval) {
@@ -29,34 +81,16 @@ function quotaWindows(quota) {
   for (const limit of limits) {
     for (const window of Array.isArray(limit?.windows) ? limit.windows : []) {
       windows.push({
-        limitKey: typeof limit?.key === "string" ? limit.key : null,
-        limitName: typeof limit?.limitName === "string" ? limit.limitName : null,
-        kind: typeof window?.kind === "string" ? window.kind : null,
-        remainingPercent: Number.isInteger(window?.remainingPercent) ? window.remainingPercent : null,
-        resetsAt: Number.isInteger(window?.resetsAt) ? window.resetsAt : null,
-        windowDurationMins: Number.isInteger(window?.windowDurationMins) ? window.windowDurationMins : null,
+        limitKey: stringOrNull(limit?.key),
+        limitName: stringOrNull(limit?.limitName),
+        kind: stringOrNull(window?.kind),
+        remainingPercent: integerOrNull(window?.remainingPercent),
+        resetsAt: integerOrNull(window?.resetsAt),
+        windowDurationMins: integerOrNull(window?.windowDurationMins),
       });
     }
   }
   return windows;
-}
-
-function quotaWindowDurationLabel(window) {
-  const mins = window?.windowDurationMins;
-  if (!Number.isInteger(mins) || mins <= 0) return null;
-  if (mins % 1_440 === 0) return `${mins / 1_440}d`;
-  if (mins % 60 === 0) return `${mins / 60}h`;
-  return `${mins}m`;
-}
-
-function quotaWindowLabel(window, index) {
-  const duration = quotaWindowDurationLabel(window);
-  const rawName = window?.limitName;
-  const namedLimit = rawName && rawName.toLowerCase() !== "codex"
-    ? rawName
-    : (window?.limitKey && window.limitKey !== "codex" ? window.limitKey : null);
-  if (namedLimit && duration) return `${namedLimit} · ${duration}`;
-  return namedLimit || duration || window?.kind || `window ${index + 1}`;
 }
 
 function compactOneLine(value, max = 320) {
@@ -64,29 +98,33 @@ function compactOneLine(value, max = 320) {
   return clean.length > max ? clean.slice(0, Math.max(1, max - 3)) + "..." : clean;
 }
 
-function approvalOneLine(pendingApproval) {
-  if (!pendingApproval) return "Approval required";
-  return compactOneLine(
-    pendingApproval.reason
-      ?? pendingApproval.details?.reason
-      ?? pendingApproval.details?.command
-      ?? pendingApproval.details?.path
-      ?? pendingApproval.details?.changes?.[0]?.path
-      ?? pendingApproval.method
-      ?? "Approval required"
-  );
-}
-
-function quotaFallbackText(window, index) {
-  const label = quotaWindowLabel(window, index);
-  const remaining = Number.isInteger(window?.remainingPercent) ? `${window.remainingPercent}% left` : "remaining unknown";
-  const reset = Number.isInteger(window?.resetsAt) ? ` · reset ${new Date(window.resetsAt * 1000).toISOString()}` : "";
-  return `${label}: ${remaining}${reset}`;
-}
-
-function portableShortTaskId(taskRef) {
-  const digest = createHash("sha256").update(String(taskRef), "utf8").digest("hex").slice(0, 10).toUpperCase();
-  return `C-${digest}`;
+function quotaWindowText(window, index, locale = null) {
+  const mins = window?.windowDurationMins;
+  const duration = !Number.isInteger(mins) || mins <= 0 ? null
+    : mins % 1_440 === 0 ? `${mins / 1_440}d`
+      : mins % 60 === 0 ? `${mins / 60}h`
+        : `${mins}m`;
+  const rawName = window?.limitName;
+  const namedLimit = rawName && rawName.toLowerCase() !== "codex"
+    ? rawName
+    : (window?.limitKey && window.limitKey !== "codex" ? window.limitKey : null);
+  const label = namedLimit && duration ? `${namedLimit} · ${duration}` : namedLimit || duration || window?.kind || `window ${index + 1}`;
+  if (!locale) {
+    const remaining = Number.isInteger(window?.remainingPercent) ? `${window.remainingPercent}% left` : "remaining unknown";
+    const reset = Number.isInteger(window?.resetsAt) ? ` · reset ${new Date(window.resetsAt * 1000).toISOString()}` : "";
+    return `${label}: ${remaining}${reset}`;
+  }
+  const strings = portableStrings(locale);
+  const remaining = Number.isInteger(window?.remainingPercent) ? `${window.remainingPercent}% ${strings.left}` : strings.unavailable;
+  let reset = "";
+  if (Number.isInteger(window?.resetsAt)) {
+    try {
+      reset = new Intl.DateTimeFormat(locale || undefined, { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZoneName: "short" }).format(new Date(window.resetsAt * 1000));
+    } catch {
+      reset = new Date(window.resetsAt * 1000).toLocaleString();
+    }
+  }
+  return `${label}：${remaining} · ${strings.reset} ${reset || strings.unavailable}`;
 }
 
 function portableLocale() {
@@ -119,56 +157,28 @@ function portableStrings(locale = portableLocale()) {
   };
 }
 
-function agentModelIdentity(entry) {
-  if (typeof entry?.model === "string" && entry.model) return entry.model;
-  if (typeof entry?.id === "string" && entry.id) return entry.id;
-  return null;
-}
-
-function portableModelOption(entry) {
-  const model = agentModelIdentity(entry);
-  if (!model) return null;
-  return {
-    model,
-    displayName: typeof entry?.displayName === "string" && entry.displayName ? entry.displayName : null,
-    isDefault: entry?.isDefault === true,
-    defaultReasoningEffort: typeof entry?.defaultReasoningEffort === "string" && entry.defaultReasoningEffort ? entry.defaultReasoningEffort : null,
-    supportedReasoningEfforts: Array.isArray(entry?.supportedReasoningEfforts)
-      ? entry.supportedReasoningEfforts.map((option) => typeof option?.reasoningEffort === "string" ? option.reasoningEffort : null).filter(Boolean)
-      : [],
-  };
-}
-
-function portableModelLabel(option) {
-  if (!option) return null;
-  return option.displayName && option.displayName !== option.model
-    ? option.displayName
-    : option.model;
-}
-
-function portableResetText(unixSeconds, locale = portableLocale()) {
-  if (!Number.isInteger(unixSeconds)) return "";
-  try {
-    return new Intl.DateTimeFormat(locale || undefined, {
-      year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZoneName: "short",
-    }).format(new Date(unixSeconds * 1000));
-  } catch {
-    return new Date(unixSeconds * 1000).toLocaleString();
-  }
-}
-
-function portableQuotaText(window, index, locale = portableLocale()) {
-  const strings = portableStrings(locale);
-  const label = quotaWindowLabel(window, index);
-  const remaining = Number.isInteger(window?.remainingPercent) ? `${window.remainingPercent}% ${strings.left}` : strings.unavailable;
-  const reset = portableResetText(window?.resetsAt, locale);
-  return `${label}：${remaining} · ${strings.reset} ${reset || strings.unavailable}`;
-}
-
 function portableQuotaGroup(label, quota, locale = portableLocale()) {
   const strings = portableStrings(locale);
   const windows = quotaWindows(quota);
-  return [label, ...(windows.length ? windows.map((window, index) => portableQuotaText(window, index, locale)) : [strings.unavailable])];
+  return [label, ...(windows.length ? windows.map((window, index) => quotaWindowText(window, index, locale)) : [strings.unavailable])];
+}
+
+function portableTaskCard({ taskId, status, task, choices, lines, windows, beforeQuota, afterQuota, selection, consent = false }) {
+  const card = {
+    kind: "portable_card", portable: true, taskId, status, task, choices,
+    requiresTaskCard: false, nextAction: "codex.agent_card_render",
+    quota: beforeQuota === null && afterQuota === null ? { windows } : { windows, before: { windows: quotaWindows(beforeQuota) }, after: { windows: quotaWindows(afterQuota) } },
+    lines, text: lines.join("\n"),
+  };
+  if (selection) card.modelSelection = structuredClone(selection);
+  if (consent) {
+    card.rebind = {
+      mode: "natural_language_reprepare", requiresNewRequestId: true,
+      instruction: "If the user changes model or reasoning effort before approval, do not commit this task. Prepare the same logical task again with the requested selection and a fresh requestId, present the new confirmation, and bind Yes only to the newly presented taskId.",
+    };
+    card.decision = { approveTool: "codex.agent_commit", declineTool: "codex.agent_decline", taskId };
+  }
+  return card;
 }
 
 function manualFallback(payload) {
@@ -177,147 +187,54 @@ function manualFallback(payload) {
   const strings = portableStrings(locale);
   const beforeQuota = payload?.meteredConsent?.quota ?? payload?.taskCard?.quota ?? null;
   const afterQuota = payload?.resourceReceipt?.accountQuota ?? null;
-  const quota = beforeQuota ?? afterQuota;
-  const windows = quotaWindows(quota);
-  const quotaLines = windows.length ? windows.map((window, index) => quotaFallbackText(window, index)) : ["Codex quota: unavailable"];
+  const windows = quotaWindows(beforeQuota ?? afterQuota);
   const taskRef = payload?.taskRef ?? payload?.taskId ?? payload?.taskCard?.taskRef ?? null;
+  const task = compactOneLine(payload?.taskCard?.summary ?? "Codex task");
+  const selection = payload?.taskCard?.modelSelection && typeof payload.taskCard.modelSelection === "object" ? payload.taskCard.modelSelection : null;
+  const selectedModelOption = selection?.models?.find((option) => option?.model === selection?.selectedModel) ?? null;
+  const requestedModel = payload?.execution?.requestedModel ?? payload?.taskCard?.requestedModel ?? selection?.selectedModel ?? null;
+  const resolvedModel = payload?.execution?.resolvedModel ?? null;
+  const requestedEffort = payload?.execution?.requestedReasoningEffort ?? payload?.taskCard?.requestedReasoningEffort ?? selection?.selectedReasoningEffort ?? null;
+  const resolvedEffort = payload?.execution?.reasoningEffort ?? null;
+  const approvalText = payload?.pendingApproval ? compactOneLine(payload.pendingApproval.reason ?? payload.pendingApproval.details?.reason ?? payload.pendingApproval.details?.command ?? payload.pendingApproval.details?.path ?? payload.pendingApproval.details?.changes?.[0]?.path ?? payload.pendingApproval.method ?? "Approval required") : "Approval required";
+
+  if (status === "consent_required") {
+    if (!taskRef) return null;
+    const taskId = portableShortTaskId(taskRef);
+    const model = selection?.selectedModel
+      ? ((selectedModelOption?.displayName && selectedModelOption.displayName !== selectedModelOption.model) ? selectedModelOption.displayName : selectedModelOption?.model) ?? selection.selectedModelDisplayName ?? selection.selectedModel
+      : requestedModel ? compactOneLine(requestedModel) : null;
+    const effort = selection?.selectedReasoningEffort ?? requestedEffort;
+    const lines = [strings.call, "", `${strings.task}：${task}`];
+    lines.push(`${strings.model}：${model ?? strings.unavailable}`, `${strings.reasoning}：${effort ?? strings.unavailable}`, "", ...portableQuotaGroup(strings.quota, beforeQuota, locale), "", strings.reply);
+    return portableTaskCard({ taskId, status: "AWAITING DECISION", task, choices: ["Yes", "No"], lines, windows, beforeQuota, afterQuota, selection, consent: true });
+  }
 
   if (taskRef) {
     const taskId = portableShortTaskId(taskRef);
-    const task = compactOneLine(payload?.taskCard?.summary ?? "Codex task");
-    const selection = payload?.taskCard?.modelSelection && typeof payload.taskCard.modelSelection === "object" ? payload.taskCard.modelSelection : null;
-    const selectedModelOption = selection?.models?.find((option) => option?.model === selection?.selectedModel) ?? null;
-    const requestedModel = payload?.execution?.requestedModel ?? payload?.taskCard?.requestedModel ?? selection?.selectedModel ?? null;
-    const resolvedModel = payload?.execution?.resolvedModel ?? null;
-    const model = status === "consent_required" && selection?.selectedModel
-      ? portableModelLabel(selectedModelOption ?? { model: selection.selectedModel, displayName: selection.selectedModelDisplayName ?? null })
-      : resolvedModel ?? requestedModel ?? null;
-    const requestedEffort = payload?.execution?.requestedReasoningEffort ?? payload?.taskCard?.requestedReasoningEffort ?? selection?.selectedReasoningEffort ?? null;
-    const resolvedEffort = payload?.execution?.reasoningEffort ?? null;
-    const effort = status === "consent_required" ? selection?.selectedReasoningEffort ?? requestedEffort ?? null : resolvedEffort ?? requestedEffort ?? null;
-    const portableStatus = status === "consent_required" ? "AWAITING DECISION" : status === "awaitingApproval" ? "CODEX APPROVAL REQUIRED" : status === "running" ? "RUNNING" : isTerminalStatus(status) ? terminalLabel(status) : String(status).toUpperCase();
-    let lines;
-    if (status === "consent_required") {
-      lines = [
-        strings.call, "",
-        `${strings.task}：${task}`,
-        `${strings.model}：${model ?? strings.unavailable}`,
-        `${strings.reasoning}：${effort ?? strings.unavailable}`,
-        "",
-        ...portableQuotaGroup(strings.quota, beforeQuota, locale), "",
-        strings.reply,
-      ];
-    } else {
-      lines = [`Codex · ${portableStatus}`, `${strings.task}：${task}`];
-      if (model) lines.push(`${strings.model}：${model}`);
-      if (effort) lines.push(`${strings.reasoning}：${effort}`);
-      if (status === "awaitingApproval" && payload?.pendingApproval) lines.push(`Pending Codex approval: ${approvalOneLine(payload.pendingApproval)}`);
-      if (isTerminalStatus(status)) {
-        const detail = compactOneLine(payload?.finalResult ?? payload?.latestError ?? "", 500);
-        const turnTokens = payload?.resourceReceipt?.tokenUsage?.turn?.totalTokens ?? null;
-        if (detail) lines.push(`Result: ${detail}`);
-        lines.push(Number.isInteger(turnTokens) ? `Usage: ${turnTokens.toLocaleString("en-US")} tokens this turn` : "Usage: tokens unavailable");
-        if (beforeQuota) lines.push("", ...portableQuotaGroup(`${strings.quota} · before`, beforeQuota, locale));
-        if (afterQuota) lines.push("", ...portableQuotaGroup(`${strings.quota} · after`, afterQuota, locale));
-        if (!beforeQuota && !afterQuota) lines.push("", strings.quota, strings.unavailable);
-      } else if (beforeQuota) lines.push("", ...portableQuotaGroup(strings.quota, beforeQuota, locale));
-    }
-    return {
-      kind: "portable_card",
-      portable: true,
-      taskId,
-      status: portableStatus,
-      task,
-      choices: status === "consent_required" ? ["Yes", "No"] : [],
-      requiresTaskCard: false,
-      nextAction: "codex.agent_card_render",
-      quota: { windows, before: { windows: quotaWindows(beforeQuota) }, after: { windows: quotaWindows(afterQuota) } },
-      ...(selection ? { modelSelection: structuredClone(selection) } : {}),
-      ...(status === "consent_required" ? {
-        rebind: {
-          mode: "natural_language_reprepare",
-          requiresNewRequestId: true,
-          instruction: "If the user changes model or reasoning effort before approval, do not commit this task. Prepare the same logical task again with the requested selection and a fresh requestId, present the new confirmation, and bind Yes only to the newly presented taskId.",
-        },
-        decision: { approveTool: "codex.agent_commit", declineTool: "codex.agent_decline", taskId },
-      } : {}),
-      lines,
-      text: lines.join("\n"),
-    };
-  }
-
-  if (status === "consent_required") {
-    const locale = portableLocale();
-    const strings = portableStrings(locale);
-    const summary = compactOneLine(payload?.taskCard?.summary ?? "Codex task");
-    const requestedModel = payload?.execution?.requestedModel ?? payload?.taskCard?.requestedModel ?? null;
-    const model = requestedModel ? compactOneLine(requestedModel) : null;
-    const requestedEffort = payload?.execution?.requestedReasoningEffort ?? payload?.taskCard?.requestedReasoningEffort ?? null;
-    const effort = requestedEffort ? compactOneLine(requestedEffort) : null;
-    const taskRef = payload?.taskRef ?? payload?.taskId ?? payload?.taskCard?.taskRef ?? null;
-    const taskId = taskRef ? portableShortTaskId(taskRef) : null;
-    const portableQuotaLines = windows.length
-      ? windows.map((window, index) => portableQuotaText(window, index, locale))
-      : [strings.unavailable];
-    const body = [strings.call, "", `${strings.task}：${summary}`];
-    if (model) body.push(`${strings.model}：${model}`);
-    if (effort) body.push(`${strings.reasoning}：${effort}`);
-    body.push("", strings.quota, ...portableQuotaLines, "", strings.reply);
-    const lines = body;
-    return {
-      kind: "portable_card",
-      choices: ["Yes", "No"],
-      summary,
-      taskId,
-      quota: { windows },
-      requiresTaskCard: false,
-      nextAction: "codex.agent_card_render",
-      decision: taskId ? {
-        approveTool: "codex.agent_commit",
-        declineTool: "codex.agent_decline",
-        taskId,
-      } : null,
-      lines,
-      text: lines.join("\n"),
-    };
-  }
-
-  if (status === "awaitingApproval" && payload?.pendingApproval) {
-    const summary = approvalOneLine(payload.pendingApproval);
-    return {
-      kind: "confirm_approval",
-      choices: ["Yes", "No"],
-      summary,
-      quota: { windows },
-      lines: ["Codex approval", `Request: ${summary}`, ...quotaLines, "Yes / No"],
-    };
-  }
-
-  const terminal = isTerminalStatus(status);
-  if (terminal) {
-    const label = terminalLabel(status);
-    const task = compactOneLine(payload?.taskCard?.summary ?? "Codex task");
-    const detail = label === "DONE" ? null : compactOneLine(payload?.latestError ?? payload?.finalResult ?? label, 240);
-    const turnTokens = payload?.resourceReceipt?.tokenUsage?.turn?.totalTokens ?? null;
-    const tokenLine = Number.isInteger(turnTokens) ? `This turn: ${turnTokens.toLocaleString("en-US")} tokens` : "This turn: tokens unavailable";
-    const lines = [`Codex · ${label}`, `Task: ${task}`];
-    if (detail) lines.push(`Detail: ${detail}`);
-    lines.push(tokenLine, "Codex quota", ...quotaLines);
-    return {
-      kind: "completion",
-      status: label.toLowerCase(),
-      task,
-      result: detail,
-      turnTokens: Number.isInteger(turnTokens) ? turnTokens : null,
-      quota: { windows },
-      lines,
-    };
+    const model = resolvedModel ?? requestedModel ?? null;
+    const effort = resolvedEffort ?? requestedEffort ?? null;
+    const portableStatus = status === "awaitingApproval" ? "CODEX APPROVAL REQUIRED" : status === "running" ? "RUNNING" : TERMINAL_STATUSES.has(status) ? TERMINAL_LABELS[status] ?? "DONE" : String(status).toUpperCase();
+    const lines = [`Codex · ${portableStatus}`, `${strings.task}：${task}`];
+    if (model) lines.push(`${strings.model}：${model}`);
+    if (effort) lines.push(`${strings.reasoning}：${effort}`);
+    if (status === "awaitingApproval" && payload?.pendingApproval) lines.push(`Pending Codex approval: ${approvalText}`);
+    if (TERMINAL_STATUSES.has(status)) {
+      const detail = compactOneLine(payload?.finalResult ?? payload?.latestError ?? "", 500);
+      const turnTokens = payload?.resourceReceipt?.tokenUsage?.turn?.totalTokens ?? null;
+      if (detail) lines.push(`Result: ${detail}`);
+      lines.push(Number.isInteger(turnTokens) ? `Usage: ${turnTokens.toLocaleString("en-US")} tokens this turn` : "Usage: tokens unavailable");
+      if (beforeQuota) lines.push("", ...portableQuotaGroup(`${strings.quota} · before`, beforeQuota, locale));
+      if (afterQuota) lines.push("", ...portableQuotaGroup(`${strings.quota} · after`, afterQuota, locale));
+      if (!beforeQuota && !afterQuota) lines.push("", strings.quota, strings.unavailable);
+    } else if (beforeQuota) lines.push("", ...portableQuotaGroup(strings.quota, beforeQuota, locale));
+    return portableTaskCard({ taskId, status: portableStatus, task, choices: [], lines, windows, beforeQuota, afterQuota, selection });
   }
 
   return null;
 }
 
-function publicAgentSnapshot(snapshot, taskCard = null) {
+function publicAgentSnapshot(snapshot, taskCard = null, extra = null) {
   const payload = {
     agentRef: snapshot?.agentRef ?? null,
     turnId: snapshot?.turnId ?? null,
@@ -327,12 +244,13 @@ function publicAgentSnapshot(snapshot, taskCard = null) {
     finalResult: snapshot?.finalResult ?? null,
     resourceReceipt: snapshot?.resourceReceipt ?? null,
     timing: snapshot?.timing ?? { startedAt: null, endedAt: null, durationMs: null },
-    execution: snapshot?.execution ?? { requestedModel: null, resolvedModel: null, modelProvider: null, serviceTier: null, reasoningEffort: null },
+    execution: snapshot?.execution ?? projectExecution(),
     latestError: snapshot?.latestError ?? null,
-    events: Array.isArray(snapshot?.events) ? snapshot.events.map(publicEvent).filter(Boolean) : [],
-    nextSeq: Number.isInteger(snapshot?.nextSeq) ? snapshot.nextSeq : 0,
+    events: Array.isArray(snapshot?.events) ? snapshot.events.map((event) => !event || typeof event !== "object" ? null : Object.fromEntries(Object.entries(event).filter(([key]) => EVENT_KEYS.has(key)))).filter(Boolean) : [],
+    nextSeq: integerOrNull(snapshot?.nextSeq) ?? 0,
   };
   if (taskCard) payload.taskCard = taskCard;
+  if (extra) Object.assign(payload, extra);
   if (typeof snapshot?.duplicate === "boolean") payload.duplicate = snapshot.duplicate;
   if (typeof snapshot?.controlAcceptance === "string") payload.controlAcceptance = snapshot.controlAcceptance;
   const fallback = manualFallback(payload);
@@ -340,101 +258,21 @@ function publicAgentSnapshot(snapshot, taskCard = null) {
   return payload;
 }
 
-function consentRequiredSnapshot({ agentRef = null, consent, taskCard = null }) {
-  const payload = {
-    agentRef,
+function pendingTaskSnapshot({ record, resolvedExecution = null }) {
+  return publicAgentSnapshot({
+    agentRef: record.agentRef,
     status: "consent_required",
-    canSend: false,
-    pendingApproval: null,
-    meteredConsent: consent,
-    taskCard,
-    finalResult: null,
-    resourceReceipt: null,
-    latestError: null,
-    events: [],
-    nextSeq: 0,
-  };
-  payload.manualFallback = manualFallback(payload);
-  return payload;
-}
-
-const TASK_STORE_VERSION = 1;
-const DEFAULT_TASK_STORE_TTL_MS = 14 * 24 * 60 * 60_000;
-const DEFAULT_TASK_STORE_MAX_ENTRIES = 2_000;
-
-function createTaskPersistence({ filePath = null, ttlMs = DEFAULT_TASK_STORE_TTL_MS, maxEntries = DEFAULT_TASK_STORE_MAX_ENTRIES } = {}) {
-  if (!filePath) return null;
-  if (!Number.isInteger(ttlMs) || ttlMs < 60_000) throw new Error("agent task-state ttlMs must be at least 60000");
-  if (!Number.isInteger(maxEntries) || maxEntries < 10 || maxEntries > 100_000) throw new Error("agent task-state maxEntries must be 10..100000");
-  const resolvedPath = path.resolve(filePath);
-  const records = new Map();
-  let blockedError = null;
-
-  if (existsSync(resolvedPath)) {
-    try {
-      const parsed = JSON.parse(readFileSync(resolvedPath, "utf8"));
-      if (parsed?.version !== TASK_STORE_VERSION || !Array.isArray(parsed.records)) {
-        throw new Error(`unsupported task-state schema version ${String(parsed?.version ?? "missing")}`);
-      }
-      for (const entry of parsed.records) {
-        if (!entry || typeof entry !== "object" || typeof entry.taskRef !== "string") continue;
-        records.set(entry.taskRef, entry);
-      }
-    } catch (error) {
-      blockedError = `agent task-state file is unreadable or corrupt: ${error instanceof Error ? error.message : String(error)}`;
-    }
-  }
-
-  function assertAvailable() {
-    if (blockedError) throw new Error(blockedError);
-  }
-
-  function trim(now = Date.now()) {
-    for (const [key, entry] of records) {
-      const updatedAt = Number.isFinite(entry?.updatedAt) ? entry.updatedAt : 0;
-      if (!updatedAt || now - updatedAt > ttlMs) records.delete(key);
-    }
-    if (records.size <= maxEntries) return;
-    const oldest = [...records.entries()].sort((a, b) => (a[1]?.updatedAt ?? 0) - (b[1]?.updatedAt ?? 0));
-    for (let index = 0; index < oldest.length - maxEntries; index += 1) records.delete(oldest[index][0]);
-  }
-
-  function flush() {
-    assertAvailable();
-    trim();
-    mkdirSync(path.dirname(resolvedPath), { recursive: true });
-    const tmp = `${resolvedPath}.tmp-${randomUUID()}`;
-    writeFileSync(tmp, JSON.stringify({ version: TASK_STORE_VERSION, records: [...records.values()] }), { encoding: "utf8", mode: 0o600 });
-    renameSync(tmp, resolvedPath);
-  }
-
-  trim();
-  return {
-    filePath: resolvedPath,
-    get(taskRef) {
-      assertAvailable();
-      trim();
-      const entry = records.get(taskRef);
-      return entry ? structuredClone(entry) : null;
-    },
-    findByRequest({ requestId, action, agentRef = null }) {
-      assertAvailable();
-      trim();
-      let found = null;
-      for (const entry of records.values()) {
-        if (entry?.requestId !== requestId || entry?.action !== action) continue;
-        if ((entry?.subjectRef ?? null) !== agentRef) continue;
-        if (!found || (entry.updatedAt ?? 0) > (found.updatedAt ?? 0)) found = entry;
-      }
-      return found ? structuredClone(found) : null;
-    },
-    put(entry) {
-      assertAvailable();
-      if (!entry || typeof entry.taskRef !== "string" || !entry.taskRef) throw new Error("persisted agent task entry requires taskRef");
-      records.set(entry.taskRef, { ...structuredClone(entry), updatedAt: Date.now() });
-      flush();
-    },
-  };
+    timing: { startedAt: null, endedAt: null, durationMs: null },
+    execution: projectExecution({
+      requestedModel: stringOrNull(record.payload?.model),
+      requestedReasoningEffort: stringOrNull(record.payload?.reasoningEffort),
+      ...resolvedExecution,
+    }),
+  }, record.taskCard, {
+    meteredConsent: record.consent,
+    taskRef: record.taskRef,
+    taskId: record.taskRef,
+  });
 }
 
 export function createAgentPreviewState({
@@ -444,25 +282,15 @@ export function createAgentPreviewState({
   taskStateTtlMs = DEFAULT_TASK_STORE_TTL_MS,
   taskStateMaxEntries = DEFAULT_TASK_STORE_MAX_ENTRIES,
 } = {}) {
-  return {
-    meteredConsent: new MeteredConsentGate({ mode: meteredConsentMode, quotaProvider: meteredQuotaProvider }),
-    preparedMetered: new Map(),
-    agentCards: new Map(),
-    taskRecords: new Map(),
-    taskPersistence: createTaskPersistence({ filePath: taskStateFile, ttlMs: taskStateTtlMs, maxEntries: taskStateMaxEntries }),
-  };
-}
-
-function isTerminalStatus(status) {
-  return new Set(["idle", "completed", "failed", "interrupted", "rejected", "lost"]).has(status);
-}
-
-function terminalLabel(status) {
-  if (status === "failed") return "FAILED";
-  if (status === "interrupted") return "STOPPED";
-  if (status === "rejected") return "REJECTED";
-  if (status === "lost") return "UNCERTAIN";
-  return "DONE";
+  const ledger = createAgentTaskLedger({
+    mode: meteredConsentMode,
+    quotaProvider: meteredQuotaProvider,
+    taskStateFile,
+    taskStateTtlMs,
+    taskStateMaxEntries,
+  });
+  const meteredConsent = Object.freeze({ get mode() { return ledger.mode; } });
+  return { ledger, meteredConsent };
 }
 
 export function registerAgentPreviewTools(server, {
@@ -476,37 +304,19 @@ export function registerAgentPreviewTools(server, {
     throw new Error("Agent preview requires both agentExecutor and authorityExecutor");
   }
   const state = agentPreviewState ?? createAgentPreviewState({ meteredConsentMode, meteredQuotaProvider });
-  const { meteredConsent, preparedMetered, agentCards, taskRecords, taskPersistence } = state;
+  const ledger = state.ledger;
+  if (!ledger) throw new Error("Agent preview requires canonical task ledger state");
+  const meteredConsent = state.meteredConsent;
+  const inFlightDispatches = new Map();
   registerAgentTaskCardResource(server);
 
-  function summaryFor(action, payload) {
-    const text = action === "start" ? payload.prompt : payload.message;
-    const clean = String(text ?? "").replace(/\s+/g, " ").trim();
-    return clean.length > 120 ? clean.slice(0, 117) + "..." : clean;
-  }
-
-  function titleFor(action, payload) {
-    const text = action === "start" ? payload.prompt : payload.message;
-    const firstLine = String(text ?? "").split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "Codex task";
-    return firstLine.length > 72 ? firstLine.slice(0, 69) + "..." : firstLine;
-  }
-
   async function fullModelCatalog() {
-    const models = [];
-    let cursor = null;
-    const seenCursors = new Set();
-    for (let page = 0; page < 20; page += 1) {
-      const result = await agentExecutor.listModels({ cursor, limit: 200, includeHidden: false });
-      for (const entry of Array.isArray(result?.models) ? result.models : []) {
-        const option = portableModelOption(entry);
-        if (option && !models.some((item) => item.model === option.model)) models.push(option);
-      }
-      if (!result?.nextCursor) return models;
-      if (seenCursors.has(result.nextCursor)) throw new Error("codex.model_list returned a repeated cursor while preparing the Codex confirmation");
-      seenCursors.add(result.nextCursor);
-      cursor = result.nextCursor;
-    }
-    throw new Error("codex.model_list exceeded the bounded pagination limit while preparing the Codex confirmation");
+    const raw = await collectModelCatalog((params) => agentExecutor.listModels(params), {
+      maxPages: 20,
+      repeatedCursorMessage: "codex.model_list returned a repeated cursor while preparing the Codex confirmation",
+      limitMessage: "codex.model_list exceeded the bounded pagination limit while preparing the Codex confirmation",
+    });
+    return raw.map(compactModelOption).filter((option, index, all) => option && all.findIndex((entry) => entry?.model === option.model) === index);
   }
 
   async function resolvePreparedModelSelection({ requestedModel = null, requestedReasoningEffort = null, currentModel = null, currentReasoningEffort = null } = {}) {
@@ -520,491 +330,126 @@ export function registerAgentPreviewTools(server, {
         ? models.find((item) => item.model === current) ?? models.find((item) => item.isDefault)
         : models.find((item) => item.isDefault);
     if (!entry) throw new Error(`codex.model_list could not resolve the selected model ${requested ?? current ?? "<default>"}`);
-    const supported = [...entry.supportedReasoningEfforts];
-    let effort = typeof requestedReasoningEffort === "string" && requestedReasoningEffort.trim() ? requestedReasoningEffort.trim() : null;
-    let effortSource = effort ? "explicit" : null;
-    if (effort && !supported.includes(effort)) {
-      throw new Error(`reasoningEffort validation failed for model "${entry.model}": requested effort "${effort}"; supported efforts: ${supported.length ? supported.join(", ") : "(none)"}`);
-    }
-    if (!effort && !requested && current === entry.model && typeof currentReasoningEffort === "string" && supported.includes(currentReasoningEffort)) {
-      effort = currentReasoningEffort;
-      effortSource = "current";
-    }
-    if (!effort && entry.defaultReasoningEffort) {
-      if (supported.length && !supported.includes(entry.defaultReasoningEffort)) {
-        throw new Error(`codex.model_list returned default reasoning effort "${entry.defaultReasoningEffort}" outside the supported efforts for model "${entry.model}"`);
-      }
-      effort = entry.defaultReasoningEffort;
-      effortSource = "default";
-    }
+    const selection = resolveReasoningSelection({
+      entry,
+      requested: requestedReasoningEffort,
+      current: currentReasoningEffort,
+      preserveCurrent: current === entry.model,
+    });
+    const { effort, supportedReasoningEfforts: supported } = selection;
     return {
       source: "codex.model_list",
       selectedModel: entry.model,
       selectedModelDisplayName: entry.displayName,
       modelSelectionSource: requested ? "explicit" : current === entry.model ? "current" : "default",
       selectedReasoningEffort: effort,
-      reasoningEffortSelectionSource: effortSource ?? "unavailable",
+      reasoningEffortSelectionSource: selection.source ?? "unavailable",
       supportedReasoningEfforts: supported,
       models,
     };
   }
 
-  function taskPayloadHash(action, payload, agentRef = null) {
-    const hasCallerModel = Object.hasOwn(payload ?? {}, "callerModel");
-    const hasCallerEffort = Object.hasOwn(payload ?? {}, "callerReasoningEffort");
-    const bound = {
-      action,
-      agentRef,
-      prompt: action === "start" ? payload?.prompt ?? null : null,
-      message: action === "send" ? payload?.message ?? null : null,
-      cwd: action === "start" ? payload?.cwd ?? null : null,
-      permissionProfile: action === "start" ? payload?.permissionProfile ?? null : null,
-      model: hasCallerModel ? payload?.callerModel ?? null : payload?.model ?? null,
-    };
-    if (hasCallerEffort) bound.reasoningEffort = payload?.callerReasoningEffort ?? null;
-    else if (!hasCallerModel && Object.hasOwn(payload ?? {}, "reasoningEffort")) bound.reasoningEffort = payload.reasoningEffort ?? null;
-    return createHash("sha256").update(JSON.stringify(bound), "utf8").digest("hex");
-  }
-
-  function taskCardFor({ taskRef, requestId, action, payload, cwd = null, permissionProfile = null, quota = null }) {
-    return {
-      kind: "codex_task",
-      taskRef,
-      taskId: taskRef,
-      requestId,
-      action,
-      title: titleFor(action, payload),
-      summary: summaryFor(action, payload),
-      requestedModel: Object.hasOwn(payload ?? {}, "callerModel")
-        ? (typeof payload?.callerModel === "string" ? payload.callerModel : null)
-        : (typeof payload?.model === "string" ? payload.model : null),
-      ...(Object.hasOwn(payload ?? {}, "callerReasoningEffort")
-        ? (typeof payload?.callerReasoningEffort === "string" ? { requestedReasoningEffort: payload.callerReasoningEffort } : {})
-        : (typeof payload?.reasoningEffort === "string" ? { requestedReasoningEffort: payload.reasoningEffort } : {})),
-      ...(payload?.modelSelection && typeof payload.modelSelection === "object" ? { modelSelection: structuredClone(payload.modelSelection) } : {}),
-      cwd,
-      permissionProfile,
-      quota,
-    };
-  }
-
-  function persistableSnapshot(snapshot) {
-    if (!snapshot || typeof snapshot !== "object") return null;
-    const resultSummary = compactOneLine(snapshot.resultSummary ?? snapshot.finalResult ?? snapshot.latestError ?? "", 800);
-    return {
-      taskRef: snapshot.taskRef ?? snapshot.taskId ?? snapshot.taskCard?.taskRef ?? null,
-      taskId: snapshot.taskRef ?? snapshot.taskId ?? snapshot.taskCard?.taskRef ?? null,
-      agentRef: snapshot.agentRef ?? null,
-      turnId: snapshot.turnId ?? null,
-      status: snapshot.status ?? "lost",
-      canSend: false,
-      pendingApproval: null,
-      taskCard: snapshot.taskCard ? structuredClone(snapshot.taskCard) : null,
-      meteredConsent: snapshot.meteredConsent ? structuredClone(snapshot.meteredConsent) : null,
-      finalResult: resultSummary || null,
-      resultSummary: resultSummary || null,
-      resourceReceipt: snapshot.resourceReceipt ? structuredClone(snapshot.resourceReceipt) : null,
-      timing: snapshot.timing ? structuredClone(snapshot.timing) : { startedAt: null, endedAt: null, durationMs: null },
-      execution: snapshot.execution ? structuredClone(snapshot.execution) : { requestedModel: null, resolvedModel: null, modelProvider: null, serviceTier: null, reasoningEffort: null },
-      latestError: snapshot.latestError ? compactOneLine(snapshot.latestError, 800) : null,
-      terminal: snapshot.terminal === true,
-      terminalAt: Number.isFinite(snapshot.terminalAt) ? snapshot.terminalAt : null,
-      events: [],
-      nextSeq: 0,
-    };
-  }
-
-  function persistRecord(record, snapshot = null, phase = null) {
-    if (!taskPersistence || !record?.taskRef) return true;
-    try {
-      taskPersistence.put({
-        taskRef: record.taskRef,
-        consentRef: record.consent?.consentRef ?? null,
-        requestId: record.consent?.requestId ?? record.taskCard?.requestId ?? null,
-        action: record.action,
-        payloadHash: record.payloadHash ?? null,
-        taskCard: structuredClone(record.taskCard),
-        subjectRef: record.subjectRef ?? null,
-        agentRef: record.agentRef ?? null,
-        turnId: record.turnId ?? null,
-        phase: phase ?? (record.terminalSnapshot ? "terminal" : record.authorized ? "active" : "pending"),
-        terminalSnapshot: snapshot ? persistableSnapshot(snapshot) : record.terminalSnapshot ? persistableSnapshot(record.terminalSnapshot) : null,
-      });
-      record.persistenceWarning = null;
-      return true;
-    } catch (error) {
-      record.persistenceWarning = `Task-card persistence unavailable: ${error instanceof Error ? error.message : String(error)}`;
-      return false;
+  async function prepareTask({ action, requestId, payload, lookupPayload = payload, cwd = null, permissionProfile = null, agentRef = null, resolvedExecution = null }) {
+    const existing = ledger.findRecord({ requestId, action, subjectRef: agentRef, payload: lookupPayload });
+    const prior = existing ? (!existing.payload && !existing.terminalSnapshot ? ledger.recover(existing.taskRef) : await preparedCardState(existing)) : null;
+    if (prior) return { ...prior, duplicate: true };
+    const consent = await ledger.authorize({ action, requestId, subjectRef: agentRef, payload });
+    if (!consent.authorized) {
+      const record = ledger.createTask({ consent: consent.consent, action, payload, cwd, permissionProfile, agentRef, authorized: false });
+      if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
+      return pendingTaskSnapshot({ record, resolvedExecution });
     }
+    return dispatchPrepared(ledger.createTask({ action, payload, cwd, permissionProfile, agentRef, requestId, authorized: true }));
   }
 
-  function recoveredTaskState(taskRef) {
-    if (!taskPersistence || typeof taskRef !== "string" || !taskRef) return null;
-    const persisted = taskPersistence.get(taskRef);
-    if (!persisted) return null;
-    if (persisted.terminalSnapshot) return structuredClone(persisted.terminalSnapshot);
-    const now = Date.now();
-    const lost = {
-      taskRef,
-      taskId: taskRef,
-      agentRef: persisted.agentRef ?? null,
-      turnId: persisted.turnId ?? null,
-      status: "lost",
-      canSend: false,
-      pendingApproval: null,
-      taskCard: persisted.taskCard ? structuredClone(persisted.taskCard) : null,
-      meteredConsent: { status: "unavailable", quota: persisted.taskCard?.quota ?? null },
-      finalResult: null,
-      resourceReceipt: null,
-      timing: { startedAt: null, endedAt: now, durationMs: null },
-      execution: {
-        requestedModel: persisted.taskCard?.requestedModel ?? null,
-        ...(typeof persisted.taskCard?.requestedReasoningEffort === "string" ? { requestedReasoningEffort: persisted.taskCard.requestedReasoningEffort } : {}),
-        resolvedModel: null,
-        modelProvider: null,
-        serviceTier: null,
-        reasoningEffort: null,
-      },
-      latestError: "Task control state was lost across Codexless restart. The original task will not be replayed.",
-      terminal: true,
-      terminalAt: now,
-      resultSummary: "Task control state was lost across Codexless restart. The original task will not be replayed.",
-      events: [],
-      nextSeq: 0,
-    };
-    try {
-      taskPersistence.put({ ...persisted, phase: "terminal", terminalSnapshot: persistableSnapshot(lost) });
-    } catch {}
-    return lost;
+  async function resolveApprovalDecision(agentRef, approvalRequestId, requestId, decision) {
+    const snapshot = await agentExecutor.resolveApproval({ agentRef, approvalRequestId, clientRequestId: requestId, decision });
+    return publicAgentSnapshot(snapshot, ledger.taskForAgent(snapshot?.agentRef)?.taskCard ?? null);
   }
 
-  async function existingRequestState({ requestId, action, payload, agentRef = null }) {
-    if (!taskPersistence) return null;
-    const persisted = taskPersistence.findByRequest({ requestId, action, agentRef });
-    if (!persisted) return null;
-    const payloadHash = taskPayloadHash(action, payload, agentRef);
-    if (persisted.payloadHash && persisted.payloadHash !== payloadHash) {
-      throw new Error(`requestId ${requestId} was already used for a different Codex task payload`);
-    }
-    const live = taskRecords.get(persisted.taskRef);
-    if (live) return preparedCardState(live);
-    return recoveredTaskState(persisted.taskRef);
-  }
-
-  function rememberPrepared({ consent, action, payload, cwd = null, permissionProfile = null, agentRef = null }) {
-    const existing = preparedMetered.get(consent.consentRef);
-    if (existing) return existing;
-    const taskRef = `task_${randomUUID()}`;
-    const record = {
-      taskRef,
-      taskId: taskRef,
-      consent,
-      action,
-      payload,
-      payloadHash: taskPayloadHash(action, payload, agentRef),
-      cwd,
-      permissionProfile,
-      subjectRef: agentRef,
-      agentRef,
-      authorized: false,
-      commitToken: `commit_${randomUUID()}`,
-      turnId: null,
-      terminalSnapshot: null,
-      declinedAt: null,
-      taskCard: taskCardFor({ taskRef, requestId: consent.requestId, action, payload, cwd, permissionProfile, quota: consent.quota }),
-    };
-    preparedMetered.set(consent.consentRef, record);
-    taskRecords.set(taskRef, record);
-    persistRecord(record, null, "pending");
-    return record;
-  }
-
-  function directRecord({ action, payload, cwd = null, permissionProfile = null, agentRef = null, requestId }) {
-    const taskRef = `task_${randomUUID()}`;
-    const consent = { consentRef: null, requestId, quota: null };
-    const record = {
-      taskRef,
-      taskId: taskRef,
-      consent,
-      action,
-      payload,
-      payloadHash: taskPayloadHash(action, payload, agentRef),
-      cwd,
-      permissionProfile,
-      subjectRef: agentRef,
-      agentRef,
-      authorized: true,
-      commitToken: null,
-      turnId: null,
-      terminalSnapshot: null,
-      declinedAt: null,
-      taskCard: taskCardFor({ taskRef, requestId, action, payload, cwd, permissionProfile, quota: null }),
-    };
-    taskRecords.set(taskRef, record);
-    persistRecord(record, null, "pending");
-    return record;
-  }
-
-  function cardForAgent(agentRef) {
-    return agentRef ? agentCards.get(agentRef) ?? null : null;
-  }
-
-  function freezeRecord(record, payload) {
-    if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
-    const frozen = {
-      ...structuredClone(payload),
+  function publicTaskSnapshot(record, snapshot) {
+    return {
+      ...publicAgentSnapshot(snapshot, record.taskCard),
       taskRef: record.taskRef,
       taskId: record.taskRef,
-      taskCard: structuredClone(record.taskCard),
-      canSend: false,
-      terminal: true,
-      terminalAt: Date.now(),
+      meteredConsent: { status: "approved", quota: record.consent?.quota ?? record.taskCard?.quota ?? null },
     };
-    frozen.resultSummary = compactOneLine(frozen.finalResult ?? frozen.latestError ?? terminalLabel(frozen.status), 600);
-    record.terminalSnapshot = frozen;
-    persistRecord(record, frozen, "terminal");
-    return structuredClone(frozen);
-  }
-
-  function lostRecord(record) {
-    return freezeRecord(record, {
-      agentRef: record.agentRef,
-      turnId: record.turnId,
-      status: "lost",
-      pendingApproval: null,
-      finalResult: null,
-      resourceReceipt: null,
-      timing: { startedAt: null, endedAt: Date.now(), durationMs: null },
-      execution: {
-        requestedModel: typeof record.payload?.model === "string" ? record.payload.model : null,
-        ...(typeof record.payload?.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
-        resolvedModel: null,
-        modelProvider: null,
-        serviceTier: null,
-        reasoningEffort: null,
-      },
-      latestError: "Task-specific terminal state was not observed before this agent advanced. The original task will not be replayed.",
-      events: [],
-      nextSeq: 0,
-      meteredConsent: { status: "approved", quota: record.consent.quota },
-    });
-  }
-
-  async function freezeCurrentTaskForAgent(agentRef) {
-    if (!agentRef) return;
-    const snapshot = await agentExecutor.show({ agentRef, afterSeq: 0 });
-    if (!isTerminalStatus(snapshot?.status)) return;
-    for (const record of taskRecords.values()) {
-      if (record.agentRef !== agentRef || record.terminalSnapshot) continue;
-      if (!record.turnId && cardForAgent(agentRef)?.taskRef === record.taskRef) record.turnId = snapshot.turnId ?? null;
-      if (!record.turnId || snapshot.turnId !== record.turnId) continue;
-      freezeRecord(record, {
-        ...publicAgentSnapshot(snapshot, record.taskCard),
-        taskRef: record.taskRef,
-        taskId: record.taskRef,
-        meteredConsent: { status: "approved", quota: record.consent.quota },
-      });
-    }
   }
 
   async function preparedCardState(record) {
     if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
-    if (!record.authorized) {
-      const pending = consentRequiredSnapshot({ agentRef: record.agentRef, consent: record.consent, taskCard: record.taskCard });
-      pending.taskRef = record.taskRef;
-      pending.taskId = record.taskRef;
-      pending.turnId = null;
-      pending.timing = { startedAt: null, endedAt: null, durationMs: null };
-      pending.execution = {
-        requestedModel: typeof record.payload?.model === "string" ? record.payload.model : null,
-        ...(typeof record.payload?.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
-        resolvedModel: null,
-        modelProvider: null,
-        serviceTier: null,
-        reasoningEffort: null,
-      };
-      pending.manualFallback = manualFallback(pending);
-      return pending;
-    }
+    if (!record.payload) return ledger.recover(record.taskRef);
+    if (!record.authorized) return pendingTaskSnapshot({ record });
     if (!record.agentRef) throw new Error("prepared Codex task is authorized but its agentRef is not available yet");
     const snapshot = await agentExecutor.show({ agentRef: record.agentRef, afterSeq: 0 });
-    if (!record.turnId && snapshot.turnId) record.turnId = snapshot.turnId;
-    if (record.turnId && snapshot.turnId !== record.turnId) return lostRecord(record);
-    const payload = {
-      ...publicAgentSnapshot(snapshot, record.taskCard),
-      taskRef: record.taskRef,
-      taskId: record.taskRef,
-      meteredConsent: { status: "approved", quota: record.consent.quota },
-    };
-    if (isTerminalStatus(payload.status)) return freezeRecord(record, payload);
-    return payload;
+    if (record.turnId && snapshot.turnId !== record.turnId) return ledger.freeze(record, ledger.terminalTaskPayload(record, "lost"));
+    record.turnId ||= snapshot.turnId ?? null;
+    const payload = publicTaskSnapshot(record, snapshot);
+    return TERMINAL_STATUSES.has(payload.status) ? ledger.freeze(record, payload) : payload;
   }
 
-  function preparedRecordByPortableTaskId(taskId) {
-    const matches = [...taskRecords.values()].filter((record) => portableShortTaskId(record.taskRef) === taskId);
-    if (matches.length !== 1) throw new Error("unknown, stale, or ambiguous Portable Card task ID");
-    const record = matches[0];
-    if (!record.consent?.consentRef) throw new Error("Portable Card task ID is not bound to a prepared metered task");
-    return record;
-  }
-
-  function declinePrepared(record) {
-    if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
-    if (record.authorized) throw new Error("prepared Codex task already started and cannot be declined as a pre-call task");
-    record.declinedAt = Date.now();
-    return freezeRecord(record, {
-      agentRef: record.agentRef,
-      turnId: null,
-      status: "rejected",
-      pendingApproval: null,
-      finalResult: null,
-      resourceReceipt: null,
-      timing: { startedAt: null, endedAt: record.declinedAt, durationMs: 0 },
-      execution: {
-        requestedModel: record.payload?.model ?? null,
-        ...(typeof record.payload?.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
-        resolvedModel: null,
-        modelProvider: null,
-        serviceTier: null,
-        reasoningEffort: null,
-      },
-      latestError: null,
-      events: [],
-      nextSeq: 0,
-      meteredConsent: { status: "rejected", quota: record.consent.quota },
-    });
-  }
-
-  function approvePrepared(record) {
-    if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
-    if (record.declinedAt) return { ...structuredClone(record.terminalSnapshot ?? lostRecord(record)), duplicate: true };
-    const consentRef = record.consent?.consentRef;
-    if (!consentRef) throw new Error("prepared Codex task is missing its metered consentRef");
-    const approval = meteredConsent.approve({
-      action: record.action,
-      requestId: record.consent.requestId,
-      subjectRef: record.action === "send" ? record.agentRef : null,
-      payload: record.payload,
-      consentRef,
-    });
-    if (!approval.authorized) throw new Error("prepared Codex task approval did not authorize dispatch");
-    record.authorized = true;
-    return dispatchPrepared(record);
-  }
-
-  async function dispatchPrepared(record) {
-    if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
-    if (record.declinedAt) return structuredClone(record.terminalSnapshot ?? lostRecord(record));
-    if (taskPersistence && !persistRecord(record, null, record.authorized ? "active" : "pending")) {
-      throw new Error("Codex task was not started because durable Task Card state could not be recorded safely");
+  async function dispatchPrepared(record, commit = false) {
+    const prior = inFlightDispatches.get(record?.taskRef);
+    if (prior) {
+      const result = await prior;
+      return { ...structuredClone(result), duplicate: true };
     }
-    if (record.action === "start") {
-      const currentAuthority = await authorityExecutor.resolveAuthority({ cwd: record.cwd, access: "inherit" });
-      if (currentAuthority.effectiveCwd !== record.cwd || currentAuthority.permissionProfile !== record.permissionProfile) {
-        throw new Error("prepared Codex task authority changed; prepare and approve a new task card");
+    const operation = (async () => {
+      const startAction = record.action === "start";
+      let current = null;
+      if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
+      if (commit && record.authorized && record.consent?.consentRef) return { ...(await preparedCardState(record)), duplicate: true };
+      if (startAction) {
+        const currentAuthority = await authorityExecutor.resolveAuthority({ cwd: record.taskCard.cwd, access: "inherit" });
+        if (currentAuthority.effectiveCwd !== record.taskCard.cwd || currentAuthority.permissionProfile !== record.taskCard.permissionProfile) throw new Error("prepared Codex task authority changed; prepare and approve a new task card");
+      } else {
+        current = await agentExecutor.show({ agentRef: record.agentRef, afterSeq: 0 });
+        if (record.payload?.parentTurnId && (current.turnId !== record.payload.parentTurnId || current.status !== "idle" || current.canSend !== true)) throw new Error("prepared Codex follow-up is stale because the agent advanced; prepare a new task card for the current turn");
       }
-    } else if (record.payload?.parentTurnId) {
-      const current = await agentExecutor.show({ agentRef: record.agentRef, afterSeq: 0 });
-      if (current.turnId !== record.payload.parentTurnId || current.status !== "idle" || current.canSend !== true) {
-        throw new Error("prepared Codex follow-up is stale because the agent advanced; prepare a new task card for the current turn");
+      if (commit) {
+        const approval = ledger.commitTask(record, {
+          action: record.action,
+          requestId: record.consent.requestId,
+          subjectRef: startAction ? null : record.agentRef,
+          payload: record.payload,
+          consentRef: record.consent.consentRef,
+        });
+        if (approval.duplicate && record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
       }
-    }
-    if (!record.authorized) {
-      throw new Error("Codex task is still pending user approval; dispatch is blocked until the prepared task is explicitly committed");
-    }
-
-    if (record.action === "start") {
+      if (!record.authorized) throw new Error("Codex task is still pending user approval; dispatch is blocked until the prepared task is explicitly committed");
+      ledger.persist(record, "active");
+      if (!startAction && TERMINAL_STATUSES.has(current?.status)) {
+        const prior = ledger.taskForAgent(record.agentRef);
+        if (prior && !prior.terminalSnapshot) {
+          if (!prior.turnId) prior.turnId = current.turnId ?? null;
+          if (prior.turnId === current.turnId) ledger.freeze(prior, publicTaskSnapshot(prior, current));
+        }
+      }
       let snapshot;
       try {
-        snapshot = await agentExecutor.start({
-          cwd: record.cwd,
-          task: record.payload.prompt,
+        const dispatch = {
           clientRequestId: record.consent.requestId,
-          permissionProfile: record.permissionProfile,
           model: record.payload.model ?? null,
           reasoningEffort: record.payload.reasoningEffort ?? null,
-        });
+          ...(startAction
+            ? { cwd: record.taskCard.cwd, task: record.payload.prompt, permissionProfile: record.taskCard.permissionProfile }
+            : { agentRef: record.agentRef, message: record.payload.message }),
+        };
+        snapshot = await agentExecutor[startAction ? "start" : "send"](dispatch);
       } catch (error) {
-        return freezeRecord(record, {
-          agentRef: record.agentRef,
-          turnId: null,
-          status: "failed",
-          pendingApproval: null,
-          finalResult: null,
-          resourceReceipt: null,
-          timing: { startedAt: null, endedAt: Date.now(), durationMs: 0 },
-          execution: {
-            requestedModel: record.payload.model ?? null,
-            ...(typeof record.payload.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
-            resolvedModel: null,
-            modelProvider: null,
-            serviceTier: null,
-            reasoningEffort: null,
-          },
-          latestError: error instanceof Error ? error.message : String(error),
-          events: [], nextSeq: 0,
-          meteredConsent: { status: "approved", quota: record.consent.quota },
-        });
+        return ledger.freeze(record, ledger.terminalTaskPayload(record, "failed", error));
       }
-      if (snapshot?.agentRef) {
-        record.agentRef = snapshot.agentRef;
-        record.turnId = snapshot.turnId ?? null;
-        agentCards.set(snapshot.agentRef, record.taskCard);
-      }
-      const payload = {
-        ...publicAgentSnapshot(snapshot, record.taskCard),
-        taskRef: record.taskRef,
-        taskId: record.taskRef,
-        meteredConsent: { status: "approved", quota: record.consent.quota },
-      };
-      if (isTerminalStatus(payload.status)) return freezeRecord(record, payload);
-      persistRecord(record, payload, "active");
+      if (startAction && snapshot?.agentRef) ledger.bindAgent(record, snapshot.agentRef, snapshot.turnId ?? null);
+      if (!startAction) ledger.bindAgent(record, record.agentRef, snapshot.turnId ?? null);
+      const payload = publicTaskSnapshot(record, snapshot);
+      if (TERMINAL_STATUSES.has(payload.status)) return ledger.freeze(record, payload);
+      ledger.persist(record, "active", payload);
       return payload;
-    }
-
-    await freezeCurrentTaskForAgent(record.agentRef);
-    let snapshot;
-    try {
-      snapshot = await agentExecutor.send({
-        agentRef: record.agentRef,
-        message: record.payload.message,
-        clientRequestId: record.consent.requestId,
-        model: record.payload.model ?? null,
-        reasoningEffort: record.payload.reasoningEffort ?? null,
-      });
-    } catch (error) {
-      return freezeRecord(record, {
-        agentRef: record.agentRef,
-        turnId: null,
-        status: "failed",
-        pendingApproval: null,
-        finalResult: null,
-        resourceReceipt: null,
-        timing: { startedAt: null, endedAt: Date.now(), durationMs: 0 },
-        execution: {
-          requestedModel: record.payload.model ?? null,
-          ...(typeof record.payload.reasoningEffort === "string" ? { requestedReasoningEffort: record.payload.reasoningEffort } : {}),
-          resolvedModel: null,
-          modelProvider: null,
-          serviceTier: null,
-          reasoningEffort: null,
-        },
-        latestError: error instanceof Error ? error.message : String(error),
-        events: [], nextSeq: 0,
-        meteredConsent: { status: "approved", quota: record.consent.quota },
-      });
-    }
-    record.turnId = snapshot.turnId ?? null;
-    if (record.agentRef) agentCards.set(record.agentRef, record.taskCard);
-    const payload = {
-      ...publicAgentSnapshot(snapshot, record.taskCard),
-      taskRef: record.taskRef,
-      taskId: record.taskRef,
-      meteredConsent: { status: "approved", quota: record.consent.quota },
-    };
-    if (isTerminalStatus(payload.status)) return freezeRecord(record, payload);
-    persistRecord(record, payload, "active");
-    return payload;
+    })();
+    inFlightDispatches.set(record.taskRef, operation);
+    return operation.finally(() => {
+      if (inFlightDispatches.get(record.taskRef) === operation) inFlightDispatches.delete(record.taskRef);
+    });
   }
 
   server.registerTool(
@@ -1018,7 +463,7 @@ export function registerAgentPreviewTools(server, {
         limit: z.number().int().min(1).max(200).optional(),
         includeHidden: z.boolean().optional(),
       }).strict(),
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: READ_ONLY,
     },
     async ({ cursor, limit, includeHidden }) => structured(async () => agentExecutor.listModels({
       cursor: cursor ?? null,
@@ -1046,7 +491,7 @@ export function registerAgentPreviewTools(server, {
         consentRef: z.string().min(1).max(512).optional()
           .describe("Legacy compatibility field. It identifies an already prepared task only; supplying or replaying it never authorizes metered Codex work. Approval must occur through the server-side Task Card commit path."),
       }).strict(),
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+      annotations: MUTATING,
       _meta: {
         "openai/toolInvocation/invoking": "Preparing Codex task…",
         "openai/toolInvocation/invoked": "Codex task ready.",
@@ -1061,54 +506,19 @@ export function registerAgentPreviewTools(server, {
         ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
         permissionProfile: authority.permissionProfile,
       };
-      const prior = await existingRequestState({ requestId, action: "start", payload: callerPayload, agentRef: null });
-      if (prior) return { ...prior, duplicate: true };
       if (consentRef) throw new Error("consentRef cannot authorize a Codex start through the public agent_start tool; render/approve the prepared Task Card instead");
       const preparedSelection = meteredConsent.mode === "always"
         ? await resolvePreparedModelSelection({ requestedModel: model ?? null, requestedReasoningEffort: reasoningEffort ?? null })
         : null;
-      const payload = preparedSelection ? {
-        ...callerPayload,
-        callerModel: model ?? null,
-        ...(reasoningEffort !== undefined ? { callerReasoningEffort: reasoningEffort } : {}),
-        model: preparedSelection.selectedModel,
-        ...(typeof preparedSelection.selectedReasoningEffort === "string" ? { reasoningEffort: preparedSelection.selectedReasoningEffort } : {}),
-        modelSelection: preparedSelection,
-      } : callerPayload;
-      const consent = await meteredConsent.authorize({ action: "start", requestId, payload });
-      if (!consent.authorized) {
-        const record = rememberPrepared({
-          consent: consent.consent,
-          action: "start",
-          payload,
-          cwd: authority.effectiveCwd,
-          permissionProfile: authority.permissionProfile,
-        });
-        if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
-        const pending = consentRequiredSnapshot({ consent: consent.consent, taskCard: record.taskCard });
-        pending.taskRef = record.taskRef;
-        pending.taskId = record.taskRef;
-        pending.turnId = null;
-        pending.timing = { startedAt: null, endedAt: null, durationMs: null };
-        pending.execution = {
-          requestedModel: payload.model ?? null,
-          ...(typeof payload.reasoningEffort === "string" ? { requestedReasoningEffort: payload.reasoningEffort } : {}),
-          resolvedModel: null,
-          modelProvider: null,
-          serviceTier: null,
-          reasoningEffort: null,
-        };
-        pending.manualFallback = manualFallback(pending);
-        return pending;
-      }
-      const record = directRecord({
+      const payload = selectedPayload(callerPayload, model, reasoningEffort, preparedSelection);
+      return prepareTask({
         action: "start",
+        requestId,
         payload,
+        lookupPayload: callerPayload,
         cwd: authority.effectiveCwd,
         permissionProfile: authority.permissionProfile,
-        requestId,
       });
-      return dispatchPrepared(record);
     })
   );
 
@@ -1119,7 +529,7 @@ export function registerAgentPreviewTools(server, {
       description:
         "Read-only render step for a prepared metered Codex start/send. Call this only after codex.agent_start or codex.agent_send returns consent_required. It does not start or continue Codex work; it re-reads the server-bound prepared record. Rich-UI Hosts can mount the Codex Task Card from outputTemplate; Hosts that cannot render that UI still receive the same confirmation as a framed Portable Card in ordinary MCP text content. Rich Card buttons use the card capability path; Portable Card Yes/No decisions bind the exact prepared task through codex.agent_commit / codex.agent_decline.",
       inputSchema: z.object({ consentRef: z.string().min(1).max(512) }).strict(),
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: READ_ONLY,
       _meta: {
         ui: { resourceUri: AGENT_TASK_CARD_URI },
         "openai/outputTemplate": AGENT_TASK_CARD_URI,
@@ -1129,12 +539,12 @@ export function registerAgentPreviewTools(server, {
     },
     async ({ consentRef }) => structuredCard(
       async () => {
-        const record = preparedMetered.get(consentRef);
+        const record = ledger.taskByConsent(consentRef);
         if (!record) throw new Error("unknown or stale prepared metered consentRef");
         return preparedCardState(record);
       },
       () => {
-        const record = preparedMetered.get(consentRef);
+        const record = ledger.taskByConsent(consentRef);
         return record?.commitToken ? { codexlessCommitToken: record.commitToken } : {};
       },
       (payload) => payload?.manualFallback?.text ?? null
@@ -1151,26 +561,26 @@ export function registerAgentPreviewTools(server, {
         taskRef: z.string().min(1).max(512).optional(),
         consentRef: z.string().min(1).max(512).optional(),
       }).strict(),
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: READ_ONLY,
       _meta: { ui: { visibility: ["app"] } },
     },
     async ({ taskRef, consentRef }) => structuredCard(
       async () => {
         if (!taskRef && !consentRef) throw new Error("taskRef or consentRef is required");
         if (taskRef) {
-          const live = taskRecords.get(taskRef);
+          const live = ledger.taskByRef(taskRef);
           if (live) return preparedCardState(live);
-          const recovered = recoveredTaskState(taskRef);
+          const recovered = ledger.recover(taskRef);
           if (recovered) return recovered;
         }
         if (consentRef) {
-          const legacy = preparedMetered.get(consentRef);
+          const legacy = ledger.taskByConsent(consentRef);
           if (legacy) return preparedCardState(legacy);
         }
         throw new Error("unknown or stale Codex task card reference");
       },
       () => {
-        const live = taskRef ? taskRecords.get(taskRef) : consentRef ? preparedMetered.get(consentRef) : null;
+        const live = taskRef ? ledger.taskByRef(taskRef) : consentRef ? ledger.taskByConsent(consentRef) : null;
         return live?.commitToken ? { codexlessCommitToken: live.commitToken } : {};
       }
     )
@@ -1183,14 +593,14 @@ export function registerAgentPreviewTools(server, {
       description:
         "Experimental Preview. Read the bounded operational state of one Codexless-owned Codex agent by opaque agentRef. Returns status, sendability, minimal pending-approval summary, final result, and a bounded event tail; it does not duplicate the Codex transcript.",
       inputSchema: z.object({
-        agentRef: z.string().min(1).max(512),
+        agentRef: AGENT_REF,
         afterSeq: z.number().int().min(0).optional(),
       }).strict(),
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: READ_ONLY,
     },
     async ({ agentRef, afterSeq }) => structured(async () => {
       const snapshot = await agentExecutor.show({ agentRef, afterSeq: afterSeq ?? 0 });
-      return publicAgentSnapshot(snapshot, cardForAgent(agentRef));
+      return publicAgentSnapshot(snapshot, ledger.taskForAgent(agentRef)?.taskCard ?? null);
     })
   );
 
@@ -1201,7 +611,7 @@ export function registerAgentPreviewTools(server, {
       description:
         `Experimental Preview. Prepare one exact Codexless-owned Codex agent follow-up by opaque agentRef. The caller must deliberately choose the target agentRef; Codexless has no implicit "most recent agent" routing. Local metered consent mode is ${meteredConsent.mode}; when set to always, every unapproved logical send returns consent_required and quota context without starting a turn. requestId is a caller-stable idempotency key and MUST be reused if the same send is retried after an uncertain response. A returned consentRef identifies the prepared follow-up but is never proof of approval: replaying it through this public tool cannot start Codex work. Approval normally occurs through the Rich Task Card; when the Host cannot render that UI, codex.agent_card_render returns a Portable Card and an explicit user Yes/No may be bound to that exact prepared follow-up through codex.agent_commit / codex.agent_decline. model is optional and may override the model for this turn and subsequent turns. reasoningEffort is an optional per-turn override validated against the current codex.model_list entry for the effective model. Active turns, stale parent turns, and pending approvals fail visibly; Codexless never auto-replays an accepted or uncertain send.`,
       inputSchema: z.object({
-        agentRef: z.string().min(1).max(512),
+        agentRef: AGENT_REF,
         message: z.string().min(1).max(200_000),
         requestId: z.string().min(1).max(512)
           .describe("Stable caller-generated idempotency key. Reuse this exact value for retries of the same logical send."),
@@ -1212,7 +622,7 @@ export function registerAgentPreviewTools(server, {
         consentRef: z.string().min(1).max(512).optional()
           .describe("Legacy compatibility field. It identifies an already prepared follow-up only; supplying or replaying it never authorizes metered Codex work. Approval must occur through the server-side Task Card commit path."),
       }).strict(),
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+      annotations: MUTATING,
       _meta: {
         "openai/toolInvocation/invoking": "Preparing Codex follow-up…",
         "openai/toolInvocation/invoked": "Codex follow-up ready.",
@@ -1224,82 +634,45 @@ export function registerAgentPreviewTools(server, {
         model: model ?? null,
         ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
       };
-      const prior = await existingRequestState({
-        requestId,
-        action: "send",
-        payload: requestPayload,
-        agentRef,
-      });
-      if (prior) return { ...prior, duplicate: true };
       if (consentRef) throw new Error("consentRef cannot authorize a Codex follow-up through the public agent_send tool; render/approve the prepared Task Card instead");
       if (meteredConsent.mode === "off") {
-        const parentCard = cardForAgent(agentRef);
-        return dispatchPrepared(directRecord({
+        const parentCard = ledger.taskForAgent(agentRef)?.taskCard ?? null;
+        return prepareTask({
           action: "send",
+          requestId,
           payload: { ...requestPayload, parentTurnId: null, permissionProfile: parentCard?.permissionProfile ?? null },
+          lookupPayload: requestPayload,
           cwd: parentCard?.cwd ?? null,
           permissionProfile: parentCard?.permissionProfile ?? null,
           agentRef,
-          requestId,
-        }));
+        });
       }
       const current = await agentExecutor.show({ agentRef, afterSeq: 0 });
       if (current.status !== "idle" || current.canSend !== true || !current.turnId) {
         throw new Error(`agent ${agentRef} is not ready for a follow-up: ${current.status}`);
       }
-      const parentCard = cardForAgent(agentRef);
+      const parentCard = ledger.taskForAgent(agentRef)?.taskCard ?? null;
       const preparedSelection = await resolvePreparedModelSelection({
         requestedModel: model ?? null,
         requestedReasoningEffort: reasoningEffort ?? null,
         currentModel: current.execution?.resolvedModel ?? null,
         currentReasoningEffort: current.execution?.reasoningEffort ?? null,
       });
-      const payload = {
+      const payload = selectedPayload({
         message,
-        callerModel: model ?? null,
-        ...(reasoningEffort !== undefined ? { callerReasoningEffort: reasoningEffort } : {}),
-        model: preparedSelection.selectedModel,
-        ...(typeof preparedSelection.selectedReasoningEffort === "string" ? { reasoningEffort: preparedSelection.selectedReasoningEffort } : {}),
-        modelSelection: preparedSelection,
         parentTurnId: current.turnId,
         permissionProfile: parentCard?.permissionProfile ?? null,
-      };
-      const consent = await meteredConsent.authorize({ action: "send", requestId, subjectRef: agentRef, payload });
-      if (!consent.authorized) {
-        const record = rememberPrepared({
-          consent: consent.consent,
-          action: "send",
-          payload,
-          cwd: parentCard?.cwd ?? null,
-          permissionProfile: parentCard?.permissionProfile ?? null,
-          agentRef,
-        });
-        if (record.terminalSnapshot) return structuredClone(record.terminalSnapshot);
-        const pending = consentRequiredSnapshot({ agentRef, consent: consent.consent, taskCard: record.taskCard });
-        pending.taskRef = record.taskRef;
-        pending.taskId = record.taskRef;
-        pending.turnId = null;
-        pending.timing = { startedAt: null, endedAt: null, durationMs: null };
-        pending.execution = {
-          requestedModel: payload.model ?? null,
-          ...(typeof payload.reasoningEffort === "string" ? { requestedReasoningEffort: payload.reasoningEffort } : {}),
-          resolvedModel: current.execution?.resolvedModel ?? null,
-          modelProvider: current.execution?.modelProvider ?? null,
-          serviceTier: current.execution?.serviceTier ?? null,
-          reasoningEffort: current.execution?.reasoningEffort ?? null,
-        };
-        pending.manualFallback = manualFallback(pending);
-        return pending;
-      }
-      const record = directRecord({
+      }, model, reasoningEffort, preparedSelection);
+      return prepareTask({
         action: "send",
+        requestId,
         payload,
+        lookupPayload: requestPayload,
         cwd: parentCard?.cwd ?? null,
         permissionProfile: parentCard?.permissionProfile ?? null,
         agentRef,
-        requestId,
+        resolvedExecution: current.execution,
       });
-      return dispatchPrepared(record);
     })
   );
 
@@ -1313,16 +686,16 @@ export function registerAgentPreviewTools(server, {
         consentRef: z.string().min(1).max(512).optional(),
         taskId: z.string().regex(/^C-[A-F0-9]{10}$/).optional(),
       }).strict(),
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: { ...MUTATING, destructiveHint: false, openWorldHint: false },
     },
     async ({ consentRef, taskId }) => structured(async () => {
       const portableMode = typeof taskId === "string";
       if (portableMode === (typeof consentRef === "string")) {
         throw new Error("provide exactly one of consentRef (Rich Card) or taskId (Portable Card)");
       }
-      const record = portableMode ? preparedRecordByPortableTaskId(taskId) : preparedMetered.get(consentRef);
+      const record = portableMode ? ledger.taskByPortable(taskId) : ledger.taskByConsent(consentRef);
       if (!record) throw new Error("unknown or stale prepared metered Codex task");
-      return declinePrepared(record);
+      return ledger.decline(record);
     })
   );
 
@@ -1339,25 +712,24 @@ export function registerAgentPreviewTools(server, {
         taskId: z.string().regex(/^C-[A-F0-9]{10}$/).optional()
           .describe("Exact short task ID from the Portable Card structured content. Use only after an explicit user Yes for that displayed task."),
       }).strict(),
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+      annotations: MUTATING,
     },
     async ({ consentRef, commitToken, taskId }) => structured(async () => {
       const portableMode = typeof taskId === "string";
       if (portableMode) {
         if (consentRef || commitToken) throw new Error("Portable Card commit accepts only taskId");
-        return approvePrepared(preparedRecordByPortableTaskId(taskId));
+        return dispatchPrepared(ledger.taskByPortable(taskId), true);
       }
       if (!consentRef || !commitToken) {
         throw new Error("Rich Task Card commit requires both consentRef and commitToken");
       }
-      const record = preparedMetered.get(consentRef);
+      const record = ledger.taskByConsent(consentRef);
       if (!record) throw new Error("unknown or stale prepared metered consentRef");
       if (record.terminalSnapshot) return { ...structuredClone(record.terminalSnapshot), duplicate: true };
-      if (record.declinedAt) return { ...structuredClone(record.terminalSnapshot ?? lostRecord(record)), duplicate: true };
       if (!record.commitToken || commitToken !== record.commitToken) {
         throw new Error("Codex Task Card commit capability is missing or does not match this prepared task");
       }
-      return approvePrepared(record);
+      return dispatchPrepared(record, true);
     })
   );
 
@@ -1367,24 +739,10 @@ export function registerAgentPreviewTools(server, {
       title: "Approve Pending Codex Agent Action",
       description:
         "Experimental Preview. Resolve exactly the currently pending Codex approval identified by approvalRequestId using the narrow one-turn approval response defined by Codex. Call only after the user explicitly approves that exact pending request. requestId is a caller-stable idempotency key and must be reused for retries of the same logical approval. Codexless never grants permissions beyond the permission subset requested by Codex.",
-      inputSchema: z.object({
-        agentRef: z.string().min(1).max(512),
-        approvalRequestId: z.string().min(1).max(512)
-          .describe("Exact pendingApproval.requestId from codex.agent_show/start/send."),
-        requestId: z.string().min(1).max(512)
-          .describe("Stable caller-generated idempotency key for this logical approval."),
-      }).strict(),
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+      inputSchema: controlInputSchema("approval"),
+      annotations: MUTATING,
     },
-    async ({ agentRef, approvalRequestId, requestId }) => structured(async () => {
-      const snapshot = await agentExecutor.resolveApproval({
-        agentRef,
-        approvalRequestId,
-        clientRequestId: requestId,
-        decision: "approve",
-      });
-      return publicAgentSnapshot(snapshot, cardForAgent(snapshot?.agentRef));
-    })
+    async ({ agentRef, approvalRequestId, requestId }) => structured(() => resolveApprovalDecision(agentRef, approvalRequestId, requestId, "approve"))
   );
 
   server.registerTool(
@@ -1393,24 +751,10 @@ export function registerAgentPreviewTools(server, {
       title: "Reject Pending Codex Agent Action",
       description:
         "Experimental Preview. Reject exactly the currently pending Codex approval identified by approvalRequestId without widening permissions. Command/file approvals use Codex's decline response; permission requests grant an empty permission subset for the current turn. requestId is a caller-stable idempotency key and must be reused for retries of the same logical rejection.",
-      inputSchema: z.object({
-        agentRef: z.string().min(1).max(512),
-        approvalRequestId: z.string().min(1).max(512)
-          .describe("Exact pendingApproval.requestId from codex.agent_show/start/send."),
-        requestId: z.string().min(1).max(512)
-          .describe("Stable caller-generated idempotency key for this logical rejection."),
-      }).strict(),
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+      inputSchema: controlInputSchema("rejection"),
+      annotations: MUTATING,
     },
-    async ({ agentRef, approvalRequestId, requestId }) => structured(async () => {
-      const snapshot = await agentExecutor.resolveApproval({
-        agentRef,
-        approvalRequestId,
-        clientRequestId: requestId,
-        decision: "reject",
-      });
-      return publicAgentSnapshot(snapshot, cardForAgent(snapshot?.agentRef));
-    })
+    async ({ agentRef, approvalRequestId, requestId }) => structured(() => resolveApprovalDecision(agentRef, approvalRequestId, requestId, "reject"))
   );
 
   server.registerTool(
@@ -1419,58 +763,40 @@ export function registerAgentPreviewTools(server, {
       title: "Cancel Active Codex Agent Turn",
       description:
         "Experimental Preview. Interrupt the currently active formal Codex turn through official turn/interrupt. This does not delete the thread or replay work. requestId is a caller-stable idempotency key and must be reused for retries of the same logical cancel.",
-      inputSchema: z.object({
-        agentRef: z.string().min(1).max(512),
-        expectedTurnId: z.string().min(1).max(512).optional()
-          .describe("Optional task-bound turn id. When supplied, cancel fails closed if the agent has advanced to another turn."),
-        requestId: z.string().min(1).max(512)
-          .describe("Stable caller-generated idempotency key for this logical cancel."),
-      }).strict(),
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+      inputSchema: controlInputSchema("cancel"),
+      annotations: MUTATING,
     },
     async ({ agentRef, expectedTurnId, requestId }) => structured(async () => {
       const snapshot = await agentExecutor.cancel({ agentRef, expectedTurnId: expectedTurnId ?? null, clientRequestId: requestId });
-      return publicAgentSnapshot(snapshot, cardForAgent(snapshot?.agentRef));
+      return publicAgentSnapshot(snapshot, ledger.taskForAgent(snapshot?.agentRef)?.taskCard ?? null);
     })
   );
 }
 
-async function structuredCard(task, extraMeta = null, contentProjector = null) {
+function wireResponse(payload, { text = null, meta = null } = {}) {
+  return {
+    content: [{ type: "text", text: typeof text === "string" && text ? text : JSON.stringify(payload) }],
+    structuredContent: payload,
+    ...(meta ? { _meta: meta } : {}),
+    isError: false,
+  };
+}
+
+async function structured(task, { card = false, extraMeta = null, contentProjector = null } = {}) {
   try {
     const payload = await task();
     const projectedMeta = typeof extraMeta === "function" ? await extraMeta(payload) : extraMeta;
     const projectedText = typeof contentProjector === "function" ? await contentProjector(payload) : contentProjector;
-    return {
-      content: [{ type: "text", text: typeof projectedText === "string" && projectedText ? projectedText : JSON.stringify(payload) }],
-      structuredContent: payload,
-      _meta: { toolwireAgentState: payload, ...(projectedMeta && typeof projectedMeta === "object" ? projectedMeta : {}) },
-      isError: false,
-    };
+    return wireResponse(payload, card ? {
+      text: projectedText,
+      meta: { toolwireAgentState: payload, ...(projectedMeta && typeof projectedMeta === "object" ? projectedMeta : {}) },
+    } : {});
   } catch (error) {
     const payload = { error: error instanceof Error ? error.message : String(error) };
-    return {
-      content: [{ type: "text", text: JSON.stringify(payload) }],
-      structuredContent: payload,
-      _meta: { toolwireAgentState: payload },
-      isError: true,
-    };
+    const response = wireResponse(payload, card ? { meta: { toolwireAgentState: payload } } : {});
+    response.isError = true;
+    return response;
   }
 }
 
-async function structured(task) {
-  try {
-    const payload = await task();
-    return {
-      content: [{ type: "text", text: JSON.stringify(payload) }],
-      structuredContent: payload,
-      isError: false,
-    };
-  } catch (error) {
-    const payload = { error: error instanceof Error ? error.message : String(error) };
-    return {
-      content: [{ type: "text", text: JSON.stringify(payload) }],
-      structuredContent: payload,
-      isError: true,
-    };
-  }
-}
+const structuredCard = (task, extraMeta = null, contentProjector = null) => structured(task, { card: true, extraMeta, contentProjector });
