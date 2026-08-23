@@ -22,6 +22,7 @@ assert.deepEqual(workbenchClientOptions?.initializeCapabilities, {
 });
 
 const bridge = new BrowserElicitationBridge({
+  autoApproveBrowserOrigins: false,
   continuationTtlMs: 5_000,
   requestStateKey: Buffer.alloc(32, 7),
   runtimeId: "browser-public-elicitation-test",
@@ -87,6 +88,79 @@ try {
   bridge.close();
 }
 
+const autoBridge = new BrowserElicitationBridge({
+  continuationTtlMs: 5_000,
+  requestStateKey: Buffer.alloc(32, 8),
+  runtimeId: "browser-public-auto-origin-test",
+});
+let autoResponse = null;
+try {
+  const autoResult = await autoBridge.run({
+    toolName: "codex.browser_open_tab",
+    input: { actionApprovalRef: "browser-action" },
+    mcpReq: {},
+    task: () => new Promise((resolve, reject) => {
+      autoBridge.handleServerRequest({
+        method: "mcpServer/elicitation/request",
+        params: {
+          threadId: "thread-2",
+          turnId: null,
+          serverName: "node_repl",
+          mode: "form",
+          message: "Allow Browser use to access https://example.test?",
+          requestedSchema: { type: "object", properties: {} },
+          _meta: {
+            codex_approval_kind: "mcp_tool_call",
+            connector_id: "browser-use",
+            tool_name: "access_browser_origin",
+            origin: "https://example.test",
+            persist: "always",
+          },
+        },
+        resolve(value) {
+          autoResponse = value;
+          resolve({ status: "opened" });
+        },
+        reject,
+      });
+    }),
+  });
+  assert.deepEqual(autoResponse, { action: "accept" });
+  assert.deepEqual(autoResult, { status: "opened" });
+
+  const unrelated = await autoBridge.run({
+    toolName: "codex.browser_read",
+    input: { tabRef: "browser-tab" },
+    mcpReq: {},
+    task: () => new Promise((resolve, reject) => {
+      autoBridge.handleServerRequest({
+        method: "mcpServer/elicitation/request",
+        params: {
+          threadId: "thread-3",
+          turnId: null,
+          serverName: "node_repl",
+          mode: "form",
+          message: "Confirm an unrelated Browser request?",
+          requestedSchema: { type: "object", properties: {} },
+          _meta: {
+            codex_approval_kind: "mcp_tool_call",
+            connector_id: "browser-use",
+            tool_name: "unrelated_browser_request",
+            origin: "https://example.test",
+            persist: "always",
+          },
+        },
+        resolve,
+        reject,
+      });
+    }),
+  });
+  assert.equal(unrelated.resultType, "input_required");
+  assert.equal(unrelated.inputRequests?.[BROWSER_ELICITATION_INPUT_KEY]?.method, "elicitation/create");
+} finally {
+  autoBridge.close();
+}
+
 const runtimeSource = await readFile(
   path.resolve(import.meta.dirname, "../src/codexless-runtime.mjs"),
   "utf8"
@@ -116,5 +190,6 @@ assert.doesNotMatch(
   /legacy:\s*"stateless"/,
   "2025-era Browser elicitation requires a sessionful HTTP transport"
 );
+assert.doesNotMatch(runtimeSource, /CODEXLESS_BROWSER_ORIGIN_APPROVAL/);
 
 console.log("Public Browser elicitation bridge PASS");

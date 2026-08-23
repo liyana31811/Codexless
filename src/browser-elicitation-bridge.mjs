@@ -121,6 +121,33 @@ function projectElicitationResponse(value) {
   return response;
 }
 
+function isBrowserOriginApprovalRequest(request) {
+  if (!isPlainObject(request) || request.mode !== "form") return false;
+  const meta = isPlainObject(request._meta) ? request._meta : null;
+  const schema = isPlainObject(request.requestedSchema) ? request.requestedSchema : null;
+  if (
+    !meta ||
+    meta.codex_approval_kind !== "mcp_tool_call" ||
+    meta.connector_id !== "browser-use" ||
+    meta.tool_name !== "access_browser_origin" ||
+    meta.persist !== "always" ||
+    typeof meta.origin !== "string" ||
+    !schema ||
+    schema.type !== "object" ||
+    !isPlainObject(schema.properties) ||
+    Object.keys(schema.properties).length !== 0 ||
+    (schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.length !== 0))
+  ) {
+    return false;
+  }
+  try {
+    const url = new URL(meta.origin);
+    return ["http:", "https:"].includes(url.protocol) && url.origin === meta.origin;
+  } catch {
+    return false;
+  }
+}
+
 function assertDecodedRequestState(value) {
   if (
     !isPlainObject(value) ||
@@ -153,6 +180,7 @@ export class BrowserElicitationBridge {
   #codec;
   #runtimeId;
   #retireTaintedOperation;
+  #autoApproveBrowserOrigins;
   #closed = false;
 
   constructor({
@@ -160,6 +188,7 @@ export class BrowserElicitationBridge {
     requestStateKey = randomBytes(32),
     runtimeId = `browser_runtime_${randomUUID()}`,
     retireTaintedOperation = null,
+    autoApproveBrowserOrigins = true,
   } = {}) {
     if (!Number.isInteger(continuationTtlMs) || continuationTtlMs < 1_000) {
       throw new Error("continuationTtlMs must be an integer at least 1000");
@@ -168,9 +197,13 @@ export class BrowserElicitationBridge {
     if (retireTaintedOperation !== null && typeof retireTaintedOperation !== "function") {
       throw new Error("retireTaintedOperation must be null or a function");
     }
+    if (typeof autoApproveBrowserOrigins !== "boolean") {
+      throw new Error("autoApproveBrowserOrigins must be a boolean");
+    }
     this.#continuationTtlMs = continuationTtlMs;
     this.#runtimeId = runtimeId;
     this.#retireTaintedOperation = retireTaintedOperation;
+    this.#autoApproveBrowserOrigins = autoApproveBrowserOrigins;
     this.#codec = createRequestStateCodec({
       key: requestStateKey,
       ttlSeconds: Math.max(1, Math.ceil(continuationTtlMs / 1000)),
@@ -202,11 +235,12 @@ export class BrowserElicitationBridge {
       return;
     }
 
+    const elicitation = isPlainObject(params.request) ? params.request : params;
     let projected;
     try {
       // Current App Server versions flatten the elicitation body into params and
       // use camelCase. Keep the nested request shape for older Codex releases.
-      projected = projectElicitationRequest(isPlainObject(params.request) ? params.request : params);
+      projected = projectElicitationRequest(elicitation);
     } catch (error) {
       request.reject?.({
         code: -32602,
@@ -235,6 +269,12 @@ export class BrowserElicitationBridge {
         code: -32000,
         message: "Browser tool call already has a pending elicitation.",
       });
+      return;
+    }
+
+    const browserOriginRequest = isBrowserOriginApprovalRequest(elicitation);
+    if (this.#autoApproveBrowserOrigins && browserOriginRequest) {
+      request.resolve?.({ action: "accept" });
       return;
     }
 
