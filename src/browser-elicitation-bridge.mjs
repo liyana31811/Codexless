@@ -67,12 +67,14 @@ function projectElicitationRequest(request) {
     return inputRequired.elicit({
       message,
       requestedSchema: structuredClone(request.requestedSchema),
+      ...(isPlainObject(request._meta) ? { _meta: structuredClone(request._meta) } : {}),
     });
   }
   if (request.mode === "url") {
     return inputRequired.elicitUrl({
       message: assertBoundedString(request.message, "elicitation message"),
       url: assertBoundedString(request.url, "elicitation url", 16_384),
+      ...(isPlainObject(request._meta) ? { _meta: structuredClone(request._meta) } : {}),
     });
   }
   if (request.mode === "openai/form") {
@@ -191,17 +193,20 @@ export class BrowserElicitationBridge {
     }
 
     const params = isPlainObject(request.params) ? request.params : null;
-    if (!params || params.server_name !== BROWSER_MCP_SERVER) {
+    const serverName = params?.serverName ?? params?.server_name;
+    if (!params || serverName !== BROWSER_MCP_SERVER) {
       request.reject?.({
         code: -32602,
-        message: `Browser elicitation is supported only for ${BROWSER_MCP_SERVER}; got ${String(params?.server_name ?? "missing")}`,
+        message: `Browser elicitation is supported only for ${BROWSER_MCP_SERVER}; got ${String(serverName ?? "missing")}`,
       });
       return;
     }
 
     let projected;
     try {
-      projected = projectElicitationRequest(params.request);
+      // Current App Server versions flatten the elicitation body into params and
+      // use camelCase. Keep the nested request shape for older Codex releases.
+      projected = projectElicitationRequest(isPlainObject(params.request) ? params.request : params);
     } catch (error) {
       request.reject?.({
         code: -32602,

@@ -1,9 +1,14 @@
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { createCodexlessRuntime } from "./codexless-runtime.mjs";
 
 const require = createRequire(import.meta.url);
-const { createMcpHandler } = require("@modelcontextprotocol/server");
+const {
+  WebStandardStreamableHTTPServerTransport,
+  createMcpHandler,
+  isLegacyRequest,
+} = require("@modelcontextprotocol/server");
 const { localhostHostValidation, localhostOriginValidation, toNodeHandler } = require("@modelcontextprotocol/node");
 
 const host = process.env.CODEX_TOOLBOX_PUBLIC_HOST ?? "127.0.0.1";
@@ -16,12 +21,25 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 }
 
 const runtime = await createCodexlessRuntime({ mode: "public" });
-const mcpHandler = createMcpHandler(runtime.createServer, {
-  legacy: "stateless",
+const modernMcpHandler = createMcpHandler(runtime.createServer, {
+  legacy: "reject",
   maxSubscriptions: 0,
   keepAliveMs: 0,
   onerror: (error) => console.error("[codexless-public-mcp]", error),
 });
+const legacyMcpHandler = createLegacySessionHandler(runtime.createServer, {
+  onerror: (error) => console.error("[codexless-public-mcp-legacy]", error),
+});
+const mcpHandler = {
+  async fetch(request, options) {
+    return await isLegacyRequest(request)
+      ? legacyMcpHandler.fetch(request, options)
+      : modernMcpHandler.fetch(request, options);
+  },
+  async close() {
+    await Promise.all([legacyMcpHandler.close(), modernMcpHandler.close()]);
+  },
+};
 const nodeMcpHandler = toNodeHandler(mcpHandler, {
   onerror: (error) => console.error("[codexless-public-node]", error),
 });
@@ -90,3 +108,86 @@ async function shutdown(signal) {
 
 process.once("SIGINT", () => void shutdown("SIGINT").finally(() => process.exit(0)));
 process.once("SIGTERM", () => void shutdown("SIGTERM").finally(() => process.exit(0)));
+
+function createLegacySessionHandler(createServer, {
+  maxSessions = 32,
+  idleTtlMs = 15 * 60_000,
+  onerror = null,
+} = {}) {
+  const sessions = new Map();
+  let closed = false;
+
+  const reportError = (error) => {
+    try {
+      onerror?.(error instanceof Error ? error : new Error(String(error)));
+    } catch {}
+  };
+  const closeEntry = async (sessionId, entry) => {
+    if (sessions.get(sessionId) !== entry) return;
+    sessions.delete(sessionId);
+    await entry.server.close().catch(reportError);
+  };
+  const cleanup = setInterval(() => {
+    const cutoff = Date.now() - idleTtlMs;
+    for (const [sessionId, entry] of sessions) {
+      if (entry.lastUsedAt < cutoff) void closeEntry(sessionId, entry);
+    }
+  }, Math.min(60_000, idleTtlMs));
+  cleanup.unref?.();
+
+  return {
+    async fetch(request, options) {
+      if (closed) throw new Error("Legacy MCP session handler is closed");
+      const sessionId = request.headers.get("mcp-session-id");
+      if (sessionId) {
+        const entry = sessions.get(sessionId);
+        if (!entry) return sessionNotFoundResponse();
+        entry.lastUsedAt = Date.now();
+        return entry.transport.handleRequest(request, options);
+      }
+      if (request.method.toUpperCase() !== "POST") return sessionNotFoundResponse();
+
+      if (sessions.size >= maxSessions) {
+        const oldest = [...sessions.entries()].sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)[0];
+        if (oldest) await closeEntry(oldest[0], oldest[1]);
+      }
+
+      const server = createServer();
+      const entry = { server, transport: null, lastUsedAt: Date.now() };
+      const transport = new WebStandardStreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        keepAliveMs: 0,
+        onsessioninitialized: (createdSessionId) => {
+          sessions.set(createdSessionId, entry);
+        },
+        onsessionclosed: (closedSessionId) => {
+          if (sessions.get(closedSessionId) === entry) sessions.delete(closedSessionId);
+        },
+      });
+      entry.transport = transport;
+      await server.connect(transport);
+      const response = await transport.handleRequest(request, options);
+      if (!transport.sessionId) await server.close().catch(reportError);
+      return response;
+    },
+    async close() {
+      if (closed) return;
+      closed = true;
+      clearInterval(cleanup);
+      const entries = [...sessions.values()];
+      sessions.clear();
+      await Promise.all(entries.map((entry) => entry.server.close().catch(reportError)));
+    },
+  };
+}
+
+function sessionNotFoundResponse() {
+  return new Response(JSON.stringify({
+    jsonrpc: "2.0",
+    error: { code: -32001, message: "MCP session not found" },
+    id: null,
+  }), {
+    status: 404,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
+}

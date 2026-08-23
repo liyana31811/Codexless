@@ -250,6 +250,24 @@ export async function createCodexlessRuntime({
   let closed = false;
 
   try {
+    if (publicPreview) {
+      browserElicitationBridge = new BrowserElicitationBridge({
+        retireTaintedOperation: async () => {
+          if (closed) return;
+          const browserRuntime = modelFreeRuntime.lane === "managed" ? browserPreview : workbench;
+          if (!browserRuntime || typeof browserRuntime.restart !== "function") {
+            throw new Error("Browser Workbench is not available for tainted-operation recovery");
+          }
+          browserRecoveryPromise = browserRuntime.restart();
+          try {
+            await browserRecoveryPromise;
+          } finally {
+            browserRecoveryPromise = null;
+          }
+        },
+      });
+    }
+
     const executor = new CodexAuthorityExecutor({
       codexBin,
       defaultCwd,
@@ -268,6 +286,9 @@ export async function createCodexlessRuntime({
       defaultCwd,
       configOverrides,
       launchEnv: modelFreeLaunchEnv,
+      serverRequestHandler: publicPreview
+        ? (request) => browserElicitationBridge.handleServerRequest(request)
+        : null,
       runtimeInfo: modelFreeRuntime.lane === "managed"
         ? {
             lane: "managed",
@@ -370,20 +391,20 @@ export async function createCodexlessRuntime({
         "prepareUpload", "upload", "prepareFill", "fill",
       ];
       let deferredBrowser = null;
-      browserElicitationBridge = privateConstruction
-        ? new BrowserElicitationBridge({
-            retireTaintedOperation: async () => {
-              if (closed) return;
-              if (!deferredBrowser?.initialized()) throw new Error("Browser Existing-runtime seam is not active");
-              browserRecoveryPromise = deferredBrowser.restart();
-              try {
-                await browserRecoveryPromise;
-              } finally {
-                browserRecoveryPromise = null;
-              }
-            },
-          })
-        : null;
+      if (privateConstruction) {
+        browserElicitationBridge = new BrowserElicitationBridge({
+          retireTaintedOperation: async () => {
+            if (closed) return;
+            if (!deferredBrowser?.initialized()) throw new Error("Browser Existing-runtime seam is not active");
+            browserRecoveryPromise = deferredBrowser.restart();
+            try {
+              await browserRecoveryPromise;
+            } finally {
+              browserRecoveryPromise = null;
+            }
+          },
+        });
+      }
       deferredBrowser = createDeferredBrowserAdapter({
         methods: browserMethods,
         factory: async () => {
@@ -402,6 +423,9 @@ export async function createCodexlessRuntime({
             codexBin: existing.path,
             defaultCwd,
             configOverrides,
+            serverRequestHandler: publicPreview
+              ? (request) => browserElicitationBridge.handleServerRequest(request)
+              : null,
           });
           await existingWorkbench.start();
           let dedicatedBrowserWorkbench = null;
