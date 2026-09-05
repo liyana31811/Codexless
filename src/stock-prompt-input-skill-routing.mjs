@@ -183,7 +183,16 @@ export function parsePromptInputSkillCatalog(stdout) {
     throw Object.assign(new Error("### Available skills heading is outside the accepted Skills block"), { code: "IMPLICIT_SKILLS_STRUCTURE_MISMATCH" });
   }
   const preludeLines = lines.slice(1, availableIndex);
-  if (!preludeLines.length || preludeLines.some((line) => !line || line.startsWith("#") || line.startsWith("- "))) {
+  const skillRootsIndex = preludeLines.indexOf("### Skill roots");
+  const proseLines = skillRootsIndex >= 0 ? preludeLines.slice(0, skillRootsIndex) : preludeLines;
+  const skillRootLines = skillRootsIndex >= 0 ? preludeLines.slice(skillRootsIndex + 1) : [];
+  const validSkillRootLine = (line) => /^- `r\d+` = `[^`]+`$/.test(line);
+  if (
+    !proseLines.length
+    || proseLines.some((line) => !line || line.startsWith("#") || line.startsWith("- "))
+    || (skillRootsIndex >= 0 && (!skillRootLines.length || skillRootLines.some((line) => !validSkillRootLine(line))))
+    || preludeLines.filter((line) => line === "### Skill roots").length > 1
+  ) {
     throw Object.assign(new Error("Skills prelude structure changed before ### Available skills"), { code: "IMPLICIT_SKILLS_STRUCTURE_MISMATCH" });
   }
   const renderedLines = lines.slice(availableIndex + 1);

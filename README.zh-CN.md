@@ -4,7 +4,7 @@
 
 ### ChatGPT 开始干 Codex 的活了。
 
-**让你的 ChatGPT 从手机、网页或桌面端，直接用上你本机已经有的 Codex 工具箱。**
+**让你的 ChatGPT 通过当前支持的 ChatGPT app / MCP 接入，用上你本机已经有的 Codex 工具箱。**
 
 [English](README.md)
 
@@ -13,140 +13,113 @@
 ![Apple Silicon macOS](https://img.shields.io/badge/macOS-Apple_Silicon-111111?logo=apple&logoColor=white)
 [![Apache-2.0 License](https://img.shields.io/badge/license-Apache--2.0-22c55e.svg)](LICENSE)
 
-**留在 ChatGPT。活落在本机。真需要 Codex 时，再摇人。**
+**留在 ChatGPT。活落在本机。真需要 Codex 时，再调用 Codex。**
 
 </div>
 
-Codexless 做的事很简单：**让你的 ChatGPT 套上 Codex 的工服，拎起你本地电脑里的 Codex 工具箱🧰，自己下场干。**
+Codexless 让你正在使用的 ChatGPT 调用一组经过验收的本地工具，底层直接复用这台电脑已有的 Codex 环境。默认入口就是普通 Chat：看项目、改文件、跑命令、操作 Chrome / Edge、控制已经连接的 Excel 工作簿，都可以在当前对话继续完成。
 
-装环境、做维护、看项目、改文件、跑命令、操作浏览器——**你先跟 ChatGPT 说要干什么，它平时自己干；真需要 Codex，再摇 Codex 本人🤖。**
+真正需要 Codex 模型时，再明确调用 Codex。普通已支持的本地工具动作不会调用 Codex 模型，因此不会产生 Codex 模型用量；真正调用 Codex 时，正常使用规则照常适用。
 
-**少掉那些没必要的 Codex 调用，额度也就少花一点；真要调用时，再把额度花在刀刃上。** 这就是 Codexless 里的 **less**。
-
-> **觉得这路子有意思？把这个仓库直接甩给你的 ChatGPT，让它自己看看：这台机器能不能装，装完能干什么。**
+> 可以直接把这个仓库交给你正在用的 ChatGPT，让它检查当前机器、解释安装条件，并告诉你安装后能用哪些能力。
 
 ---
 
-## 它到底能干什么？
+## Codex 和 Codexless，到底差在哪？
 
-### 1. Codex 的本地工具箱，直接递给 ChatGPT
+### Codex 的核心本地能力，Codexless 已经覆盖多少？
 
-让当前这个 Chat 直接拿 Codex 的本地工具干活。
+| 能力 | Codex | Codexless 0.1.2 Preview |
+| --- | :---: | :---: |
+| 本地文件 / Git / 有界 Terminal 命令 | ✅ | ✅ |
+| Chrome / Edge Browser | ✅ | ✅ |
+| Live Excel / Document Control | ✅ | ✅ |
+| Skills / 项目规则 | ✅ | ✅ 直接复用 |
+| Windows Computer Use / CUA | ✅ | — 暂未公开 |
 
-看项目、装环境、做维护、改文件、跑命令、看结果，都可以留在这里继续。
+**✅ 表示该能力族的主要用户路径已经可用，不表示 Codex 的所有内部 primitive 都以 1:1 形式公开。** 长尾能力只有在完成公开面验收后才会加入。
 
-**人话：以前总要切到 Codex 才能落地的那一步，现在原地就能继续做。**
+### 工作方式也不一样
 
-这些已经支持的工具动作，**不会实际调用 Codex，也不会扣 Codex 额度。**
+| 工作方式 | Codex | Codexless |
+| --- | --- | --- |
+| 主要入口 | Codex App / CLI / Remote | **当前支持界面中的 ChatGPT 普通 Chat** |
+| 日常工作面 | Codex | **当前普通 Chat** |
+| 本地工具执行 | Codex 工作流内 | **从普通 Chat 直接调用** |
+| Skills / 项目环境 | 原生使用 | **直接复用现有 Codex 环境** |
+| 需要 Codex 模型时 | 正常执行路径 | **明确需要时再调用** |
 
----
+**Codex：进入 Codex 工作。**
 
-### 2. 双重保险，应对 Codex 更新
+**Codexless：留在普通 Chat，也能使用大部分本地工具。**
 
-Codexless 除了使用本机 Codex 的工具箱，也可以在 Recommended 安装中准备一套**官方固定版本的 Codex runtime**，作为第二条独立工具路径。它不会替换你已经在用的本机 Codex。
-
-完成一次额外的官方 ChatGPT 登录后，文件和命令相关工作可以使用这套固定版本。本机 Codex 更新后如果暂时出现兼容问题，这些工具仍有一条独立的可用路径；如果暂时不登录，本机 Codex 路径照常可用。
-
-**本机 Codex 仍然是当前完整体验的必要前提：Browser 和 Call Codex 目前都继续使用本机 Codex。** 两套路径彼此独立；某一路发生错误时会明确报错，不会自动切到另一条。固定版本使用隔离登录，Codexless 不复制本机 Codex 的登录凭据。
-
----
-
-### 3. Codex 已经学会的，直接拿来用
-
-项目规则、Skills、目录习惯，能复用的就直接复用。
-
-**不用重教一遍，也不用另起炉灶。**
-
-> **工具箱直接拎走，说明书也一起带上。**
-
-还有一层长期好处：**Codex 的工具箱继续进化，我们不用从头重造一套。** 适合公开的新能力重新验收过，就能继续沿这条路拿来用。
-
-当然，不是“Codex 一更新，ChatGPT 就自动得到全部新能力”。没验过的能力，不算公开承诺。
+Codexless 的重点不是重做一套 Codex，而是让这些本地能力也能从普通 Chat 使用。
 
 ---
 
-### 4. 先跟 ChatGPT 说，需要 Codex 时它再摇人
+## 它能做什么？
 
-**ChatGPT 可以直接当你的默认入口。** 你先把事交给它；当前工具够用，它就继续做。真需要 Codex 专门出手时，再从当前 Chat 升级过去。你想直接开 Codex 当然也可以，Codexless 不限制原来的工作习惯。
+### 本地项目工作
 
-真要调用 Codex 时，它先**向你打个申请**：
+ChatGPT 可以看项目、读写文件、运行受控命令、使用 Git 和本地 CLI，再自己检查结果。项目规则和 Codex Skills 能复用的就直接复用，不需要维护第二套说明。
 
-1. 准备让 Codex 干什么；
-2. 先帮你查好当前还剩多少额度；
-3. 要不要调用，Yes / No 你说了算；
-4. 干完告诉你用了多少、还剩多少额度。
+### Chrome + Edge Browser
 
-> **平时自己干。真需要时，再摇 Codex。**
+当前公开 Browser 同时支持 **Chrome 和 Edge**：
 
-如果当前 Chat 显示不了这张卡，也会退回普通文本确认；一样要你明确回答 Yes / No，不会自动放行。
+- 查看标签页、页面内容和 viewport 截图；
+- 打开、关闭、跳转页面；
+- 语义点击和文本填写；
+- 有界滚动，以及 `Enter` / `Tab` / `Escape`；
+- prepared 上传和下载。
 
-<p align="center">
-  <img src="docs/images/codex-task-card-flow.gif" width="100%" alt="Codex Task Card：调用、执行、完成三种状态">
-</p>
+Browser 使用你选择的本地浏览器 profile 和其中已有的网站登录状态。上传本地文件还需要在 ChatGPT 浏览器扩展中打开 **“允许访问文件网址”**。
 
----
+公开面不提供任意 JavaScript、raw selector、任意坐标、任意键盘、generic CDP，也不会自动用 Computer Use 兜底。
 
-### 5. Chat 窗口也能钻进 Chrome 干活了
+### Live Excel / Document Control
 
-**不仅有看浏览器的眼睛👀，也有操控浏览器的手🖐**
+0.1.2 加入一组面向**已经连接的工作簿**的公开 Excel Preview：
 
-不再只是“看完告诉你怎么点”，而是可以自己继续操作下去。
+- `excel_status`
+- `excel_read_sheets_metadata`
+- `excel_read_ranges`
+- `excel_search_workbook`
+- `excel_write_range`
+- `excel_format_range`
 
-当前公开 Browser 支持：
+更完整的动态 Excel 工具入口目前仍只在内部使用。公开版不提供 generic Office scripting、raw MCP executor，也不会把整套动态 Excel 工具直接暴露出来。
 
-- 查看、截图👀；
-- 打开、关闭、跳转页面🌐；
-- 点击、填写文本、提交✍；
-- 使用 `Enter` / `Tab` / `Escape`，滚动页面↕️；
-- 上传⏫、下载⏬。
+写入和格式修改里，“dispatch 成功”不会自动冒充业务完成。Codexless 会区分调用回执和 workbook verification；结果不确定时不会盲目重放写动作。
 
-#### 使用浏览器操控，需要具备以下条件
+### 真需要 Codex 时，再调用 Codex
 
-本机需要安装 **Chrome**，并在实际使用的 Chrome profile 中安装并连接 **ChatGPT 浏览器扩展**。
+真正准备调用 Codex 前，普通 Chat 会显示一段紧凑的**固定文字审批**，明确列出任务、模型 / reasoning、当前 quota 信息和 exact Task ID，然后由你回答 **Yes / No**。
 
-如果需要上传本地文件，还需在扩展设置中打开 **“允许访问文件网址”**。
+确认后任务在后台执行；进入 terminal 状态后，再返回固定文字 Result，包含结果、mutation / verification 证据、剩余 blocker、quota 信息和同一个 Task ID。
 
----
-
-## 这东西适合我吗？
-
-**大概率适合：**
-
-1. 你本来就在用 ChatGPT + Codex 做项目，烦来回搬上下文、重复维护两套工具；
-2. Codex 额度经常吃紧，想让它少在平时登场，把额度留到真要调用它的时候；
-3. 你长期用着同一个 AI 助手 / 伴侣，不想为了干活换一个陌生 Agent，想让这个熟悉的 AI 也有本地手脚，能做更多事。
-
-**可能没那么需要：** 你几乎所有任务都直接用 Codex，已经自己搭好成熟的 Agent 基础设施，或者需要的是一套无限制的浏览器 / 桌面自动化平台。
+底层任务绑定仍是 single-use / no-replay：过期或已经消费过的审批不能拿来重新启动同一任务。
 
 ---
 
-## 准备安装前，先看这几条
+## 安装前先确认
 
 - **平台：** Windows + **Apple Silicon macOS（arm64）** Technical Preview。Intel Mac 暂不支持。
-- **前提：** 本机已有 **Node.js 22+** 和可工作的 **Codex**。Codex Desktop 不是必须项，CLI 能正常使用也可以。
-- **Recommended 双路径：** 本机已有可工作的 Codex 仍是前提。Recommended 安装还会为 Codexless 准备一套官方固定版本的 runtime，作为独立工具路径；它不会替你安装或替换本机 Codex。
-- **浏览器操控：** 本机需要安装 Chrome 和 ChatGPT 浏览器扩展；Browser 使用当前 Chrome profile 的网站登录状态。
-- **上传文件：** 还需要在扩展设置中额外打开 **“允许访问文件网址”**。
-- **个人套餐实测：** Plus 和 Pro 已在真实机器通过产品形态链路测试。这是实测证据，不是未来政策保证。
-- **本地怎么连：** ChatGPT 不会直接访问 `localhost`。典型链路是 **本机 Codexless → 已认证 Tunnel / remote MCP endpoint → ChatGPT App / Developer Mode**。
-- **Tunnel 不锁死：** OpenAI Secure MCP Tunnel 是已经支持的一条路，但不是唯一依赖。
+- **前提：** 本机已有 **Node.js 22+** 和一套可工作的 **Codex**。Codex Desktop 不是必须项，有可用 CLI/runtime 即可。
+- **Recommended 双路径：** 可以额外准备一套固定版本的官方 Codex runtime，用于已经支持的文件 / 命令工作；它不会替换本机 Codex，登录状态也相互隔离。
+- **Browser：** 本机需要 Chrome 或 Edge，以及已连接的 ChatGPT 浏览器扩展。
+- **Excel：** 工作簿需要先通过受支持的 Document Control / Excel Add-in 路径连接。公开 Excel 正常路径不依赖 CUA。
+- **ChatGPT 侧可用性（以本版本发布时为准）：** OpenAI 当前文档将具备写入 / 修改能力的完整自定义 MCP 支持列在 ChatGPT 网页版的 Business、Enterprise 和 Edu；Pro 的 developer mode 自定义 MCP 目前仅支持 read/fetch，MCP apps 当前也不支持移动端。Codexless 目前不是 Plugin Directory 中的公开条目。安装前请再确认 OpenAI 当时的套餐与界面支持，因为这一层会独立于 Codexless 变化。
+- **本地怎么连：** ChatGPT 不直接访问 `localhost`。典型链路是 **本机 Codexless → 已认证 Tunnel / remote MCP endpoint → ChatGPT custom app / developer-mode MCP 接入**。
 - **身份：** Codexless 是独立项目，不是 OpenAI 产品，也不代表 OpenAI 背书。
 
 ---
 
 ## 安装
 
-**先确认电脑里有 Node.js 22+ 和可工作的本机 Codex。安装脚本会检查这些前提；它不会替你安装 Node/npm，也不会替你安装或替换这套本机 Codex。Recommended 安装还会为 Codexless 准备一套官方固定版本的 runtime。**
-
-如果你不想自己判断环境，先把这个仓库交给自己的 AI，让它帮你检查平台、Node、Codex 和安装路径。
-
-涉及本机执行、权限或 trust 的最终确认，仍然由你决定。
-
-**安装 Codexless 时，拉取或下载需要的 release/tag，然后运行对应平台的安装命令即可。以后切换到更新版本时，获取新的 release/tag，再运行同一个安装命令。安装目录之外的用户状态会保留。**
+从你准备安装的 release/tag 获取源码。installer 会检查 Node.js 和已有本机 Codex；它不会替你安装 Node/npm，也不会替换本机 Codex。
 
 ### Windows
-
-安装：
 
 ```powershell
 .\bin\codexless-install.cmd
@@ -178,10 +151,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Codex
 
 ### Apple Silicon macOS
 
-当前只支持 Apple Silicon（`arm64`）。
-
-安装：
-
 ```sh
 sh ./bin/codexless-install.sh
 ```
@@ -210,156 +179,60 @@ sh ./bin/codexless-install.sh
 "$HOME/Library/Application Support/Codexless/app/bin/codexless-uninstall.sh"
 ```
 
-### installer 会做什么？
-
-两端 installer 都会先检查 Node.js 和本机 Codex，再在临时区域安装依赖；Recommended 安装还会准备官方固定版本的 Codex runtime。doctor 通过后，才会切换正式安装。
-
-它不会替你安装 Chrome、浏览器扩展或配置 Tunnel，也不会自动扩大 Codex trust。Browser 上传所需的文件访问权限也需要用户自行打开。
-
-以后切换到更新版本时，获取新的 release/tag，再运行同一个安装命令即可。Codexless 不会自动检查或安装更新。
+升级或重装时，获取新的 release/tag 后再次运行同一个 installer 即可。安装目录之外的用户状态会保留。Codexless 不会偷偷扩大 Codex trust，也不会替用户配置 Tunnel 或浏览器文件访问权限。
 
 ---
 
 ## FAQ
 
-### 1. 我用 Codexless 干活，会消耗 Codex 额度吗？
+### 用 Codexless 会消耗 Codex 额度吗？
 
-- **Codexless 可以帮 ChatGPT 干很多原本要找 Codex 干的活；只要没有真的调用 Codex，就不会消耗 Codex 额度。** 真正启动 Codex Agent 时才会消耗。
-- **Work 和 Codex 本来共用一套额度。** 所以在 Work 窗口里用 Codexless，并不能绕过 Work 自己需要消耗的额度；如果你的目标是尽量节省 Codex 额度，**推荐在普通 Chat 里使用 Codexless。**
+普通已支持的 model-free 本地工具动作不会调用 Codex 模型，因此不会产生 Codex 模型用量。实际调用 Codex 时，正常 Codex 使用规则照常适用。
 
----
+Codexless **不会增加、刷新、转移、合并或绕过** Codex 使用额度或套餐限制。
 
-### 2. 如果 Codex 额度到 0% 了，Codexless 还能干活吗？
+### Codex 额度到 0% 以后还能用吗？
 
-**能。除了不能实际调用 Codex，其他已经支持的功能照常能用。**
+Model-free 能力可以继续使用。真正需要 Codex 模型的动作，需要等相应 Codex 使用量恢复后再执行。
 
-读、查、改、验，以及不需要实际调用 Codex 的 Browser 功能还能继续。
+### 本地权限有多大？
 
-等额度恢复后，再继续调用 Codex。
+权限上限跟随本机 Codex 当前有效授权。Codexless 可以对单次动作继续降权；远端调用方不能静默选择更强的本地权限。真正的 permission / trust 拒绝会明确失败。完整边界见 [`SECURITY.md`](SECURITY.md)。
 
----
+### Codex 会什么，ChatGPT 就全部会了吗？
 
-### 3. 省额度，是不是等于绕额度、绕套餐限制或者钻平台规则？
+不会。**0.1.2 的公开合同是 44 个工具**，只包含已经选择并验收进公开面的能力；household / internal 能力不会自动公开。
 
-**不是。省额度，是少调用；不是把谁的额度变多、刷新、转移、合并或者绕过去。**
+### 我原来的 ChatGPT → Codex 工作流需要改吗？
 
-当前已经验收的 model-free 工具够用时，Codexless 就直接用这些工具，不为了同一件小事额外调用 Codex 模型；真正调用 Codex 时，Codex 额度仍然照常计算。
+不用。你可以继续在 ChatGPT 里讨论和规划；普通 Chat 当前工具够用就直接完成，真正需要 Codex 时再明确调用。
 
-Codexless 基于 Codex App Server 和 ChatGPT app / MCP integration surface，不靠逆向私有 UI 或 secret protocol 去规避产品边界。
+### ChatGPT 为什么能碰到本机？
 
-它也不会绕过本机 trust / permission、审批、sandbox / network 边界或平台确认。上游支持面或规则发生变化时，Codexless 应该跟着受支持的路径调整，或者明确失败，而不是偷偷绕过去。
+ChatGPT 拿到的是经过认证 MCP 路径公开出来的 Codexless tools，例如：
 
----
+> **本机 Codexless → 已认证 Tunnel / remote MCP endpoint → ChatGPT custom app / developer-mode MCP 接入**
 
-### 4. 权限有多大？会不会乱删乱动我本地的东西？
-
-**权限上限默认跟着你本机 Codex 的授权走，不会比 Codex 本身能操作的范围更大。**
-
-Codexless 还可以按动作继续收窄权限。
-
-如果你想更保守，可以在本机 Codex / 项目 trust 侧把权限范围收紧；Codexless 不会绕过这些设置。
-
-真正的 permission / trust 拒绝应该明确失败，不会为了“把任务跑成功”偷偷切到更高权限路径。
-
-完整边界看 [`SECURITY.md`](SECURITY.md)。
-
----
-
-### 5. Codex 会什么，ChatGPT 就全部会了吗？
-
-**不会。**
-
-Codexless 只公开已经验收过的能力，不是把整个 Codex 环境无条件暴露出去。
-
-当前公开服务合同是 **39 个工具**，其中模型直接看到 **36 个**；另外 3 个 Task Card 动作只供 App 界面使用。
-
-真正需要调用 Codex 模型时，会走单独的 Agent / 审批流程；普通本地工具动作不是另一条隐藏的 Codex 调用通道。
-
-更底层的 consent / commit / replay 细节放在后面的“给想看底层的人”。
-
----
-
-### 6. Browser 能帮我操作网页吗？
-
-**能。**
-
-可以看标签页、截图、打开、关闭和跳转页面、点击、填写文本、滚动、使用 `Enter` / `Tab` / `Escape`、上传和下载。
-
-它不是无限制接管 Chrome。任意脚本、任意 selector、任意坐标、完整键盘控制等 raw 能力不开放。
-
-Browser 使用的是本机当前 Chrome profile 的登录状态；上传本地文件还需要额外打开扩展的 **“允许访问文件网址”**。
-
----
-
-### 7. 我原来的 ChatGPT 规划 → Codex 执行工作流要改吗？
-
-**不用。**
-
-你照样可以先在 ChatGPT 里想、拆、聊。
-
-当前工具够用就直接做完；真需要 Codex，再明确升级过去。
-
-Codexless 减少的是没必要的搬运，不是逼你换工作习惯。
-
----
-
-### 8. ChatGPT 不是不能直接进本地吗？Codexless 怎么做到的？
-
-对，ChatGPT 不能直接访问你电脑上的 `localhost`。
-
-Codexless 的做法是给本机服务接一条**经过认证的 MCP 通道**：
-
-> **本机 Codexless → 已认证 Tunnel / remote MCP endpoint → ChatGPT App / Developer Mode**
-
-ChatGPT 调的是 Codexless 对外开放的这组工具，不是直接拿到你整台电脑。
-
-Tunnel / endpoint 的凭据不要进仓库，也不要贴进公开截图。
+不要把 Tunnel / endpoint 凭据写进仓库或公开截图。
 
 ---
 
 ## 给想看底层的人
 
-### 1. 公开合同
+- 精确 public service contract 固定在 `src/surface-contracts.mjs`，并由 public contract tests 验收。
+- 0.1.2 公开面是 **44 个工具**。普通 Chat 的 Call Codex 使用固定文字 Approval / Result；neutral `agent_commit(taskId)` / `agent_decline(taskId)` 继续属于 authoritative task path。
+- Public Excel 只包含上面的六颗 typed tools；schema-reader 和 dynamic Excel gateway 本批继续 household-only。
+- Browser 公开的是经过验收的用户动作语义，不是 raw Browser 内部能力。
+- Codex 继续是本地 permission / trust 权威；Codexless 可以降权，但不能静默扩大权限。
+- Codexless 使用 Codex App Server 和 ChatGPT app/MCP integration surfaces，不依赖逆向私有 UI。
 
-当前公开服务合同为 **39 个工具**；模型直接看到 **36 个**，另 3 个 Task Card 动作只供 App 界面使用。
+运行公开合同测试：
 
-Metered Agent 的 consent 是服务器侧状态：任务身份不是审批本身；真正 dispatch Codex 还必须经过对应的审批 / commit 路径。拒绝后不能靠重放旧请求把任务重新启动。
-
-精确合同由 `src/surface-contracts.mjs` 固定，并由 public contract test 验收。
-
-运行：
-
-```powershell
+```sh
 npm test
 ```
 
-### 2. 权限模型
-
-Codex 仍是本地 permission / trust 权威。
-
-- Codexless 可以继续收窄权限；
-- 远端不能静默选择更强的本地权限；
-- 真正的 permission / trust 拒绝要明确失败。
-
-### 3. Browser 边界
-
-公开 Browser 面向用户动作，不直接暴露 raw Browser 内部能力。
-
-当前公开动作包括：读取标签页 / 页面、截图、打开 / 关闭 / 导航、语义点击、文本填写、滚动、固定 `Enter` / `Tab` / `Escape`、文件选择上传、浏览器下载。
-
-不公开任意 JavaScript、raw selector、任意坐标、任意键盘、generic CDP，也不自动使用 Computer Use 兜底。
-
-### 4. 集成方式
-
-Codexless 基于 Codex App Server 和 ChatGPT app/MCP integration surface，不逆向私有 UI。
-
-### 5. 当前 Technical Preview 证据
-
-Windows 和 Apple Silicon macOS 都已经用真实机器跑过安装 / doctor / stdio 验收。
-
-Browser 也已经在 Windows 和 Apple Silicon Mac 做过真实机器 dogfood；release/source 候选仍按独立 checklist 验收，不拿 source contract 代替实机证据。
-
-### 6. 从源码运行
+从源码运行：
 
 ```sh
 npm ci
@@ -372,27 +245,16 @@ HTTP：
 npm run start:http
 ```
 
-自动发现找不到当前已验收的 Codex executable 时，可以显式设置 `CODEX_BIN`。
-
-Windows 下不要把 `CODEX_BIN` 指到 npm 的 `.cmd` / `.ps1` shim。
+自动发现找不到已接受的 Codex executable 时，可以显式设置 `CODEX_BIN`。Windows 下不要把它指到 npm `.cmd` / `.ps1` shim。
 
 ---
 
 ## 给 AI 助理
 
-如果用户把这个仓库发给你，问“这是啥？需要吗？安全吗？”，先看实际仓库和当前机器，再给建议。
+如果用户把这个仓库发给你，问“这是啥、要不要装、安全吗”，先检查实际仓库和当前机器，再给建议。
 
-先确认这些事实：
-
-1. Codexless 让 ChatGPT 使用一组**经过验收**的 Codex-backed 本地能力；Codex 仍是专家升级通道。
-2. 它**不增加、不绕过 Codex quota**；普通工具工作和真正调用 Codex 是两条不同路线。
-3. 权限上限来自本机 Codex 当前有效授权；远端不能静默扩大。
-4. Browser 已经不只是 Reader：能看、截、开、关、跳、点、填、滚、按固定键、上传、下载，但不暴露 raw Browser 内部能力。
-5. Browser 需要本机 Chrome 和 ChatGPT 浏览器扩展；上传文件还需要额外的文件网址访问权限。
-6. Codexless 是独立项目，不是 OpenAI 产品或背书。
+先确认这些事实：Codexless 公开的是经过验收的本地能力子集；它不增加或绕过 Codex 使用额度；权限上限来自本机 Codex 当前有效授权；Browser 是 bounded user-action surface；Excel 公开面是六颗 typed Preview；Codexless 是独立项目，不是 OpenAI 产品。
 
 ---
 
-> **平时自己干，硬骨头再摇 Codex。**
->
-> **这就是 Codexless：不是不用 Codex，是不用什么都先叫 Codex。**
+> **留在 ChatGPT。活落在本机。真需要 Codex 时，再调用 Codex。**

@@ -15,7 +15,7 @@ const V1_FRONTMATTER_KEYS = new Set([
 export const DEFAULT_CODEX_CALL_PROFILE_INSTRUCTION = `# Codex Call Profile
 
 ## Apply this Profile at each decision point
-Treat this Profile as the user's recurring Codex working instructions, not as a one-time setup result. Re-read and apply it whenever deciding whether to call Codex, how to route model/reasoning, how to handle a pending Codex action, or how to continue a running Codex task. These are defaults, not immutable product rules: more specific user-authored instructions in this Profile take precedence. If a rule is materially ambiguous for the current situation, do not silently broaden it; ask the user when needed.
+Treat this Profile as the user's recurring Codex working instructions, not as a one-time setup result. Re-read and apply it whenever deciding whether to call Codex, how to route model/reasoning, how to handle a pending Codex action, or how to continue a running Codex task. These are defaults, not immutable product rules. For soft working habits such as in-turn/action approval, an explicit current-task instruction from the user takes priority over this long-term Profile; otherwise apply the valid Profile, and use the recommended default only when the Profile is missing. No one-off instruction can bypass the hard Call Codex gate: only an explicit valid requireCallApproval=false can do that. If a rule is materially ambiguous for the current situation, do not silently broaden it; ask the user when needed.
 
 ## When to call Codex
 For every new task, decide again whether Codex should be called. By default, use Codex only when the current task genuinely needs Codex execution or the user explicitly asks for Codex. Do not call Codex merely because it is available. The user may replace this with a stricter, broader, or otherwise more specific calling rule.
@@ -267,8 +267,23 @@ export function loadCodexCallProfile({
       legacy: false,
     };
   }
-  const text = readFileSync(resolvedPath, "utf8");
-  return { ...parseCodexCallProfileText(text), filePath: resolvedPath };
+  try {
+    const text = readFileSync(resolvedPath, "utf8");
+    return { ...parseCodexCallProfileText(text), filePath: resolvedPath };
+  } catch (error) {
+    return {
+      status: "invalid",
+      valid: false,
+      error: `Profile could not be read: ${error instanceof Error ? error.message : String(error)}`,
+      filePath: resolvedPath,
+      hash: null,
+      profileRevision: null,
+      schemaVersion: CODEX_CALL_PROFILE_SCHEMA_VERSION,
+      effective: safeEffective(),
+      instruction: "",
+      legacy: false,
+    };
+  }
 }
 
 function serializeProfile({

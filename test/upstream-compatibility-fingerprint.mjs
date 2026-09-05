@@ -239,6 +239,7 @@ test("node_repl server removal changes relevant hash and is structured RED", () 
 
   assert.notEqual(report.fingerprint.relevantCapabilityHash, baseline.fingerprint.relevantCapabilityHash);
   assert.equal(report.semanticEvidence.browserNodeRepl.status, "RED");
+  assert.equal(report.overallStatus, "RED");
   assert.equal(report.semanticEvidence.browserNodeRepl.serverObserved, false);
   assert.ok(report.semanticEvidence.browserNodeRepl.missingRequiredMembers.includes("node_repl"));
   assert.equal(report.fingerprint.relevantCapabilityProjection.browser.nodeRepl.serverObserved, false);
@@ -253,6 +254,7 @@ test("node_repl js removal changes relevant hash and is structured RED", () => {
 
   assert.notEqual(report.fingerprint.relevantCapabilityHash, baseline.fingerprint.relevantCapabilityHash);
   assert.equal(report.semanticEvidence.browserNodeRepl.status, "RED");
+  assert.equal(report.overallStatus, "RED");
   assert.equal(report.semanticEvidence.browserNodeRepl.jsToolObserved, false);
   assert.ok(report.semanticEvidence.browserNodeRepl.missingRequiredMembers.includes("node_repl.tools.js"));
 });
@@ -356,6 +358,7 @@ test("Browser build/pair mismatch is structured RED and fail-closed", () => {
   assert.equal(report.bundlePairing.decision, "fail-closed");
   assert.equal(report.bundlePairing.reason, "current_browser_plugin_manifest_mismatch");
   assert.equal(report.semanticEvidence.browserBundlePairing.status, "RED");
+  assert.equal(report.overallStatus, "RED");
   assert.equal(report.fingerprint.relevantCapabilityProjection.browser.bundlePairing.state, "mismatched-or-partial");
 });
 
@@ -375,6 +378,7 @@ test("Browser partial pair not found is structured RED and fail-closed", () => {
   assert.equal(report.bundlePairing.decision, "fail-closed");
   assert.equal(report.bundlePairing.reason, "current_browser_plugin_pair_not_found");
   assert.equal(report.semanticEvidence.browserBundlePairing.status, "RED");
+  assert.equal(report.overallStatus, "RED");
   assert.equal(report.fingerprint.relevantCapabilityProjection.browser.bundlePairing.state, "mismatched-or-partial");
 });
 
@@ -384,7 +388,7 @@ test("finalize-absent Browser marks are turn cleanup only and never GREEN releas
   );
   assert.equal(lifecycle.tabsFinalize, false);
   assert.equal(lifecycle.adapterShape, "finalize-absent-turn-cleanup");
-  assert.equal(lifecycle.adapterExistingTabRelease, "unavailable");
+  assert.equal(lifecycle.adapterExistingTabRelease, "turn-boundary-auto-release");
   assert.equal(lifecycle.classification, "turn-cleanup-no-public-release");
   assert.equal(lifecycle.existingTabRelease, "unproven");
   assert.equal(lifecycle.handback, "unproven");
@@ -398,6 +402,34 @@ test("finalize-absent Browser marks are turn cleanup only and never GREEN releas
     report.semanticEvidence.browserExistingTabRelease.classification,
     "turn-cleanup-no-public-release"
   );
+  assert.equal(report.semanticEvidence.browserExistingTabRelease.existingTabRelease, "unproven");
+  assert.equal(report.semanticEvidence.browserExistingTabRelease.handback, "unproven");
+  assert.match(report.semanticEvidence.browserExistingTabRelease.note, /independent-controller force release\/takeover/);
+  assert.ok(report.warnings.some((entry) => entry.code === "browser-existing-tab-release-unproven"));
+  assert.equal(report.overallStatus, "GREEN");
+});
+
+test("unknown or unsupported Browser release lifecycle remains overall RED", () => {
+  const evidence = baseEvidence();
+  evidence.browserLifecycle = {
+    status: "RED",
+    adapterShape: "unsupported",
+    adapterExistingTabRelease: "unavailable",
+    classification: "existing-tab-release-unproven",
+    tabsFinalize: false,
+    markDeliverable: false,
+    markHandoff: false,
+    existingTabRelease: "unproven",
+    handback: "unproven",
+  };
+
+  const report = buildCompatibilityFingerprintReport(evidence);
+
+  assert.equal(report.semanticEvidence.browserExistingTabRelease.status, "RED");
+  assert.equal(report.semanticEvidence.browserExistingTabRelease.classification, "existing-tab-release-unproven");
+  assert.equal(report.semanticEvidence.browserExistingTabRelease.existingTabRelease, "unproven");
+  assert.equal(report.semanticEvidence.browserExistingTabRelease.handback, "unproven");
+  assert.equal(report.overallStatus, "RED");
 });
 
 test("incomplete collection environment suppresses comparable capability fingerprint", () => {
@@ -452,7 +484,6 @@ test("collector and reporter stay model-free, avoid Browser calls, and write onl
   const requests = [];
   const reads = [];
   let closed = false;
-  const chromeSkillPath = "C:\\bundle\\chrome\\26.1\\skills\\control-chrome\\SKILL.md";
   const fakeClient = {
     notificationMethods: [],
     async start() {
@@ -465,7 +496,19 @@ test("collector and reporter stay model-free, avoid Browser calls, and write onl
           data: [{
             cwd: "C:\\work\\repo",
             errors: [],
-            skills: [{ name: "chrome:control-chrome", path: chromeSkillPath, enabled: true }],
+            skills: [],
+          }],
+        };
+      }
+      if (method === "plugin/list") {
+        return {
+          marketplaces: [{
+            plugins: [{
+              id: "chrome@openai-bundled",
+              name: "chrome",
+              localVersion: "26.1",
+              source: { path: "C:\\bundle\\chrome" },
+            }],
           }],
         };
       }
@@ -540,13 +583,14 @@ test("collector and reporter stay model-free, avoid Browser calls, and write onl
       assert.deepEqual(configOverrides, []);
       return fakeClient;
     },
-    resolveBrowserCompatibility: async ({ chromeSkillPath: observedPath }) => {
-      assert.equal(observedPath, chromeSkillPath);
+    resolveBrowserCompatibility: async ({ chromeSkillPath: observedPath, chromePluginBuild }) => {
+      assert.equal(observedPath, null);
+      assert.equal(chromePluginBuild, "26.1");
       return {
         status: "ok",
-        source: "codex-skills-list",
+        source: "codex-plugin-list",
         build: "26.1",
-        chromeSkillPath,
+        chromeSkillPath: null,
         browserServicePath: "C:\\bundle\\browser\\26.1\\scripts\\browser-service.mjs",
         browserClientPath: "C:\\bundle\\chrome\\26.1\\scripts\\browser-client.mjs",
         browserClientSha256: HEX64,
@@ -563,6 +607,7 @@ test("collector and reporter stay model-free, avoid Browser calls, and write onl
 
   assert.deepEqual(requests, [
     "skills/list",
+    "plugin/list",
     "mcpServerStatus/list",
     "model/list",
     "config/read",
@@ -576,8 +621,13 @@ test("collector and reporter stay model-free, avoid Browser calls, and write onl
     "mcpServerStatus/list",
     "model/list",
     "permissionProfile/list",
+    "plugin/list",
     "skills/list",
   ]);
+  assert.equal(report.bundlePairing.status, "GREEN");
+  assert.equal(report.bundlePairing.source, "codex-plugin-list");
+  assert.equal(report.capabilityProjection.browser.chromeSkill.observed, false);
+  assert.equal(report.unavailableReasons.some((entry) => entry.code === "current_chrome_skill_unavailable"), false);
   assert.equal(report.semanticEvidence.modelFreeCollection.status, "GREEN");
   assert.equal(report.semanticEvidence.modelFreeCollection.modelTurnStarted, false);
   assert.equal(report.semanticEvidence.modelFreeCollection.threadStarted, false);

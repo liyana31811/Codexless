@@ -50,6 +50,19 @@ try {
   assert.match(resolved.overrides.join("\n"), /NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S/);
   assert.ok(resolved.overrides.some((value) => value.includes(path.resolve(codexBin).replaceAll("\\", "\\\\"))), "Codex paths with spaces/non-ASCII must stay quoted in the generated TOML override");
 
+  const skilllessPlugin = await resolveBrowserRuntimeCompatibility({
+    codexBin,
+    chromeSkillPath: null,
+    chromePluginBuild: build,
+    env,
+  });
+  assert.equal(skilllessPlugin.status, "ok");
+  assert.equal(skilllessPlugin.source, "codex-plugin-list");
+  assert.equal(skilllessPlugin.chromeSkillPath, null);
+  assert.equal(path.resolve(skilllessPlugin.chromePluginRoot), path.resolve(chromeVersionRoot));
+  assert.equal(path.resolve(skilllessPlugin.browserClientPath), path.resolve(clientPath));
+  assert.equal(path.resolve(skilllessPlugin.browserServicePath), path.resolve(servicePath));
+
   writeFileSync(browserManifestPath, JSON.stringify({ name: "browser", version: `${build}-drift` }));
   const manifestMismatch = await resolveBrowserRuntimeCompatibility({
     codexBin: path.join(root, "codex.exe"),

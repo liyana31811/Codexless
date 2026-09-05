@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Exact-text menuitem fixture</title>
+
+<!--
+  Mirrors the relevant Google Drive/GMO CAR shape without site-specific selectors:
+  visible text lives under a role=menuitem ancestor but is excluded from the
+  accessible name. Exact role+name therefore cannot be relied on, while the
+  exact visible-text fallback can still bind the unique semantic menuitem.
+-->
+<div id="fixture-menu" role="menu" aria-label="Actions">
+  <div id="target-menuitem" role="menuitem" tabindex="0">
+    <span aria-hidden="true">ショートカットを追加</span>
+  </div>
+
+  <div id="disabled-menuitem" role="menuitem" aria-disabled="true" tabindex="-1">
+    <span aria-hidden="true">無効な操作</span>
+  </div>
+</div>

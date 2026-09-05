@@ -59,7 +59,7 @@ async function withManagedClient(run, { entrypoint = "mcp-stdio-household.mjs" }
   }
 }
 
-test("public command_exec blocks direct Formal Codex before executor dispatch", async () => {
+test("public command_exec blocks any nested Codex CLI before executor dispatch", async () => {
   let execCalls = 0;
   const createServer = createCodexToolboxServerFactory({
     executor: {
@@ -87,6 +87,8 @@ test("public command_exec blocks direct Formal Codex before executor dispatch", 
     for (const command of [
       ["C:\\fake-managed\\codex.exe", "exec", "MUST_NOT_RUN"],
       ["codex.exe", "review", "MUST_NOT_RUN"],
+      ["codex.exe", "--version"],
+      ["cmd.exe", "/d", "/c", "codex --version"],
     ]) {
       const blocked = await client.callTool({
         name: "codex.command_exec",
@@ -216,6 +218,10 @@ test("managed household surface is model-free and hard-blocks Formal Agent befor
     const listed = await client.listTools();
     const names = listed.tools.map((tool) => tool.name);
     assert.deepEqual(names, [...HOUSEHOLD_TOOL_ALLOWLIST]);
+    assert.equal(names.includes("codex.browser_webmcp_discover"), false, "external Chrome/Edge WebMCP must stay hidden until the upstream extension runtime exposes webmcp");
+    assert.equal(names.includes("codex.browser_webmcp_call"), false, "external Chrome/Edge WebMCP must stay hidden until the upstream extension runtime exposes webmcp");
+    assert.equal(PUBLIC_TOOL_ALLOWLIST.includes("codex.browser_webmcp_discover"), false, "Q75 exposure rollback must not widen the public preview");
+    assert.equal(PUBLIC_TOOL_ALLOWLIST.includes("codex.browser_webmcp_call"), false, "Q75 exposure rollback must not widen the public preview");
     for (const forbidden of ["thread/start", "thread/resume", "turn/start", "turn/interrupt", "model/execute", "codex.raw_rpc"]) {
       assert.equal(names.includes(forbidden), false, `raw model/control RPC leaked into managed surface: ${forbidden}`);
     }
@@ -353,6 +359,21 @@ test("managed public surface keeps model-free toolbox usable while Call Codex is
     });
     assert.equal(blockedWrappedFormal.isError, true);
     assert.equal(blockedWrappedFormal.structuredContent?.errorCode, "FORMAL_CODEX_AGENT_REQUIRED");
+
+    const ordinaryTextMentionsCodex = process.platform === "win32"
+      ? ["powershell.exe", "-NoProfile", "-Command", "Write-Output 'direct Codex is ordinary text here'"]
+      : ["/bin/sh", "-lc", "printf '%s' 'direct Codex is ordinary text here'"];
+    const allowedOrdinaryText = await client.callTool({
+      name: "codex.command_exec",
+      arguments: {
+        command: ordinaryTextMentionsCodex,
+        cwd: root,
+        access: "readOnly",
+        timeoutMs: 5_000,
+      },
+    });
+    assert.equal(allowedOrdinaryText.isError, false);
+    assert.match(allowedOrdinaryText.structuredContent?.stdout ?? "", /direct Codex is ordinary text here/);
 
     const blocked = await client.callTool({
       name: "codex.agent_start",

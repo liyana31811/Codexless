@@ -178,16 +178,28 @@ function compatibilityRuntimeMode(env) {
   return "workbench";
 }
 
+export function browserServerRequestRoutingPolicy(mode) {
+  if (!["household", "public", "workbench"].includes(mode)) {
+    throw new Error("Codexless runtime mode must be household, public, or workbench");
+  }
+  return Object.freeze({
+    enabled: mode === "household" || mode === "public",
+    scope: mode === "household" || mode === "public" ? "browser-only" : "disabled",
+  });
+}
+
 export async function createCodexlessRuntime({
   env = process.env,
   mode = compatibilityRuntimeMode(env),
   stateRoot,
+  workbenchFactory = (options) => new CodexWorkbenchExecutor(options),
 } = {}) {
   if (!["household", "public", "workbench"].includes(mode)) {
     throw new Error("Codexless runtime mode must be household, public, or workbench");
   }
   const privateConstruction = mode === "household";
   const publicPreview = mode === "public";
+  const browserServerRequests = browserServerRequestRoutingPolicy(mode);
 
   const runtimeProvider = await createCodexRuntimeProvider({ env, stateRoot });
   const modelFreeRuntime = runtimeProvider.modelFree;
@@ -263,7 +275,7 @@ export async function createCodexlessRuntime({
     });
     const authorityValidation = await executor.validate();
 
-    workbench = new CodexWorkbenchExecutor({
+    workbench = workbenchFactory({
       codexBin,
       defaultCwd,
       configOverrides,
@@ -285,7 +297,7 @@ export async function createCodexlessRuntime({
       if (!existingCatalogWorkbenchPromise) {
         existingCatalogWorkbenchPromise = (async () => {
           const existing = await runtimeProvider.resolveExisting();
-          const candidate = new CodexWorkbenchExecutor({
+          const candidate = workbenchFactory({
             codexBin: existing.path,
             defaultCwd,
             configOverrides,
@@ -313,25 +325,34 @@ export async function createCodexlessRuntime({
     let browserRuntimeCompatibility = null;
     if (modelFreeRuntime.lane === "existing") {
       let browserWorkbenchForExecutor = workbench;
-      if (privateConstruction) {
-        const [nodeReplConfig, currentChromeSkill, configuredMcpServerNames] = await Promise.all([
-          workbench.configuredMcpServer({ name: "node_repl", cwd: defaultCwd }).catch(() => null),
-          workbench.currentChromeSkill({ cwd: defaultCwd }).catch(() => null),
-          configuredMcpServerNamesForBrowser(workbench, { cwd: defaultCwd }),
-        ]);
-        browserRuntimeCompatibility = await resolveBrowserRuntimeCompatibility({
-          codexBin,
-          chromeSkillPath: currentChromeSkill?.path ?? null,
-          env,
-        });
-        const browserAvailable = browserRuntimeCompatibility.status === "ok" && nodeReplConfig !== null;
-        const browserConfigOverrides = buildBrowserConfigOverrides({
-          configOverrides,
-          compatibilityOverrides: browserRuntimeCompatibility.overrides,
-          configuredMcpServerNames,
-          nodeReplConfig,
-          browserAvailable,
-        });
+      if (browserServerRequests.enabled) {
+        let browserWorkbenchCwd = defaultCwd;
+        let browserWorkbenchOverrides = configOverrides;
+        if (privateConstruction || publicPreview) {
+          const [nodeReplConfig, currentChromeSkill, currentChromePlugin, configuredMcpServerNames] = await Promise.all([
+            workbench.configuredMcpServer({ name: "node_repl", cwd: defaultCwd }).catch(() => null),
+            workbench.currentChromeSkill({ cwd: defaultCwd }).catch(() => null),
+            typeof workbench.currentChromePlugin === "function"
+              ? workbench.currentChromePlugin({ cwd: defaultCwd }).catch(() => null)
+              : Promise.resolve(null),
+            configuredMcpServerNamesForBrowser(workbench, { cwd: defaultCwd }),
+          ]);
+          browserRuntimeCompatibility = await resolveBrowserRuntimeCompatibility({
+            codexBin,
+            chromeSkillPath: currentChromeSkill?.path ?? null,
+            chromePluginBuild: currentChromePlugin?.localVersion ?? null,
+            env,
+          });
+          const browserAvailable = browserRuntimeCompatibility.status === "ok" && nodeReplConfig !== null;
+          browserWorkbenchOverrides = buildBrowserConfigOverrides({
+            configOverrides,
+            compatibilityOverrides: browserRuntimeCompatibility.overrides,
+            configuredMcpServerNames,
+            nodeReplConfig,
+            browserAvailable,
+          });
+          browserWorkbenchCwd = browserRuntimeCompatibility.browserRuntimeCwd;
+        }
         browserElicitationBridge = new BrowserElicitationBridge({
           retireTaintedOperation: async () => {
             if (closed) return;
@@ -344,10 +365,10 @@ export async function createCodexlessRuntime({
             }
           },
         });
-        browserWorkbench = new CodexWorkbenchExecutor({
+        browserWorkbench = workbenchFactory({
           codexBin,
-          defaultCwd: browserRuntimeCompatibility.browserRuntimeCwd,
-          configOverrides: browserConfigOverrides,
+          defaultCwd: browserWorkbenchCwd,
+          configOverrides: browserWorkbenchOverrides,
           serverRequestHandler: (request) => browserElicitationBridge.handleServerRequest(request),
         });
         browserWorkbenchForExecutor = browserWorkbench;
@@ -357,20 +378,21 @@ export async function createCodexlessRuntime({
         workbench: browserWorkbenchForExecutor,
         defaultCwd,
         authorityExecutor: executor,
-        runtimeCompatibility: privateConstruction ? browserRuntimeCompatibility : null,
-        runtimeCompatibilityResolver: privateConstruction && browserRuntimeCompatibility?.status === "ok"
-          ? ({ chromeSkillPath }) => resolveBrowserRuntimeCompatibility({ codexBin, chromeSkillPath, env })
+        runtimeCompatibility: (privateConstruction || publicPreview) ? browserRuntimeCompatibility : null,
+        runtimeCompatibilityResolver: (privateConstruction || publicPreview) && browserRuntimeCompatibility?.status === "ok"
+          ? ({ chromeSkillPath, chromePluginBuild }) => resolveBrowserRuntimeCompatibility({ codexBin, chromeSkillPath, chromePluginBuild, env })
           : null,
       });
     } else {
       const browserMethods = [
-        "status", "confirmationPolicy", "listTabs", "readTab", "screenshotTab",
-        "prepareCloseTab", "closeTab", "prepareOpenTab", "openTab", "scrollTab", "keypressTab",
+        "status", "confirmationPolicy", "emergencyResetControlState", "listTabs", "readTab", "screenshotTab",
+        "discoverElements", "prepareElementAction", "elementAction",
+        "prepareCloseTab", "closeTab", "prepareBulkCloseTabs", "bulkCloseTabs", "prepareOpenTab", "openTab", "scrollTab", "keypressTab",
         "prepareNavigate", "navigate", "prepareClick", "click", "prepareDownload", "download",
         "prepareUpload", "upload", "prepareFill", "fill",
       ];
       let deferredBrowser = null;
-      browserElicitationBridge = privateConstruction
+      browserElicitationBridge = browserServerRequests.enabled
         ? new BrowserElicitationBridge({
             retireTaintedOperation: async () => {
               if (closed) return;
@@ -398,7 +420,7 @@ export async function createCodexlessRuntime({
             outputBytesCap: 32_768,
           });
           await existingAuthority.validate();
-          const existingWorkbench = new CodexWorkbenchExecutor({
+          const existingWorkbench = workbenchFactory({
             codexBin: existing.path,
             defaultCwd,
             configOverrides,
@@ -407,29 +429,38 @@ export async function createCodexlessRuntime({
           let dedicatedBrowserWorkbench = null;
           let browserWorkbenchForExecutor = existingWorkbench;
           let compatibility = null;
-          if (privateConstruction) {
-            const [nodeReplConfig, currentChromeSkill, configuredMcpServerNames] = await Promise.all([
-              existingWorkbench.configuredMcpServer({ name: "node_repl", cwd: defaultCwd }).catch(() => null),
-              existingWorkbench.currentChromeSkill({ cwd: defaultCwd }).catch(() => null),
-              configuredMcpServerNamesForBrowser(existingWorkbench, { cwd: defaultCwd }),
-            ]);
-            compatibility = await resolveBrowserRuntimeCompatibility({
+          if (browserServerRequests.enabled) {
+            let browserWorkbenchCwd = defaultCwd;
+            let browserWorkbenchOverrides = configOverrides;
+            if (privateConstruction || publicPreview) {
+              const [nodeReplConfig, currentChromeSkill, currentChromePlugin, configuredMcpServerNames] = await Promise.all([
+                existingWorkbench.configuredMcpServer({ name: "node_repl", cwd: defaultCwd }).catch(() => null),
+                existingWorkbench.currentChromeSkill({ cwd: defaultCwd }).catch(() => null),
+                typeof existingWorkbench.currentChromePlugin === "function"
+                  ? existingWorkbench.currentChromePlugin({ cwd: defaultCwd }).catch(() => null)
+                  : Promise.resolve(null),
+                configuredMcpServerNamesForBrowser(existingWorkbench, { cwd: defaultCwd }),
+              ]);
+              compatibility = await resolveBrowserRuntimeCompatibility({
+                codexBin: existing.path,
+                chromeSkillPath: currentChromeSkill?.path ?? null,
+                chromePluginBuild: currentChromePlugin?.localVersion ?? null,
+                env,
+              });
+              const browserAvailable = compatibility.status === "ok" && nodeReplConfig !== null;
+              browserWorkbenchOverrides = buildBrowserConfigOverrides({
+                configOverrides,
+                compatibilityOverrides: compatibility.overrides,
+                configuredMcpServerNames,
+                nodeReplConfig,
+                browserAvailable,
+              });
+              browserWorkbenchCwd = compatibility.browserRuntimeCwd;
+            }
+            dedicatedBrowserWorkbench = workbenchFactory({
               codexBin: existing.path,
-              chromeSkillPath: currentChromeSkill?.path ?? null,
-              env,
-            });
-            const browserAvailable = compatibility.status === "ok" && nodeReplConfig !== null;
-            const browserConfigOverrides = buildBrowserConfigOverrides({
-              configOverrides,
-              compatibilityOverrides: compatibility.overrides,
-              configuredMcpServerNames,
-              nodeReplConfig,
-              browserAvailable,
-            });
-            dedicatedBrowserWorkbench = new CodexWorkbenchExecutor({
-              codexBin: existing.path,
-              defaultCwd: compatibility.browserRuntimeCwd,
-              configOverrides: browserConfigOverrides,
+              defaultCwd: browserWorkbenchCwd,
+              configOverrides: browserWorkbenchOverrides,
               serverRequestHandler: (request) => browserElicitationBridge.handleServerRequest(request),
             });
             browserWorkbenchForExecutor = dedicatedBrowserWorkbench;
@@ -438,9 +469,9 @@ export async function createCodexlessRuntime({
             workbench: browserWorkbenchForExecutor,
             defaultCwd,
             authorityExecutor: existingAuthority,
-            runtimeCompatibility: privateConstruction ? compatibility : null,
-            runtimeCompatibilityResolver: privateConstruction && compatibility?.status === "ok"
-              ? ({ chromeSkillPath }) => resolveBrowserRuntimeCompatibility({ codexBin: existing.path, chromeSkillPath, env })
+            runtimeCompatibility: (privateConstruction || publicPreview) ? compatibility : null,
+            runtimeCompatibilityResolver: (privateConstruction || publicPreview) && compatibility?.status === "ok"
+              ? ({ chromeSkillPath, chromePluginBuild }) => resolveBrowserRuntimeCompatibility({ codexBin: existing.path, chromeSkillPath, chromePluginBuild, env })
               : null,
           });
           return {
@@ -552,6 +583,10 @@ export async function createCodexlessRuntime({
       meteredQuotaProvider: resourceSnapshotProvider,
       taskStateFile: agentTaskStateFile,
     });
+    // HTTP MCP serving creates a fresh McpServer per request. Excel opaque
+    // session refs must therefore live at runtime lifetime too, otherwise a
+    // ref minted by excel_status is unknown on the very next tool call.
+    const excelSessionRefs = new Map();
 
     let computerUse = null;
     let cuaValidation = null;
@@ -594,6 +629,7 @@ export async function createCodexlessRuntime({
       meteredQuotaProvider: resourceSnapshotProvider,
       agentPreviewState,
       agentPortableCard: privateConstruction || publicPreview,
+      legacyAgentCardInternals: false,
       agentReasoningEffort: privateConstruction || publicPreview,
       codexCallProfile: privateConstruction || publicPreview,
       codexCallProfileFile: (privateConstruction || publicPreview) && typeof env.CODEXLESS_CALL_PROFILE_FILE === "string" && env.CODEXLESS_CALL_PROFILE_FILE.trim()
@@ -613,15 +649,16 @@ export async function createCodexlessRuntime({
       publicPreview,
       guardDirectFormalCodex: privateConstruction || publicPreview,
       recentCallStore,
+      excelSessionRefs,
       warnWhenUsingDefaultCwd: true,
       serverInstructions: publicPreview
-        ? "Public Technical Preview surface. It exposes only the accepted first-release allowlist: Codex-authority-bounded command/read/edit construction; Codex project context/Skills/catalog reads; the accepted Browser surface at household parity; Codex Call Profile; and the formal metered Codex Agent lane with visible task/consent/usage state. Broad raw host filesystem methods, raw host process/PTY control, Computer Use, generic configured-MCP calls, and other Workbench/private control-plane capabilities outside the accepted Browser slice are intentionally absent. Remote callers cannot widen Codex permission profiles, sandbox, approval policy, trusted roots, or network authority. Browser remains constrained to the accepted explicit public Browser allowlist. Metered Agent work remains distinct from model-free tool work; preserve Task Card/manualFallback confirmation semantics where configured and return factual usage/quota observations without attributing account-level quota movement to one task."
+        ? "Public Technical Preview surface. It exposes only the accepted first-release allowlist: Codex-authority-bounded command/read/edit construction; Codex project context/Skills/catalog reads; the accepted Browser surface at household parity; Codex Call Profile; and the formal metered Codex Agent lane with visible task/consent/usage state. Broad raw host filesystem methods, raw host process/PTY control, Computer Use, generic configured-MCP calls, and other Workbench/private control-plane capabilities outside the accepted Browser slice are intentionally absent. Remote callers cannot widen Codex permission profiles, sandbox, approval policy, trusted roots, or network authority. Browser remains constrained to the accepted explicit public Browser allowlist. Metered Agent work remains distinct from model-free tool work; Call Approval and terminal Result use the fixed compact Chat text presentation, Running stays authoritative but is not mechanically presented, and usage/quota observations must remain factual without attributing account-level quota movement to one task."
         : privateConstruction
-          ? "Codexless household surface for daily self-dogfood. It exposes only an explicit server-side allowlist: accepted command_exec compatibility contract; project/account/read-only discovery; persistent process + receipts; Codex Skill/catalog reads; authority-bounded read_many and guarded precise_edit; existing-login Chrome Reader plus read-only viewport screenshot, fixed Enter/Tab/Escape keypress at current focus, authority-bounded upload, browser-managed download, exact prepared single-tab close, and narrow prepared navigation/new-tab/click/fill plus bounded scroll; the dynamic codex.browser_confirmation_policy reader; and the formal Codex Agent lane with visible consent/usage card. Broad raw fs_mutate, generic mcp_call, and all general CUA/computer tools are intentionally absent. Remote callers cannot widen Codex permission profiles, sandbox, approval policy, trusted roots, or network authority. Web routing is phase-aware, not tool-loyal: when the caller also has a lightweight read-only/open-web search or reader surface, use that for public-web discovery/filtering that does not need the user's authenticated/session-specific state, then switch into signed-in Browser only when the task needs a current tab/session, private/non-indexed content, live UI state, or an interaction/side effect. Browse openly, act locally. Browser navigation itself is destination-first, not gesture-faithful: when the bounded user goal is simply to reach/read another page and an exact http(s) destination is reliably available from Browser-derived evidence, prefer direct navigate/open-tab over clicking an intermediate UI element; do not guess route patterns, and always read back URL plus page identity after arrival. Keep click when the click itself matters, the URL is not reliably known, or direct routing would bypass required page state/workflow. In pure-Browser acceptance, do not use a site MCP/connector to discover the route/id and then count that as Browser evidence. For Browser work, use the currently installed Codex Chrome Skill confirmations policy as the default risk taxonomy instead of inventing a parallel permission table. Prepared action refs are exact target/state bindings only, not proof of user approval. Default user-facing UX is brand-neutral verbal task-level confirmation: when the Codex policy indicates a confirmation-worthy action class, explain that the extra permission is based on the current Codex Browser Policy and ask once for the bounded task; routine actions inside the same unchanged task must not trigger per-action prompts. Clarify when useful that Browser permission does not start a Codex task or by itself consume Codex quota. Reconfirm only when task scope materially expands, a user-authored preference requires stricter handling, or a higher-level platform rule requires action-time confirmation; user-authored context may request a looser confirmation preference only where higher-level policy permits. Metered Agent start/send is a separate lane. On this household private surface, present the returned Portable Card as standalone MCP text and bind the user decision to its exact short Task ID through codex.agent_portable_commit or codex.agent_portable_decline; never select among pending tasks from a generic Yes/No. Rich Card v13 and its app-only commit/decline remain compatibility paths and must not be removed or weakened. Preserve visible quota/usage receipts. Do not route formal Codex model/control work through codex.command_exec or codex.process as a fallback: obvious direct Codex CLI launches are rejected with FORMAL_CODEX_AGENT_REQUIRED. The generic process/PTY lane remains a powerful host-state tool and is not claimed to be an inescapable security sandbox against arbitrarily wrapped executables."
-          : "Experimental Codexless Workbench + Agent surface for self-dogfood. It combines the accepted codex.command_exec compatibility contract with Codex project context, broad raw structured filesystem/search for internal Preview work, narrower authorized read_many + guarded precise_edit for normal project construction, persistent process/PTY control plus terminal completion receipts, Skills/Plugin/App/MCP catalogs and direct configured MCP calls, accepted existing-login Chrome Reader + read-only viewport screenshot + fixed Enter/Tab/Escape keypress at current focus + authority-bounded upload + browser-managed download + exact prepared single-tab close + narrow prepared navigation/new-tab/click/fill + bounded scroll, dynamic codex.browser_confirmation_policy, and a formal Codex Agent lane. Web routing is phase-aware, not tool-loyal: when the caller also has a lightweight read-only/open-web search or reader surface, use that for public-web discovery/filtering that does not need the user's authenticated/session-specific state, then switch into signed-in Browser only when the task needs a current tab/session, private/non-indexed content, live UI state, or an interaction/side effect. Browse openly, act locally. Browser navigation itself is destination-first, not gesture-faithful: when the user goal is simply to reach/read another page and an exact http(s) destination is reliably available from Browser-derived evidence, prefer direct navigate/open-tab over clicking an intermediate UI element; do not guess route patterns, and always read back URL plus page identity after arrival. Keep click when the click itself matters, the URL is not reliably known, or direct routing would bypass required page state/workflow. In pure-Browser acceptance, do not use a site MCP/connector to discover the route/id and then count that as Browser evidence. Browser confirmation decisions use the currently installed Codex Chrome Skill confirmations policy as the default risk taxonomy plus user-authored task context. Prepared action refs are exact state/target bindings only, not approval tokens. Default Browser UX consolidates policy-required permission into one brand-neutral verbal confirmation for the bounded task; do not prompt per routine action inside the same unchanged task, do not use the Codex Task Card for Browser permission, and do not imply that Browser permission starts a metered Codex turn. Reconfirm only for materially expanded task risk or when higher-level policy requires action-time confirmation; user-authored preferences may adjust confirmation strictness only where higher-level policy permits. Metered Agent start/send remains a separate lane: it first prepares an exact consent record; the MCP Apps Task Card makes quota/status/pending approval/final usage visible and its app-only agent_commit can commit only the server-bound consentRef. Agent authority is resolved locally through the same Codexless/Codex authority path; remote callers cannot select permission profiles, sandbox, approval policy, roots, or network authority. When configured, isolated prepared-click CUA remains a separate regression capability. Broad Preview bodies must not be treated as a permission upgrade request. If the Task Card UI is unavailable or does not render, present the returned manualFallback.lines as a separate compact confirmation/report block in the user's conversation language when practical; preserve the line structure, keep Yes / No literal for confirmations, and do not bury quota, approval, or completion receipts inside prose.",
+          ? "Codexless household surface for daily self-dogfood. It exposes only an explicit server-side allowlist: accepted command_exec compatibility contract; project/account/read-only discovery; persistent process + receipts; Codex Skill/catalog reads; authority-bounded read_many and guarded precise_edit; existing-login Chrome Reader plus read-only viewport screenshot, fixed Enter/Tab/Escape keypress at current focus, authority-bounded upload, browser-managed download, exact prepared single-tab close, and narrow prepared navigation/new-tab/click/fill plus bounded scroll; the dynamic codex.browser_confirmation_policy reader; and the formal Codex Agent lane with fixed-text approval/result state and truthful consent/usage receipts. Broad raw fs_mutate, generic mcp_call, and all general CUA/computer tools are intentionally absent. Remote callers cannot widen Codex permission profiles, sandbox, approval policy, trusted roots, or network authority. Web routing is phase-aware, not tool-loyal: when the caller also has a lightweight read-only/open-web search or reader surface, use that for public-web discovery/filtering that does not need the user's authenticated/session-specific state, then switch into signed-in Browser only when the task needs a current tab/session, private/non-indexed content, live UI state, or an interaction/side effect. Browse openly, act locally. Browser navigation itself is destination-first, not gesture-faithful: when the bounded user goal is simply to reach/read another page and an exact http(s) destination is reliably available from Browser-derived evidence, prefer direct navigate/open-tab over clicking an intermediate UI element; do not guess route patterns, and always read back URL plus page identity after arrival. Keep click when the click itself matters, the URL is not reliably known, or direct routing would bypass required page state/workflow. In pure-Browser acceptance, do not use a site MCP/connector to discover the route/id and then count that as Browser evidence. For Browser work, use the currently installed Codex Chrome Skill confirmations policy as the default risk taxonomy instead of inventing a parallel permission table. Prepared action refs are exact target/state bindings only, not proof of user approval. Default user-facing UX is brand-neutral verbal task-level confirmation: when the Codex policy indicates a confirmation-worthy action class, explain that the extra permission is based on the current Codex Browser Policy and ask once for the bounded task; routine actions inside the same unchanged task must not trigger per-action prompts. Clarify when useful that Browser permission does not start a Codex task or by itself consume Codex quota. Reconfirm only when task scope materially expands, a user-authored preference requires stricter handling, or a higher-level platform rule requires action-time confirmation; user-authored context may request a looser confirmation preference only where higher-level policy permits. Metered Agent start/send is a separate lane. Normal Chat Call Approval is fixed compact text bound to the exact Task ID; only explicit valid requireCallApproval=false skips that gate. Literal Yes / No maps only to codex.agent_commit / codex.agent_decline for that exact prepared task. Running remains authoritative and supervised but is not mechanically presented. Terminal always returns the fixed text Result with truthful available usage/quota after-state. In-turn approvals that actually require the user remain conspicuous ordinary-text decisions. Do not route formal Codex model/control work through codex.command_exec or codex.process as a fallback: obvious direct Codex CLI launches are rejected with FORMAL_CODEX_AGENT_REQUIRED. The generic process/PTY lane remains a powerful host-state tool and is not claimed to be an inescapable security sandbox against arbitrarily wrapped executables."
+          : "Experimental Codexless Workbench + Agent surface for self-dogfood. It combines the accepted codex.command_exec compatibility contract with Codex project context, broad raw structured filesystem/search for internal Preview work, narrower authorized read_many + guarded precise_edit for normal project construction, persistent process/PTY control plus terminal completion receipts, Skills/Plugin/App/MCP catalogs and direct configured MCP calls, accepted existing-login Chrome Reader + read-only viewport screenshot + fixed Enter/Tab/Escape keypress at current focus + authority-bounded upload + browser-managed download + exact prepared single-tab close + narrow prepared navigation/new-tab/click/fill + bounded scroll, dynamic codex.browser_confirmation_policy, and a formal Codex Agent lane. Web routing is phase-aware, not tool-loyal: when the caller also has a lightweight read-only/open-web search or reader surface, use that for public-web discovery/filtering that does not need the user's authenticated/session-specific state, then switch into signed-in Browser only when the task needs a current tab/session, private/non-indexed content, live UI state, or an interaction/side effect. Browse openly, act locally. Browser navigation itself is destination-first, not gesture-faithful: when the user goal is simply to reach/read another page and an exact http(s) destination is reliably available from Browser-derived evidence, prefer direct navigate/open-tab over clicking an intermediate UI element; do not guess route patterns, and always read back URL plus page identity after arrival. Keep click when the click itself matters, the URL is not reliably known, or direct routing would bypass required page state/workflow. In pure-Browser acceptance, do not use a site MCP/connector to discover the route/id and then count that as Browser evidence. Browser confirmation decisions use the currently installed Codex Chrome Skill confirmations policy as the default risk taxonomy plus user-authored task context. Prepared action refs are exact state/target bindings only, not approval tokens. Default Browser UX consolidates policy-required permission into one brand-neutral verbal confirmation for the bounded task; do not prompt per routine action inside the same unchanged task, do not reuse formal Codex Call Approval for Browser permission, and do not imply that Browser permission starts a metered Codex turn. Reconfirm only for materially expanded task risk or when higher-level policy requires action-time confirmation; user-authored preferences may adjust confirmation strictness only where higher-level policy permits. Metered Agent start/send remains a separate lane: it first prepares one exact server-bound task; normal Chat approval/result presentation is fixed text bound to its exact Task ID, and literal Yes / No is resolved only by codex.agent_commit / codex.agent_decline. Agent authority is resolved locally through the same Codexless/Codex authority path; remote callers cannot select permission profiles, sandbox, approval policy, roots, or network authority. When configured, isolated prepared-click CUA remains a separate regression capability. Broad Preview bodies must not be treated as a permission upgrade request. Present the returned fixed chatPresentation text directly in the user's Chat/Host language when available; keep Yes / No literal for confirmations, do not use service-machine locale as language authority, do not manufacture a Running block, and do not bury quota, approval, or completion receipts inside prose.",
       commandDescription: publicPreview
-        ? "Run one buffered argv command through official Codex App Server command/exec without a Codex model turn. The caller may provide cwd as working-directory context. Codexless resolves the authorized Codex permission profile and passes it directly to command/exec. On Windows, a bare executable name is resolved through the host PATH to a directly launchable .exe/.com/.cmd/.bat shim before dispatch; this changes only executable lookup, not Codex authority. This public surface does not expose host-process control; a command blocked by local Codex permission/trust or host-state isolation must remain visible rather than silently escaping the sandbox."
-        : "Run one buffered argv command through official Codex App Server command/exec without a Codex model turn. The caller may provide cwd as working-directory context. Codexless resolves the authorized Codex permission profile and passes it directly to command/exec. On Windows, a bare executable name is resolved through the host PATH to a directly launchable .exe/.com/.cmd/.bat shim before dispatch; this changes only executable lookup, not Codex authority. Use codex.process instead for genuine host-state work outside the command_exec sandbox, including explicitly requested Git repository-metadata operations on an existing .git directory or authenticated host CLI work that depends on the local Windows credential store. Select that host lane directly when the task itself requires it; do not weaken or bypass a Codex permission denial for ordinary project work. Formal Codex model/control work is not a supported command_exec fallback; obvious direct Codex CLI model/control invocations fail visibly with FORMAL_CODEX_AGENT_REQUIRED and must be routed through codex.agent_start/codex.agent_send plus the household Portable Card exact-ID decision flow.",
+        ? "Run one buffered argv command through official Codex App Server command/exec without a Codex model turn. The caller may provide cwd as working-directory context. Codexless resolves the authorized Codex permission profile and passes it directly to command/exec. On Windows, a bare executable name is resolved through the host PATH to a directly launchable .exe/.com/.cmd/.bat shim before dispatch; this changes only executable lookup, not Codex authority. This public surface does not expose host-process control; a command blocked by local Codex permission/trust or host-state isolation must remain visible rather than silently escaping the sandbox. This model-free lane must not launch Codex CLI directly or through recognized nested wrappers; formal metered Codex work must use codex.agent_start/codex.agent_send so exact approval/result lifecycle and no-replay semantics are preserved."
+        : "Run one buffered argv command through official Codex App Server command/exec without a Codex model turn. The caller may provide cwd as working-directory context. Codexless resolves the authorized Codex permission profile and passes it directly to command/exec. On Windows, a bare executable name is resolved through the host PATH to a directly launchable .exe/.com/.cmd/.bat shim before dispatch; this changes only executable lookup, not Codex authority. Use codex.process instead for genuine host-state work outside the command_exec sandbox, including explicitly requested Git repository-metadata operations on an existing .git directory or authenticated host CLI work that depends on the local Windows credential store. Select that host lane directly when the task itself requires it; do not weaken or bypass a Codex permission denial for ordinary project work. Formal Codex model/control work is not a supported command_exec fallback; obvious direct Codex CLI model/control invocations fail visibly with FORMAL_CODEX_AGENT_REQUIRED and must be routed through codex.agent_start/codex.agent_send plus the fixed-text exact-Task-ID decision flow.",
       commandArgDescription:
         "argv vector passed to Codex command/exec under the resolved/local-authorized Codex permission profile.",
       cwdArgDescription:

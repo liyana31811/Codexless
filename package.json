@@ -1,6 +1,6 @@
 {
   "name": "codexless",
-  "version": "0.1.1-preview.5",
+  "version": "0.1.2-preview.0",
   "private": true,
   "license": "Apache-2.0",
   "description": "Windows and Apple Silicon macOS Technical Preview: let ChatGPT use accepted Codex-backed local capabilities and escalate to Codex only when needed.",
@@ -45,7 +45,9 @@
   "dependencies": {
     "@modelcontextprotocol/node": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
+    "@napi-rs/canvas": "1.0.8",
     "@openai/codex": "0.147.0",
+    "pdfjs-dist": "6.3.289",
     "zod": "4.4.3"
   },
   "devDependencies": {

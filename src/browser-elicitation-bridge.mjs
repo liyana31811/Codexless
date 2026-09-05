@@ -55,6 +55,40 @@ function assertBoundedString(value, name, maxChars = 20_000) {
   return value;
 }
 
+function classifyBrowserOriginPermission(request) {
+  if (!isPlainObject(request) || request.mode !== "form" || !isPlainObject(request._meta)) return null;
+  const meta = request._meta;
+  if (
+    meta.codex_approval_kind !== "mcp_tool_call" ||
+    meta.connector_id !== "browser-use" ||
+    meta.tool_name !== "access_browser_origin" ||
+    meta.persist !== "always" ||
+    typeof meta.origin !== "string"
+  ) return null;
+  if (!isPlainObject(request.requestedSchema)) return null;
+  const schemaKeys = Object.keys(request.requestedSchema).sort();
+  if (
+    schemaKeys.length !== 2 ||
+    schemaKeys[0] !== "properties" ||
+    schemaKeys[1] !== "type" ||
+    request.requestedSchema.type !== "object" ||
+    !isPlainObject(request.requestedSchema.properties) ||
+    Object.keys(request.requestedSchema.properties).length !== 0
+  ) return null;
+  let parsed;
+  try {
+    parsed = new URL(meta.origin);
+  } catch {
+    return null;
+  }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.origin !== meta.origin) return null;
+  return {
+    kind: "browser_origin_permission",
+    origin: parsed.origin,
+    decision: "dynamic_policy_required",
+  };
+}
+
 function projectElicitationRequest(request) {
   if (!isPlainObject(request)) {
     throw new Error("App Server Browser elicitation request must be an object");
@@ -64,15 +98,21 @@ function projectElicitationRequest(request) {
     if (!isPlainObject(request.requestedSchema)) {
       throw new Error("form elicitation requires requestedSchema");
     }
+    const meta = isPlainObject(request._meta) ? structuredClone(request._meta) : null;
+    if (meta) delete meta.codexless_browser_origin_permission;
+    const browserOriginPermission = classifyBrowserOriginPermission(request);
+    if (browserOriginPermission) meta.codexless_browser_origin_permission = browserOriginPermission;
     return inputRequired.elicit({
       message,
       requestedSchema: structuredClone(request.requestedSchema),
+      ...(meta ? { _meta: meta } : {}),
     });
   }
   if (request.mode === "url") {
     return inputRequired.elicitUrl({
       message: assertBoundedString(request.message, "elicitation message"),
       url: assertBoundedString(request.url, "elicitation url", 16_384),
+      ...(isPlainObject(request._meta) ? { _meta: structuredClone(request._meta) } : {}),
     });
   }
   if (request.mode === "openai/form") {
@@ -191,17 +231,45 @@ export class BrowserElicitationBridge {
     }
 
     const params = isPlainObject(request.params) ? request.params : null;
-    if (!params || params.server_name !== BROWSER_MCP_SERVER) {
+    const camelServerName = params?.serverName;
+    const snakeServerName = params?.server_name;
+    if (
+      camelServerName !== undefined &&
+      snakeServerName !== undefined &&
+      camelServerName !== snakeServerName
+    ) {
       request.reject?.({
         code: -32602,
-        message: `Browser elicitation is supported only for ${BROWSER_MCP_SERVER}; got ${String(params?.server_name ?? "missing")}`,
+        message: "Browser elicitation serverName/server_name aliases disagree.",
+      });
+      return;
+    }
+    const serverName = camelServerName ?? snakeServerName;
+    if (!params || serverName !== BROWSER_MCP_SERVER) {
+      request.reject?.({
+        code: -32602,
+        message: `Browser elicitation is supported only for ${BROWSER_MCP_SERVER}; got ${String(serverName ?? "missing")}`,
       });
       return;
     }
 
+    let elicitation;
+    if (Object.hasOwn(params, "request")) {
+      if (!isPlainObject(params.request)) {
+        request.reject?.({
+          code: -32602,
+          message: "Nested Browser elicitation request must be an object.",
+        });
+        return;
+      }
+      elicitation = params.request;
+    } else {
+      elicitation = params;
+    }
+
     let projected;
     try {
-      projected = projectElicitationRequest(params.request);
+      projected = projectElicitationRequest(elicitation);
     } catch (error) {
       request.reject?.({
         code: -32602,

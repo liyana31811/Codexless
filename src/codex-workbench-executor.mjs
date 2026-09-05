@@ -14,6 +14,25 @@ const MAX_BUFFER_CHARS = 512_000;
 const PROCESS_RECEIPT_TTL_MS = 60 * 60_000;
 const MAX_PROCESS_RECEIPTS = 100;
 const CHROME_SKILL_NAME = "chrome:control-chrome";
+const CHROME_PLUGIN_ID = "chrome@openai-bundled";
+
+export function projectCurrentChromePlugin(result) {
+  for (const marketplace of result?.marketplaces ?? []) {
+    const plugin = (marketplace?.plugins ?? []).find((entry) => entry?.id === CHROME_PLUGIN_ID);
+    if (!plugin) continue;
+    const localVersion = typeof plugin.localVersion === "string" && plugin.localVersion.trim()
+      ? plugin.localVersion.trim()
+      : null;
+    if (!localVersion) return null;
+    return {
+      id: CHROME_PLUGIN_ID,
+      name: typeof plugin.name === "string" ? plugin.name : "chrome",
+      localVersion,
+      sourcePath: typeof plugin?.source?.path === "string" ? plugin.source.path : null,
+    };
+  }
+  return null;
+}
 
 function decodeBase64(value) {
   return Buffer.from(value ?? "", "base64").toString("utf8");
@@ -526,6 +545,12 @@ export class CodexWorkbenchExecutor {
     const skills = (result?.data ?? []).flatMap((row) => row?.skills ?? []);
     const chromeSkill = skills.find((skill) => skill?.name === CHROME_SKILL_NAME && skill?.enabled !== false);
     return chromeSkill?.path ? { name: CHROME_SKILL_NAME, path: chromeSkill.path } : null;
+  }
+
+  async currentChromePlugin({ cwd = this.#defaultCwd } = {}) {
+    const effectiveCwd = path.resolve(cwd);
+    const result = await this.#request("plugin/list", { cwds: [effectiveCwd], forceRefetch: false });
+    return projectCurrentChromePlugin(result);
   }
 
   async mcpCall({ server, tool, arguments: args = {}, cwd = this.#defaultCwd, meta = null, expectedGeneration = null }) {

@@ -7,6 +7,7 @@ import { resolveBrowserRuntimeCompatibility } from "./browser-runtime-compat.mjs
 import { CodexAppServerClient } from "./codex-app-server-client.mjs";
 import { resolveCodexExecutable } from "./codex-bin.mjs";
 import { normalizeBrowserLifecycleShape } from "./codex-browser-executor.mjs";
+import { projectCurrentChromePlugin } from "./codex-workbench-executor.mjs";
 import { readJsonFile } from "./json-file.mjs";
 import { listAllMcpServerStatus } from "./mcp-status-pagination.mjs";
 
@@ -272,7 +273,7 @@ export function buildCompatibilityFingerprintReport(evidence = {}) {
       existingTabRelease: browserLifecycle.existingTabRelease,
       handback: browserLifecycle.handback,
       note: browserLifecycle.classification === "turn-cleanup-no-public-release"
-        ? "Existing normalizeBrowserLifecycleShape classified finalize-absent marks as turn cleanup; the fingerprint does not promote those marks to public existing-tab release."
+        ? "Known finalize-absent turn-boundary cleanup is compatible for normal Browser lifecycle, but it does not prove an explicit existing-tab release primitive or independent-controller force release/takeover."
         : null,
     },
     browserRuntimeAttachment: {
@@ -299,6 +300,12 @@ export function buildCompatibilityFingerprintReport(evidence = {}) {
     },
   };
 
+  const browserLifecycleOverallStatus = browserLifecycle.status === "RED"
+    && browserLifecycle.classification === "turn-cleanup-no-public-release"
+    && browserLifecycle.adapterShape === "finalize-absent-turn-cleanup"
+    && browserLifecycle.adapterExistingTabRelease === "turn-boundary-auto-release"
+    ? "GREEN"
+    : semanticEvidence.browserExistingTabRelease.status;
   const statusInputs = [
     semanticEvidence.modelFreeCollection.status,
     semanticEvidence.appServerRequiredShapes.status,
@@ -306,7 +313,7 @@ export function buildCompatibilityFingerprintReport(evidence = {}) {
     semanticEvidence.authority.modelFreeCatalogStatus,
     semanticEvidence.browserNodeRepl.status,
     semanticEvidence.browserBundlePairing.status,
-    semanticEvidence.browserExistingTabRelease.status,
+    browserLifecycleOverallStatus,
   ];
   const overallStatus = !fingerprintUsable
     ? "YELLOW"
@@ -485,6 +492,7 @@ export async function collectUpstreamCompatibilityInventory({
   let configReadResult = null;
   let permissionProfileListResult = null;
   let chromeSkill = null;
+  let currentChromePlugin = null;
   let browserCompatibility = null;
   let browserClientSource = null;
   let client = null;
@@ -536,9 +544,22 @@ export async function collectUpstreamCompatibilityInventory({
           forceReload: false,
         });
         chromeSkill = findChromeSkill(skillsListResult);
-        if (!chromeSkill) unavailableReasons.push({ code: "current_chrome_skill_unavailable" });
       } catch {
         unavailableReasons.push({ code: "skills-list-unavailable" });
+      }
+
+      invokedMethods.push("plugin/list");
+      try {
+        const pluginListResult = await client.request("plugin/list", {
+          cwds: [effectiveCwd],
+          forceRefetch: false,
+        });
+        currentChromePlugin = projectCurrentChromePlugin(pluginListResult);
+      } catch {
+        warnings.push({ code: "plugin-list-unavailable" });
+      }
+      if (!chromeSkill && !currentChromePlugin) {
+        unavailableReasons.push({ code: "current_chrome_skill_unavailable" });
       }
 
       invokedMethods.push("mcpServerStatus/list");
@@ -587,13 +608,14 @@ export async function collectUpstreamCompatibilityInventory({
         browserCompatibility = await resolveBrowserCompatibility({
           codexBin: codexResolution.path,
           chromeSkillPath: chromeSkill?.path ?? null,
+          chromePluginBuild: currentChromePlugin?.localVersion ?? null,
           env,
         });
       } catch {
         browserCompatibility = {
           status: "unavailable",
           reason: "browser-runtime-compatibility-resolver-failed",
-          source: "codex-skills-list",
+          source: currentChromePlugin ? "codex-plugin-list" : "codex-skills-list",
           overrides: [],
         };
       }
@@ -618,8 +640,10 @@ export async function collectUpstreamCompatibilityInventory({
   if (!browserCompatibility) {
     browserCompatibility = {
       status: "unavailable",
-      reason: chromeSkill ? "browser-runtime-compatibility-unavailable" : "current_chrome_skill_unavailable",
-      source: "codex-skills-list",
+      reason: chromeSkill || currentChromePlugin
+        ? "browser-runtime-compatibility-unavailable"
+        : "current_chrome_skill_unavailable",
+      source: currentChromePlugin ? "codex-plugin-list" : "codex-skills-list",
       overrides: [],
     };
   }

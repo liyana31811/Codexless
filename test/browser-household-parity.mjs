@@ -2,16 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import {
   CodexBrowserExecutor,
   assertBrowserExistingTabReleaseAvailable,
+  browserFillEditableElementProfile,
   canonicalizeContentEditableParagraphText,
   cleanupBrowserClaim,
   markBrowserDeliverable,
+  markBrowserHandoff,
   normalizeBrowserLifecycleShape,
   releaseBrowserClaim,
   resolveBoundContentEditableParagraphText,
+  resolveBoundFillEditableElement,
+  sanitizePasswordDomSnapshot,
 } from "../src/codex-browser-executor.mjs";
 import { registerBrowserPreviewTools } from "../src/browser-tools.mjs";
 
@@ -157,6 +161,101 @@ test("Browser bound rich-editor resolver accepts exactly one visible nested cont
   );
 });
 
+test("Browser fill editable normalization stays inside the semantic target and rejects ambiguous or explicitly non-editable shapes", () => {
+  const editableNode = (tagName, {
+    attrs = {},
+    descendants = [],
+    isContentEditable = false,
+    disabled = false,
+    readOnly = false,
+    inert = false,
+    visible = true,
+  } = {}) => ({
+    nodeType: 1,
+    tagName: tagName.toUpperCase(),
+    isContentEditable,
+    disabled,
+    readOnly,
+    inert,
+    visible,
+    getAttribute(name) { return Object.hasOwn(attrs, name) ? attrs[name] : null; },
+    hasAttribute(name) { return Object.hasOwn(attrs, name); },
+    querySelectorAll() { return descendants; },
+  });
+  const visible = (candidate) => candidate?.visible !== false;
+
+  const input = editableNode("input");
+  const textarea = editableNode("textarea");
+  assert.deepEqual(resolveBoundFillEditableElement(input, visible), { source: "direct", editableCount: 1, kind: "input" });
+  assert.deepEqual(resolveBoundFillEditableElement(textarea, visible), { source: "direct", editableCount: 1, kind: "textarea" });
+  assert.equal(browserFillEditableElementProfile(editableNode("input", { attrs: { type: "checkbox" } })).supported, false);
+
+  const directContentEditable = editableNode("div", { isContentEditable: true });
+  assert.deepEqual(resolveBoundFillEditableElement(directContentEditable, visible), { source: "direct", editableCount: 1, kind: "contenteditable" });
+  const nestedIndependentEditor = editableNode("div", { attrs: { contenteditable: "true" } });
+  const directWithNestedEditor = editableNode("div", { isContentEditable: true, descendants: [nestedIndependentEditor] });
+  assert.deepEqual(
+    resolveBoundFillEditableElement(directWithNestedEditor, visible),
+    { source: null, editableCount: 2, kind: null },
+    "a directly editable semantic target plus another visible independently editable descendant is ambiguous"
+  );
+  const attrOnlyContentEditable = editableNode("div", {
+    attrs: { contenteditable: " PlainText-Only " },
+    isContentEditable: false,
+  });
+  assert.deepEqual(
+    resolveBoundFillEditableElement(attrOnlyContentEditable, visible),
+    { source: "direct", editableCount: 1, kind: "contenteditable" },
+    "non-boolean but standards-valid plaintext-only contenteditable must be normalized without depending on isContentEditable"
+  );
+
+  const nestedTextarea = editableNode("textarea");
+  const wrapper = editableNode("div", { descendants: [nestedTextarea] });
+  assert.deepEqual(
+    resolveBoundFillEditableElement(wrapper, visible),
+    { source: "unique-visible-descendant", editableCount: 1, kind: "textarea" },
+    "a semantic textbox wrapper may resolve only its own unique visible supported editable descendant"
+  );
+
+  const hiddenExtra = editableNode("div", { attrs: { contenteditable: "true" }, visible: false });
+  assert.deepEqual(
+    resolveBoundFillEditableElement(editableNode("div", { descendants: [nestedTextarea, hiddenExtra] }), visible),
+    { source: "unique-visible-descendant", editableCount: 1, kind: "textarea" },
+    "hidden editable templates do not create false ambiguity"
+  );
+  const secondEditable = editableNode("div", { attrs: { contenteditable: "true" } });
+  assert.deepEqual(
+    resolveBoundFillEditableElement(editableNode("div", { descendants: [nestedTextarea, secondEditable] }), visible),
+    { source: null, editableCount: 2, kind: null },
+    "multiple visible writable descendants must fail closed rather than picking an index"
+  );
+
+  const semanticShell = editableNode("div");
+  assert.deepEqual(
+    resolveBoundFillEditableElement(semanticShell, visible),
+    { source: "semantic-shell", editableCount: 0, kind: "semantic-shell" },
+    "the pre-existing exact textbox semantic-shell dispatch remains available for activation-only editors"
+  );
+  assert.deepEqual(
+    resolveBoundFillEditableElement(editableNode("div", { attrs: { "aria-disabled": "true" } }), visible),
+    { source: null, editableCount: 0, kind: null },
+    "aria-disabled semantic shells must not inherit the activation fallback"
+  );
+  assert.deepEqual(
+    resolveBoundFillEditableElement(editableNode("div", { attrs: { "aria-readonly": "true" } }), visible),
+    { source: null, editableCount: 0, kind: null },
+    "aria-readonly semantic shells must not inherit the activation fallback"
+  );
+  const explicitlyNotEditable = editableNode("div", { attrs: { contenteditable: "false" } });
+  assert.deepEqual(resolveBoundFillEditableElement(explicitlyNotEditable, visible), { source: null, editableCount: 0, kind: null });
+  const wrapperWithReadonly = editableNode("div", { descendants: [editableNode("textarea", { readOnly: true })] });
+  assert.deepEqual(
+    resolveBoundFillEditableElement(wrapperWithReadonly, visible),
+    { source: null, editableCount: 0, kind: null },
+    "a visible readonly descendant must not fall back to writing the wrapper"
+  );
+});
+
 test("Browser API shape legacy explicit-finalize supports repeated existing-tab claim/read/release/reclaim", async () => {
   const calls = [];
   let claimed = false;
@@ -207,7 +306,7 @@ test("Browser API shape legacy explicit-finalize supports repeated existing-tab 
   assert.deepEqual(calls, [{ keep: [] }, { keep: [] }]);
 });
 
-test("Browser API shape finalize-absent turn-cleanup reports truthful unavailable receipt and cannot prove synthetic reclaim", async () => {
+test("Browser API shape finalize-absent turn-cleanup reports turn-boundary release and optional later-turn handoff", async () => {
   let claimed = false;
   let handoffMarks = 0;
   let deliverableMarks = 0;
@@ -228,22 +327,28 @@ test("Browser API shape finalize-absent turn-cleanup reports truthful unavailabl
   };
   assert.deepEqual(normalizeBrowserLifecycleShape(browser, tab), {
     shape: "finalize-absent-turn-cleanup",
-    existingTabRelease: "unavailable",
+    existingTabRelease: "turn-boundary-auto-release",
+    continuation: "markHandoff",
     deliverable: "markDeliverable",
   });
   const first = await browser.user.claimTab();
   assert.deepEqual(await cleanupBrowserClaim(browser, first), {
-    cleanupStatus: "unavailable",
-    cleanupReason: "turn-cleanup-unproven",
+    cleanupStatus: "deferred",
+    cleanupReason: "turn-boundary-auto-release",
     lifecycleShape: "finalize-absent-turn-cleanup",
   });
-  assert.equal(handoffMarks, 0, "markHandoff is not a release primitive and must not be used as one");
-  assert.equal(deliverableMarks, 0, "markDeliverable is not an existing-tab release primitive");
+  assert.equal(handoffMarks, 0, "ordinary turn-end cleanup must not mark unfinished handoff");
+  assert.equal(deliverableMarks, 0, "ordinary existing-tab cleanup must not mark deliverable");
   await assert.rejects(
     () => browser.user.claimTab(),
     /already part of browser session/,
-    "without a real turn-end or explicit finalize, synthetic reclaim remains unproven"
+    "the maintained release occurs at turn boundary, not inside the same turn"
   );
+  claimed = false;
+  const second = await browser.user.claimTab();
+  assert.equal(second, tab, "a later turn can reclaim the still-open user tab after turn-boundary handback");
+  assert.equal(await markBrowserHandoff(browser, second), "finalize-absent-turn-cleanup");
+  assert.equal(handoffMarks, 1, "unfinished later-turn workflow explicitly marks handoff");
   assert.throws(
     () => assertBrowserExistingTabReleaseAvailable(browser),
     /TOOLWIRE_BROWSER_EXISTING_TAB_RELEASE_UNAVAILABLE:finalize-absent-release-unproven/
@@ -298,6 +403,7 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
     textSemanticRole: "link",
     textClickBinding: { kind: "onclick-property", depth: 2, tagName: "div", role: null, id: null },
     textThreadCardBinding: { kind: "thread-card-data", depth: 1, tagName: "div", threadId: "2811" },
+    textStableIdBinding: { kind: "stable-element-id", depth: 0, tagName: "a", id: "sendPasswordButton", role: null, href: null, ariaDisabled: null },
     scopeLinkCount: 1,
     scopedTargetCount: 1,
     textBindingChanged: false,
@@ -311,6 +417,9 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
     closeUncertain: false,
     closeTransportThrow: false,
     closeDispatches: 0,
+    bulkCloseDispatches: 0,
+    bulkCloseUncertainProviderTabId: null,
+    workbenchRestarts: 0,
     clickPostDispatchFailure: false,
     clickFinalizeFailure: false,
     clickTransportThrow: false,
@@ -323,8 +432,13 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
     fillNotApplied: false,
     fillVerificationUnavailable: false,
     fillActivationRepair: false,
+    fillTargetChanged: false,
+    fillEditableErrorCount: null,
     fillVerificationSource: "fresh-target",
     fillRoleBoundCount: 1,
+    fillNativePasswordCount: 0,
+    fillNativePasswordVisible: true,
+    fillNativePasswordEnabled: true,
     clicks: 0,
     downloads: 0,
     downloadUncertain: false,
@@ -334,6 +448,8 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
     fills: 0,
     navigations: 0,
     openedTabs: 0,
+    openedTabFamilies: [],
+    openTabUncertain: false,
     screenshots: 0,
     screenshotReportedByteLengthDelta: 0,
     keypresses: [],
@@ -342,23 +458,62 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
     lastScrollDelta: null,
     scrollUncertain: false,
     scrollReadbackFailure: false,
+    domSnapshotOverride: null,
+    visibleDom: '<button node_id=17 role="button" aria-label="Compose">Compose</button>\n<button node_id=23 role="button" aria-label="Compose">Compose</button>',
+    elementVisibleDomReads: 0,
+    elementClicks: 0,
+    elementDoubleClicks: 0,
+    elementActionUncertain: false,
+    passwordSnapshotDescriptors: [],
     fieldValue: "",
     fieldRenderedText: null,
     fillStrategy: "fill",
-    fillTargetMeta: { tag: "input", contentEditable: false, customHost: null },
+    fillTargetMeta: {
+      tag: "input",
+      inputType: "text",
+      placeholder: "Search Reddit",
+      contentEditable: false,
+      customHost: null,
+      editableSource: "direct",
+      editableKind: "input",
+      semanticTag: "input",
+      semanticContentEditable: false,
+    },
     bumpGenerationBeforeMutationDispatch: false,
     bumpGenerationBeforeReadDispatch: false,
     skillPathAfterReadRestart: null,
+    mcpCatalogCalls: 0,
+    mcpCatalogFailuresRemaining: 0,
+    bumpGenerationOnMcpCatalogFailure: false,
+    webMcpFetches: 0,
+    webMcpCalls: 0,
+    webMcpDrops: 0,
+    webMcpDescription: "WebMCP tools available: save_note",
+    webMcpResult: { saved: true },
+    webMcpDiscoverErrorText: null,
+    webMcpCallErrorText: null,
   };
   return {
     generation: 1,
     calls,
     state,
+    async restart() {
+      state.workbenchRestarts += 1;
+      state.syntheticClaimHeld = false;
+      this.generation += 1;
+      return { status: "restarted", generation: this.generation };
+    },
     async catalog({ kind }) {
       if (kind === "skills") {
         return { skills: skillAvailable ? [{ name: "chrome:control-chrome", path: state.skillPath, enabled: true }] : [] };
       }
       if (kind === "mcp") {
+        state.mcpCatalogCalls += 1;
+        if (state.mcpCatalogFailuresRemaining > 0) {
+          state.mcpCatalogFailuresRemaining -= 1;
+          if (state.bumpGenerationOnMcpCatalogFailure) this.generation += 1;
+          throw new Error("simulated transient node_repl discovery failure");
+        }
         return {
           servers: nodeReplAvailable
             ? [{ name: "node_repl", error: null, tools: [{ name: "js" }] }]
@@ -408,8 +563,48 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
           if (state.syntheticClaimHeld) {
             return { isError: true, text: "Tab 123 is already part of browser session synthetic-session" };
           }
-          if (state.cleanupReceipt?.cleanupStatus === "unavailable") state.syntheticClaimHeld = true;
+          if (state.cleanupReceipt?.cleanupStatus !== "released") state.syntheticClaimHeld = true;
         }
+      }
+      if (title === "Probe ChatGPT actual model route") {
+        assert.match(code, /documentation\.get\("capabilities\/tab\/cdp"\)/);
+        assert.match(code, /你现在是什么模型？/);
+        assert.match(code, /getByRole\("radio", \{ name, exact: true \}\)/);
+        assert.match(code, /\[\["chat", "Chat"\], \["work", "Work"\]\]/);
+        assert.match(code, /TOOLWIRE_BROWSER_MODEL_ROUTE_CHAT_SURFACE_REQUIRED/);
+        assert.doesNotMatch(code, /TOOLWIRE_BROWSER_MODEL_ROUTE_TEMP_CHAT_REQUIRED/);
+        return {
+          isError: false,
+          text: JSON.stringify({
+            status: "ok",
+            submitted: true,
+            responseObserved: true,
+            streamFinished: true,
+            streamFailed: false,
+            response: { origin: "https://chatgpt.com", pathname: "/backend-api/f/conversation", status: 200, mimeType: "text/event-stream" },
+            assistantClaim: { text: "我是 GPT-5.6 Sol。", truncated: false },
+            surfaceMode: "chat",
+            fields: {
+              resolved_model_slug: "gpt-5-6-thinking",
+              server_ste_metadata: { model_slug: null },
+              requested_model_experience: null,
+              observedValues: {
+                resolved_model_slug: ["gpt-5-6-thinking"],
+                server_ste_metadata_model_slug: [],
+                requested_model_experience: [],
+              },
+            },
+            evidence: {
+              cdpCapability: true,
+              networkEnabledBeforeSubmit: true,
+              eventBaselineBeforeSubmit: true,
+              websocketFramesObserved: true,
+              responseBodyAvailable: true,
+              responseBodyError: null,
+            },
+            ...state.cleanupReceipt,
+          }),
+        };
       }
       if (title === "Read Codex Browser confirmation policy") {
         assert.match(code, /documentation\.get\("confirmations"\)/);
@@ -440,6 +635,46 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
             ...state.cleanupReceipt,
           }),
         };
+      }
+      if (title === "Prepare exact-set Chrome bulk tab close") {
+        assert.match(code, /user\.openTabs\(\)/);
+        assert.doesNotMatch(code, /user\.claimTab\(/, "bulk-close prepare must remain read-only and unclaimed");
+        assert.doesNotMatch(code, /\.close\(\)/, "bulk-close prepare must not close any tab");
+        const requestedMatch = code.match(/const __twRequested = (\[[^\n]+\]);/);
+        assert.ok(requestedMatch, "bulk-close prepare must bind an exact server-side provider set");
+        const requested = JSON.parse(requestedMatch[1]);
+        const rows = [];
+        for (let index = 0; index < requested.length; index += 1) {
+          const tab = state.tabs.find((candidate) => candidate.providerTabId === requested[index].providerTabId);
+          if (!tab) return { isError: true, text: `TOOLWIRE_BROWSER_BULK_CLOSE_TAB_STALE:${index}` };
+          if (typeof tab.url !== "string" || !tab.url) return { isError: true, text: `TOOLWIRE_BROWSER_BULK_CLOSE_URL_UNAVAILABLE:${index}` };
+          rows.push({ ...tab });
+        }
+        return { isError: false, text: JSON.stringify({ rows }) };
+      }
+      if (title.startsWith("Execute prepared Chrome bulk tab close ")) {
+        assert.match(code, /user\.openTabs\(\)/);
+        assert.match(code, /user\.claimTab\(/);
+        assert.match(code, /__twTab\.close\(\)/);
+        assert.match(code, /TOOLWIRE_BROWSER_BULK_CLOSE_URL_CHANGED/);
+        assert.match(code, /TOOLWIRE_BROWSER_BULK_CLOSE_RESULT_UNCERTAIN/);
+        assert.match(code, /cleanupBrowserClaim\(__twBrowser, __twTab\)/);
+        const providerMatch = code.match(/providerTabId === ("(?:[^"\\]|\\.)*")/);
+        assert.ok(providerMatch, "bulk-close execute must bind one prepared provider identity per item");
+        const providerTabId = JSON.parse(providerMatch[1]);
+        const expectedUrlMatch = code.match(/__twObservedUrl !== ("(?:[^"\\]|\\.)*")/);
+        assert.ok(expectedUrlMatch, "bulk-close execute must bind one exact prepared URL per item");
+        const expectedUrl = JSON.parse(expectedUrlMatch[1]);
+        const index = state.tabs.findIndex((candidate) => candidate.providerTabId === providerTabId);
+        if (index < 0) return { isError: true, text: "TOOLWIRE_BROWSER_BULK_CLOSE_TAB_STALE" };
+        const tab = state.tabs[index];
+        if (tab.url !== expectedUrl) return { isError: true, text: "TOOLWIRE_BROWSER_BULK_CLOSE_URL_CHANGED" };
+        state.bulkCloseDispatches += 1;
+        if (state.bulkCloseUncertainProviderTabId === providerTabId) {
+          return { isError: true, text: "TOOLWIRE_BROWSER_BULK_CLOSE_RESULT_UNCERTAIN:simulated lost receipt after close dispatch" };
+        }
+        state.tabs.splice(index, 1);
+        return { isError: false, text: JSON.stringify({ beforeUrl: expectedUrl, closed: true }) };
       }
       if (title === "Prepare exact Chrome tab close") {
         assert.match(code, /user\.openTabs\(\)/);
@@ -541,7 +776,9 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
           }),
         };
       }
-      if (title === "Execute prepared Chrome new tab") {
+      if (/^Execute prepared (Chrome|Edge) new tab$/.test(title)) {
+        const family = title.includes("Edge") ? "edge" : "chrome";
+        assert.ok(code.includes(`browsers.get(${JSON.stringify(family)})`), "new-tab dispatch must use the prepared browser family");
         assert.match(code, /\.tabs\.new\(\)/);
         assert.match(code, /\.goto\(/);
         assert.match(code, /markBrowserDeliverable\(__twBrowser, __twTab\)/, "new-tab cleanup must route through the normalized lifecycle adapter");
@@ -552,6 +789,10 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
         assert.ok(targetMatch, "new-tab body must bind a JSON URL literal");
         const targetUrl = JSON.parse(targetMatch[1]);
         state.openedTabs += 1;
+        state.openedTabFamilies.push(family);
+        if (state.openTabUncertain) {
+          return { isError: true, text: "TOOLWIRE_BROWSER_OPEN_TAB_RESULT_UNCERTAIN:simulated lost receipt after create dispatch" };
+        }
         state.tabs.unshift({
           providerTabId: `["browser-instance","new-${state.openedTabs}"]`,
           title: "Opened Page",
@@ -647,6 +888,9 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
           assert.match(code, /filter\(\{ has: __twTextLocator \}\)/);
           assert.match(code, /TOOLWIRE_BROWSER_TEXT_SEMANTIC_COUNT/);
           if (state.textVisibleCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_COUNT:" + state.textVisibleCount };
+          if (state.textSemanticKind === "stable-element-id" && /if \(__twSemanticCount === 0 && false\)/.test(code)) {
+            return { isError: true, text: "TOOLWIRE_BROWSER_TEXT_NO_BINDING:[]" };
+          }
           if (state.textSemanticCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_TEXT_SEMANTIC_COUNT:" + state.textSemanticCount };
         } else if (scopedRoleMode) {
           assert.match(code, /getByRole\("link"\)\.filter\(\{ visible: true \}\)/);
@@ -681,18 +925,38 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
               ? state.textClickBinding
               : exactTextMode && state.textSemanticKind === "thread-card-data"
                 ? state.textThreadCardBinding
-                : null,
+                : exactTextMode && state.textSemanticKind === "stable-element-id"
+                  ? state.textStableIdBinding
+                  : null,
             ...state.cleanupReceipt,
           }),
         };
       }
       if (title === "Prepare exact Chrome fill") {
         const scopedFillMode = code.includes("const __twScopeLinks =");
-        const placeholderFillMode = code.includes("getByPlaceholder");
+        const placeholderFillMode = code.includes("__twPlaceholderRoleLocator");
+        const nativePasswordFillMode = code.includes("__twNativePasswordCandidates");
         assert.match(code, /getByRole/);
+        assert.match(code, /__twResolveBoundEditableLocator/);
+        assert.match(code, /locator\('input, textarea, \[contenteditable\]'\)/);
+        assert.match(code, /TOOLWIRE_BROWSER_FILL_EDITABLE_COUNT/);
+        assert.match(code, /editableSource/);
+        assert.match(code, /editableKind/);
+        assert.match(code, /semantic-shell/);
         if (placeholderFillMode) {
-          assert.match(code, /__twRoleBoundLocator/);
-          assert.match(code, /__twLocator\.and\(__twRoleLocator\)/);
+          assert.match(code, /__twPlaceholderRoleCandidates/);
+          assert.match(code, /__twPlaceholderSemanticMatches/);
+          assert.match(code, /getAttribute\("placeholder"\)/);
+          assert.match(code, /descendantPlaceholderMatches/);
+          assert.doesNotMatch(code, /getByPlaceholder/);
+        }
+        if (nativePasswordFillMode) {
+          assert.match(code, /__twNativePasswordInputs/);
+          assert.match(code, /__twNativePasswordCandidates/);
+          assert.match(code, /__twCandidate\.isVisible\(\)/);
+          assert.match(code, /__twCandidate\.isEnabled\(\)/);
+          assert.match(code, /type === "password"/);
+          assert.match(code, /placeholder === __twPasswordBinding\?\.expectedPlaceholder/);
         }
         if (scopedFillMode) {
           assert.match(code, /__twScopeLinks\.evaluateAll/);
@@ -701,7 +965,7 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
           assert.match(code, /TOOLWIRE_BROWSER_SCOPE_TARGET_COUNT/);
           if (state.scopeLinkCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_SCOPE_LINK_COUNT:" + state.scopeLinkCount };
           if (state.scopedTargetCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_SCOPE_TARGET_COUNT:3:" + state.scopedTargetCount };
-        } else {
+        } else if (!placeholderFillMode) {
           assert.match(code, /exact: true/);
         }
         assert.doesNotMatch(code, /inputValue\s*\(/);
@@ -715,15 +979,22 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
         assert.doesNotMatch(code, /targetStructure:[\s\S]*outerHTML/);
         assert.match(code, /cleanupBrowserClaim\(__twBrowser, __twTab\)/);
         assert.equal(state.fills, 0, "prepare fill must not mutate the field");
-        if (placeholderFillMode && state.fillRoleBoundCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_COUNT:" + state.fillRoleBoundCount };
-        if (!scopedFillMode && state.locatorCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_COUNT:" + state.locatorCount };
+        const nativePasswordEligibleCount = nativePasswordFillMode && state.fillNativePasswordVisible && state.fillNativePasswordEnabled
+          ? state.fillNativePasswordCount
+          : 0;
+        const placeholderResolvedCount = state.fillRoleBoundCount !== 0 ? state.fillRoleBoundCount : nativePasswordEligibleCount;
+        if (placeholderFillMode && placeholderResolvedCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_COUNT:" + placeholderResolvedCount };
+        if (!scopedFillMode && !placeholderFillMode && state.locatorCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_COUNT:" + state.locatorCount };
+        if (Number.isInteger(state.fillEditableErrorCount)) return { isError: true, text: "TOOLWIRE_BROWSER_FILL_EDITABLE_COUNT:" + state.fillEditableErrorCount };
         if (!state.locatorVisible) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_NOT_VISIBLE" };
         if (!state.locatorEnabled) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_NOT_ENABLED" };
-        const currentValue = typeof state.fieldRenderedText === "string"
-          && /^\s*$/.test(state.fieldValue)
-          && !/^\s*$/.test(state.fieldRenderedText)
-          ? state.fieldRenderedText
-          : state.fieldValue;
+        const currentValue = state.fillTargetMeta?.inputType === "password"
+          ? null
+          : typeof state.fieldRenderedText === "string"
+            && /^\s*$/.test(state.fieldValue)
+            && !/^\s*$/.test(state.fieldRenderedText)
+            ? state.fieldRenderedText
+            : state.fieldValue;
         return {
           isError: false,
           text: JSON.stringify({
@@ -743,6 +1014,10 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
       }
       if (title === "Execute prepared Chrome fill") {
         const scopedFillMode = code.includes("const __twScopeLinks =");
+        const placeholderFillMode = code.includes("__twPlaceholderRoleLocator");
+        const nativePasswordFill = code.includes("const __twNativePasswordFill = true;");
+        const nativePasswordBindingMatch = code.match(/const __twPreparedNativePasswordBinding = (\{[^\r\n]+\}|null);/);
+        const nativePasswordBinding = nativePasswordBindingMatch ? JSON.parse(nativePasswordBindingMatch[1]) : null;
         assert.match(code, /getByRole/);
         if (scopedFillMode) {
           assert.match(code, /__twScopeLinks\.evaluateAll/);
@@ -750,7 +1025,7 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
           assert.match(code, /TOOLWIRE_BROWSER_SCOPE_TARGET_COUNT/);
           if (state.scopeLinkCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_SCOPE_LINK_COUNT:" + state.scopeLinkCount };
           if (state.scopedTargetCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_SCOPE_TARGET_COUNT:3:" + state.scopedTargetCount };
-        } else {
+        } else if (!placeholderFillMode) {
           assert.match(code, /exact: true/);
         }
         assert.match(code, /\.fill\(/);
@@ -770,10 +1045,14 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
         assert.match(code, /inlineTags/);
         assert.match(code, /\.innerText\(\{ timeoutMs: 1000 \}\)/);
         assert.match(code, /\.textContent\(\{ timeoutMs: 1000 \}\)/);
-        assert.match(code, /__twExactRoleMatches > 1/);
-        assert.match(code, /querySelectorAll\('input, textarea, \[contenteditable\]/);
-        assert.match(code, /depth <= 3/);
-        assert.match(code, /local-editor-exact/);
+        assert.match(code, /__twResolveBoundEditableLocator/);
+        assert.match(code, /locator\('input, textarea, \[contenteditable\]'\)/);
+        assert.match(code, /TOOLWIRE_BROWSER_FILL_TARGET_CHANGED/);
+        assert.match(code, /editableSource/);
+        assert.match(code, /editableKind/);
+        assert.doesNotMatch(code, /same-role-visible-target/);
+        assert.doesNotMatch(code, /local-editor-exact/);
+        assert.doesNotMatch(code, /depth <= 3/);
         assert.match(code, /__twResolveFreshTarget/);
         assert.match(code, /__twVerifyFreshTarget/);
         assert.match(code, /activation-only-empty/);
@@ -789,7 +1068,19 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
         assert.match(code, /TOOLWIRE_BROWSER_FILL_RESULT_UNCERTAIN/);
         assert.match(code, /cleanupBrowserClaim\(__twBrowser, __twTab\)/);
         if (state.pageChanged) return { isError: true, text: "TOOLWIRE_BROWSER_ACTION_URL_CHANGED" };
-        if (!scopedFillMode && state.locatorCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_COUNT:" + state.locatorCount };
+        const nativePasswordEligibleCount = placeholderFillMode && state.fillNativePasswordVisible && state.fillNativePasswordEnabled
+          ? state.fillNativePasswordCount
+          : 0;
+        const placeholderResolvedCount = state.fillRoleBoundCount !== 0 ? state.fillRoleBoundCount : nativePasswordEligibleCount;
+        if (placeholderFillMode && placeholderResolvedCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_COUNT:" + placeholderResolvedCount };
+        if (!scopedFillMode && !placeholderFillMode && state.locatorCount !== 1) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_COUNT:" + state.locatorCount };
+        if (Number.isInteger(state.fillEditableErrorCount)) return { isError: true, text: "TOOLWIRE_BROWSER_FILL_EDITABLE_COUNT:" + state.fillEditableErrorCount };
+        if (state.fillTargetChanged) return { isError: true, text: "TOOLWIRE_BROWSER_FILL_TARGET_CHANGED" };
+        if (nativePasswordFill && (
+          state.fillTargetMeta?.tag !== nativePasswordBinding?.tag
+          || state.fillTargetMeta?.inputType !== nativePasswordBinding?.type
+          || state.fillTargetMeta?.placeholder !== nativePasswordBinding?.placeholder
+        )) return { isError: true, text: "TOOLWIRE_BROWSER_FILL_TARGET_CHANGED" };
         if (!state.locatorVisible) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_NOT_VISIBLE" };
         if (!state.locatorEnabled) return { isError: true, text: "TOOLWIRE_BROWSER_LOCATOR_NOT_ENABLED" };
         if (state.fillUncertain) return { isError: true, text: "TOOLWIRE_BROWSER_FILL_RESULT_UNCERTAIN:timeout after input event" };
@@ -798,11 +1089,13 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
         assert.ok(textMatch, "fill body must bind a JSON string literal");
         const targetText = JSON.parse(textMatch[1]);
         const clearRequested = targetText === "";
-        const beforeValue = typeof state.fieldRenderedText === "string"
-          && /^\s*$/.test(state.fieldValue)
-          && !/^\s*$/.test(state.fieldRenderedText)
-          ? state.fieldRenderedText
-          : state.fieldValue;
+        const beforeValue = nativePasswordFill
+          ? null
+          : typeof state.fieldRenderedText === "string"
+            && /^\s*$/.test(state.fieldValue)
+            && !/^\s*$/.test(state.fieldRenderedText)
+            ? state.fieldRenderedText
+            : state.fieldValue;
         if (state.fillNotApplied) {
           state.fills += 1;
           return { isError: true, text: "TOOLWIRE_BROWSER_FILL_NOT_APPLIED:fresh bound target remained empty after the bounded fill attempt" };
@@ -862,10 +1155,13 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
             beforeUrl: state.tabs[0].url,
             afterUrl: state.tabs[0].url,
             afterTitle: state.tabs[0].title,
-            beforeValue,
-            afterValue,
-            verificationSource: typeof state.fieldRenderedText === "string" ? "fresh-target-rendered-text" : state.fillVerificationSource,
-            snapshot: typeof state.fieldRenderedText === "string" ? `FIELD_RENDERED=${state.fieldRenderedText}` : `FIELD=${state.fieldValue}`,
+            ...(nativePasswordFill ? {} : { beforeValue, afterValue }),
+            verificationSource: nativePasswordFill
+              ? "fresh-native-password-binding"
+              : typeof state.fieldRenderedText === "string" ? "fresh-target-rendered-text" : state.fillVerificationSource,
+            ...(nativePasswordFill
+              ? {}
+              : { snapshot: typeof state.fieldRenderedText === "string" ? `FIELD_RENDERED=${state.fieldRenderedText}` : `FIELD=${state.fieldValue}` }),
             ...state.cleanupReceipt,
           }),
         };
@@ -982,6 +1278,7 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
         const exactTextMode = code.includes("playwright.getByText(");
         const scopedRoleMode = code.includes("const __twScopeLinks =");
         const localRadioMode = code.includes("__twDispatchLocator.check(");
+        const rightClickMode = code.includes('button: "right"');
         if (exactTextMode) {
           assert.match(code, /getByText/);
           assert.match(code, /__twRawTextLocator\.all\(\)/);
@@ -1006,6 +1303,8 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
           assert.match(code, /input\[type="radio"\]:not\(:disabled\)/);
           assert.match(code, /__twDispatchLocator\.check\(\{ timeoutMs: 5000 \}\)/);
           assert.match(code, /__twDispatchLocator\.isChecked\(\)/);
+        } else if (rightClickMode) {
+          assert.match(code, /__twDispatchLocator\.click\(\{ button: "right", timeoutMs: 5000 \}\)/);
         } else {
           assert.match(code, /__twDispatchLocator\.click\(\{ timeoutMs: 5000 \}\)/);
         }
@@ -1047,10 +1346,114 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
           }),
         };
       }
+      if (title === "Discover current Browser WebMCP tools") {
+        assert.match(code, /capabilities\.get\("webmcp"\)/);
+        assert.match(code, /fetchTools\(\)/);
+        assert.match(code, /__codexlessWebMcpHandles\.set/);
+        assert.match(code, /cleanupBrowserClaim\(__twBrowser, __twTab\)/);
+        assert.ok(
+          code.indexOf("cleanupBrowserClaim(__twBrowser, __twTab)") < code.indexOf("__codexlessWebMcpHandles.set"),
+          "discover must not commit the durable node-side handle before claim cleanup completes"
+        );
+        state.webMcpFetches += 1;
+        if (typeof state.webMcpDiscoverErrorText === "string") {
+          return { isError: true, text: state.webMcpDiscoverErrorText };
+        }
+        return {
+          isError: false,
+          text: JSON.stringify({
+            title: state.tabs[0].title,
+            url: state.tabs[0].url,
+            lastOpened: state.tabs[0].lastOpened,
+            description: state.webMcpDescription,
+            descriptionBytes: Buffer.byteLength(state.webMcpDescription, "utf8"),
+            ...state.cleanupReceipt,
+          }),
+        };
+      }
+      if (title === "Discard current Browser WebMCP handle") {
+        assert.match(code, /__codexlessWebMcpHandles\?\.delete/);
+        state.webMcpDrops += 1;
+        return { isError: false, text: JSON.stringify({ discarded: true }) };
+      }
+      if (title === "Call current Browser WebMCP tool") {
+        assert.match(code, /__codexlessWebMcpHandles\?\.get/);
+        assert.match(code, /\.tools\.call\(/);
+        assert.match(code, /__codexlessWebMcpHandles\.delete/);
+        assert.ok(
+          code.indexOf("__codexlessWebMcpHandles.delete") < code.indexOf(".tools.call("),
+          "dispatch attempt must consume the node-side handle before calling the page-defined tool"
+        );
+        assert.doesNotMatch(code, /fetchTools\(\)/);
+        assert.doesNotMatch(code, /registration_id\s*:/);
+        state.webMcpCalls += 1;
+        if (typeof state.webMcpCallErrorText === "string") {
+          return { isError: true, text: state.webMcpCallErrorText };
+        }
+        const resultJson = JSON.stringify(state.webMcpResult);
+        return {
+          isError: false,
+          text: JSON.stringify({
+            result: state.webMcpResult,
+            resultOmitted: false,
+            resultBytes: Buffer.byteLength(resultJson, "utf8"),
+            ...state.cleanupReceipt,
+          }),
+        };
+      }
       if (code.includes("browsers.list")) {
         return {
           isError: false,
           text: JSON.stringify(state.browserBackends),
+        };
+      }
+      if (title === "Discover opaque Browser elements" || title === "Prepare opaque Browser element action") {
+        assert.match(code, /user\.claimTab\(/);
+        assert.match(code, /dom_cua\.get_visible_dom\(\)/);
+        assert.match(code, /cleanupBrowserClaim\(__twBrowser, __twTab\)/);
+        assert.doesNotMatch(code, /dom_cua\.(?:click|double_click)\(/, "opaque element discovery/preparation must not dispatch an action");
+        state.elementVisibleDomReads += 1;
+        return {
+          isError: false,
+          text: JSON.stringify({
+            title: state.tabs[0].title,
+            url: state.tabs[0].url,
+            visibleDom: state.visibleDom,
+            ...state.cleanupReceipt,
+          }),
+        };
+      }
+      if (title === "Execute opaque Browser element action") {
+        assert.match(code, /user\.claimTab\(/);
+        assert.match(code, /dom_cua\.get_visible_dom\(\)/);
+        assert.match(code, /const __twExpectedNodeId = /);
+        assert.match(code, /const __twFingerprint = __twCreateHash\("sha256"\)/);
+        assert.match(code, /TOOLWIRE_BROWSER_ELEMENT_STALE/);
+        assert.match(code, /TOOLWIRE_BROWSER_ELEMENT_TARGET_CHANGED/);
+        assert.match(code, /TOOLWIRE_BROWSER_CLICK_RESULT_UNCERTAIN/);
+        assert.match(code, /cleanupBrowserClaim\(__twBrowser, __twTab\)/);
+        const nodeMatch = code.match(/const __twExpectedNodeId = ("(?:[^"\\]|\\.)*");/);
+        assert.ok(nodeMatch, "opaque action must bind the server-held stock node id only inside execution code");
+        const rawNodeId = JSON.parse(nodeMatch[1]);
+        const actionMatch = code.match(/if \(("(?:click|double_click)") === "click"\)/);
+        assert.ok(actionMatch, "opaque action must bind one reviewed action literal before dispatch");
+        const action = JSON.parse(actionMatch[1]);
+        if (!state.visibleDom.includes(`node_id=${rawNodeId}`) && !state.visibleDom.includes(`node_id="${rawNodeId}"`)) {
+          return { isError: true, text: "TOOLWIRE_BROWSER_ELEMENT_STALE" };
+        }
+        state.elementVisibleDomReads += 1;
+        if (action === "double_click") state.elementDoubleClicks += 1;
+        else state.elementClicks += 1;
+        if (state.elementActionUncertain) return { isError: true, text: "TOOLWIRE_BROWSER_CLICK_RESULT_UNCERTAIN:simulated lost stock action receipt" };
+        return {
+          isError: false,
+          text: JSON.stringify({
+            beforeUrl: state.tabs[0].url,
+            afterUrl: state.tabs[0].url,
+            afterTitle: state.tabs[0].title,
+            action,
+            ...state.cleanupReceipt,
+          }),
         };
       }
       if (code.includes("domSnapshot")) {
@@ -1059,17 +1462,26 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
         if (state.scrollReadbackFailure && state.scrolls > 0) {
           return { isError: true, text: "simulated post-scroll DOM readback failure" };
         }
+        const rawSnapshot = typeof state.domSnapshotOverride === "string"
+          ? state.domSnapshotOverride
+          : typeof state.fieldRenderedText === "string"
+            ? `FIELD_RENDERED=${state.fieldRenderedText}`
+            : state.lastScrollDelta == null
+              ? "A".repeat(2500)
+              : `SCROLLED=${state.lastScrollDelta}`;
+        let snapshot = rawSnapshot;
+        if (code.includes("sanitizeBrowserDomSnapshot")) {
+          assert.match(code, /input\[type="password"\], \[role="password"\]/);
+          assert.match(code, /filter\(\{ visible: true \}\)/);
+          snapshot = sanitizePasswordDomSnapshot(rawSnapshot, state.passwordSnapshotDescriptors).snapshot;
+        }
         return {
           isError: false,
           text: JSON.stringify({
             title: state.tabs[0].title,
             url: state.tabs[0].url,
             lastOpened: state.tabs[0].lastOpened,
-            snapshot: typeof state.fieldRenderedText === "string"
-              ? `FIELD_RENDERED=${state.fieldRenderedText}`
-              : state.lastScrollDelta == null
-                ? "A".repeat(2500)
-                : `SCROLLED=${state.lastScrollDelta}`,
+            snapshot,
             ...state.cleanupReceipt,
           }),
         };
@@ -1084,6 +1496,84 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
     },
   };
 }
+
+test("Browser executor integrates stock visible-DOM identity behind opaque element refs for click and double-click", async () => {
+  const workbench = makeWorkbench();
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const tabRef = listed.tabs[0].tabRef;
+
+  const discovered = await browser.discoverElements({ tabRef });
+  assert.equal(discovered.count, 2);
+  assert.equal(discovered.elements[0].descriptor.name, "Compose");
+  assert.equal(discovered.elements[1].descriptor.name, "Compose");
+  assert.notEqual(discovered.elements[0].elementRef, discovered.elements[1].elementRef);
+  assert.equal(JSON.stringify(discovered).includes('"17"'), false, "public opaque discovery must not leak raw stock node ids");
+  assert.equal(JSON.stringify(discovered).includes('"23"'), false, "public opaque discovery must not leak repeated-target raw stock ids");
+
+  const prepared = await browser.prepareElementAction({
+    tabRef,
+    elementRef: discovered.elements[0].elementRef,
+    action: "click",
+  });
+  assert.equal(prepared.action.kind, "click");
+  assert.equal(prepared.action.elementRef, discovered.elements[0].elementRef);
+  assert.equal(JSON.stringify(prepared).includes('"17"'), false, "prepared public receipt must keep stock node id server-side");
+  const clicked = await browser.elementAction({ actionApprovalRef: prepared.actionApprovalRef });
+  assert.equal(clicked.status, "clicked");
+  assert.equal(workbench.state.elementClicks, 1);
+  assert.equal(workbench.state.elementDoubleClicks, 0);
+
+  const refreshed = await browser.discoverElements({ tabRef });
+  await assert.rejects(
+    () => browser.prepareElementAction({ tabRef, elementRef: discovered.elements[0].elementRef, action: "click" }),
+    (error) => error.code === "BROWSER_ELEMENT_REF_UNKNOWN"
+  );
+  const preparedDouble = await browser.prepareElementAction({
+    tabRef,
+    elementRef: refreshed.elements[1].elementRef,
+    action: "double_click",
+  });
+  const doubled = await browser.elementAction({ actionApprovalRef: preparedDouble.actionApprovalRef });
+  assert.equal(doubled.status, "double_clicked");
+  assert.equal(workbench.state.elementDoubleClicks, 1);
+
+  await assert.rejects(
+    () => browser.prepareElementAction({ tabRef, rawNodeId: "17", action: "click" }),
+    (error) => error.code === "BROWSER_ELEMENT_REF_REQUIRED"
+  );
+});
+
+test("Browser opaque element execution revalidates fresh node state and never replays an uncertain dispatch", async () => {
+  const workbench = makeWorkbench();
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const tabRef = listed.tabs[0].tabRef;
+
+  let discovered = await browser.discoverElements({ tabRef });
+  let prepared = await browser.prepareElementAction({ tabRef, elementRef: discovered.elements[0].elementRef, action: "click" });
+  workbench.state.visibleDom = '<button node_id=99 role="button" aria-label="Compose">Compose</button>';
+  await assert.rejects(
+    () => browser.elementAction({ actionApprovalRef: prepared.actionApprovalRef }),
+    (error) => error.code === "BROWSER_ELEMENT_STALE"
+  );
+  assert.equal(workbench.state.elementClicks, 0, "stale target must fail before dispatch");
+
+  workbench.state.visibleDom = '<button node_id=17 role="button" aria-label="Compose">Compose</button>';
+  discovered = await browser.discoverElements({ tabRef });
+  prepared = await browser.prepareElementAction({ tabRef, elementRef: discovered.elements[0].elementRef, action: "click" });
+  workbench.state.elementActionUncertain = true;
+  await assert.rejects(
+    () => browser.elementAction({ actionApprovalRef: prepared.actionApprovalRef }),
+    (error) => error.code === "BROWSER_CLICK_RESULT_UNCERTAIN"
+  );
+  assert.equal(workbench.state.elementClicks, 1, "uncertain stock dispatch must be attempted exactly once");
+  await assert.rejects(
+    () => browser.elementAction({ actionApprovalRef: prepared.actionApprovalRef }),
+    (error) => error.code === "BROWSER_ACTION_REF_EXPIRED"
+  );
+  assert.equal(workbench.state.elementClicks, 1, "consumed opaque action ref must never replay the uncertain dispatch");
+});
 
 test("Browser origin permission diagnosis separates saved deny, network policy, generic permission, transport, and success", async () => {
   const workbench = makeWorkbench();
@@ -1184,11 +1674,11 @@ test("Browser origin permission diagnosis separates saved deny, network policy, 
   assert.equal(listed.tabs[0].url, "https://mail.example.test/inbox");
 });
 
-test("Browser finalize-absent existing-tab read reports turn-cleanup-unproven and bounded synthetic reclaim busy", async () => {
+test("Browser finalize-absent existing-tab read reports deferred turn-boundary release and same-turn reclaim stays busy", async () => {
   const workbench = makeWorkbench();
   workbench.state.cleanupReceipt = {
-    cleanupStatus: "unavailable",
-    cleanupReason: "turn-cleanup-unproven",
+    cleanupStatus: "deferred",
+    cleanupReason: "turn-boundary-auto-release",
     cleanupError: null,
   };
   workbench.state.simulateClaimLifecycle = true;
@@ -1197,8 +1687,8 @@ test("Browser finalize-absent existing-tab read reports turn-cleanup-unproven an
   const tabRef = listed.tabs[0].tabRef;
 
   const first = await browser.readTab({ tabRef });
-  assert.equal(first.cleanupStatus, "unavailable");
-  assert.equal(first.cleanupReason, "turn-cleanup-unproven");
+  assert.equal(first.cleanupStatus, "deferred");
+  assert.equal(first.cleanupReason, "turn-boundary-auto-release");
   assert.equal(first.cleanupError, null);
   assert.equal(workbench.state.syntheticClaimAttempts, 1);
 
@@ -1255,6 +1745,20 @@ test("Browser tool errors surface only bounded permission diagnostics", async ()
       };
       throw error;
     },
+    async click() {
+      const error = new Error("Browser node_repl discovery remained unavailable after one bounded pre-dispatch rediscovery attempt.");
+      error.code = "BROWSER_NODE_REPL_DISCOVERY_FAILED";
+      error.nextActions = ["Retry the same prepared actionApprovalRef after Browser/node_repl recovers."];
+      error.diagnostic = {
+        failureLayer: "pre_dispatch_discovery",
+        preDispatch: true,
+        safeToRetry: true,
+        internalRediscoveryAttempts: 1,
+        actionRefRetained: true,
+        rawProviderId: "must-not-leak",
+      };
+      throw error;
+    },
   };
   registerBrowserPreviewTools(server, browser);
   const result = await registered.get("codex.browser_tabs").handler({});
@@ -1265,6 +1769,78 @@ test("Browser tool errors surface only bounded permission diagnostics", async ()
     scope: "conversation",
     origin: "https://gaim1.xyz",
   });
+
+  const discoveryResult = await registered.get("codex.browser_click").handler({ actionApprovalRef: "browser_action_test" });
+  assert.equal(discoveryResult.isError, true);
+  assert.equal(discoveryResult.structuredContent?.errorCode, "BROWSER_NODE_REPL_DISCOVERY_FAILED");
+  assert.deepEqual(discoveryResult.structuredContent?.diagnostic, {
+    failureLayer: "pre_dispatch_discovery",
+    preDispatch: true,
+    safeToRetry: true,
+    actionRefRetained: true,
+    internalRediscoveryAttempts: 1,
+  });
+  assert.equal(Object.hasOwn(discoveryResult.structuredContent?.diagnostic ?? {}, "rawProviderId"), false);
+});
+
+test("Browser family-aware existing-tab tools expose family-neutral public titles and descriptions", () => {
+  const registered = new Map();
+  const server = {
+    registerTool(name, definition, handler) {
+      registered.set(name, { definition, handler });
+    },
+  };
+  registerBrowserPreviewTools(server, {});
+  const familyAwareTools = [
+    "codex.browser_read", "codex.browser_screenshot",
+    "codex.browser_discover_elements", "codex.browser_prepare_element_action", "codex.browser_element_action",
+    "codex.browser_prepare_close_tab", "codex.browser_close_tab",
+    "codex.browser_prepare_bulk_close_tabs", "codex.browser_bulk_close_tabs",
+    "codex.browser_scroll", "codex.browser_keypress",
+    "codex.browser_prepare_navigate", "codex.browser_navigate",
+    "codex.browser_prepare_click", "codex.browser_click",
+    "codex.browser_prepare_download", "codex.browser_download",
+    "codex.browser_prepare_upload", "codex.browser_upload",
+    "codex.browser_prepare_fill", "codex.browser_fill",
+  ];
+  for (const name of familyAwareTools) {
+    const definition = registered.get(name)?.definition;
+    assert.ok(definition, `${name} must be registered`);
+    assert.doesNotMatch(definition.title ?? "", /Chrome/i, `${name} title must not advertise Chrome-only semantics`);
+    const description = definition.description ?? "";
+    assert.doesNotMatch(description, /existing Chrome tab|Chrome tabRef|previously prepared Chrome|existing Chrome textbox/i, `${name} description must not advertise Chrome-only existing-tab semantics`);
+  }
+  assert.doesNotMatch(registered.get("codex.browser_prepare_open_tab")?.definition?.title ?? "", /Chrome/i, "new-tab must be browser-family neutral once family is explicitly bound at prepare time");
+  assert.match(registered.get("codex.browser_model_route_probe")?.definition?.description ?? "", /Chrome/i, "model-route diagnostic remains truthfully Chrome-specific");
+});
+
+test("Browser opaque element public surface exposes only bounded refs and single-use prepared actions", () => {
+  const registered = new Map();
+  const server = { registerTool(name, definition, handler) { registered.set(name, { definition, handler }); } };
+  registerBrowserPreviewTools(server, {});
+  const discover = registered.get("codex.browser_discover_elements")?.definition;
+  const prepare = registered.get("codex.browser_prepare_element_action")?.definition;
+  const execute = registered.get("codex.browser_element_action")?.definition;
+  assert.ok(discover && prepare && execute);
+  assert.equal(discover.annotations?.readOnlyHint, true);
+  assert.equal(discover.inputSchema.safeParse({ tabRef: "browser_tab_test" }).success, true);
+  assert.equal(discover.inputSchema.safeParse({ tabRef: "browser_tab_test", maxNodes: 256 }).success, true);
+  assert.equal(discover.inputSchema.safeParse({ tabRef: "browser_tab_test", maxNodes: 257 }).success, false);
+  for (const forbidden of ["nodeId", "providerTabId", "selector", "index", "x", "y", "javascript"]) {
+    assert.equal(discover.inputSchema.safeParse({ tabRef: "browser_tab_test", [forbidden]: "raw" }).success, false, `${forbidden} must not enter discovery authority`);
+  }
+  assert.equal(prepare.annotations?.readOnlyHint, true);
+  assert.equal(prepare.inputSchema.safeParse({ tabRef: "browser_tab_test", elementRef: "browser_element_test", action: "click" }).success, true);
+  assert.equal(prepare.inputSchema.safeParse({ tabRef: "browser_tab_test", elementRef: "browser_element_test", action: "double_click" }).success, true);
+  assert.equal(prepare.inputSchema.safeParse({ tabRef: "browser_tab_test", elementRef: "browser_element_test", action: "fill" }).success, false);
+  assert.equal(prepare.inputSchema.safeParse({ tabRef: "browser_tab_test", elementRef: "browser_element_test", action: "click", nodeId: "42" }).success, false);
+  assert.equal(execute.annotations?.destructiveHint, true);
+  assert.deepEqual(Object.keys(execute.inputSchema.shape), ["actionApprovalRef"]);
+  assert.equal(execute.inputSchema.safeParse({ actionApprovalRef: "browser_action_test" }).success, true);
+  assert.equal(execute.inputSchema.safeParse({ actionApprovalRef: "browser_action_test", elementRef: "browser_element_test" }).success, false);
+  assert.match(discover.description ?? "", /fallback/i);
+  assert.match(prepare.description ?? "", /not evidence of user approval/i);
+  assert.match(execute.description ?? "", /never auto-replayed/i);
 });
 
 test("Browser prepare-click schema exposes only narrow role/name or exact-text targets", () => {
@@ -1281,12 +1857,125 @@ test("Browser prepare-click schema exposes only narrow role/name or exact-text t
   assert.equal(schema.safeParse({ tabRef: "browser_tab_test", role: "button", name: "Refresh" }).success, true);
   assert.equal(schema.safeParse({ tabRef: "browser_tab_test", role: "button", name: "Reply", scopeUrl: "https://www.reddit.com/r/codex/comments/example/comment/abc123/" }).success, true);
   assert.equal(schema.safeParse({ tabRef: "browser_tab_test", text: "Clickable card title" }).success, true);
+  assert.equal(schema.safeParse({ tabRef: "browser_tab_test", role: "button", name: "Refresh", button: "right" }).success, true);
+  assert.equal(schema.safeParse({ tabRef: "browser_tab_test", role: "button", name: "Refresh", button: "middle" }).success, false);
   assert.equal(schema.safeParse({ tabRef: "browser_tab_test", text: "Clickable card title", selector: ".thread-card" }).success, false);
+  assert.equal(schema.safeParse({ tabRef: "browser_tab_test", text: "Clickable card title", id: "sendPasswordButton" }).success, false);
+  assert.equal(schema.safeParse({ tabRef: "browser_tab_test", text: "Clickable card title", javascript: "document.getElementById('sendPasswordButton').click()" }).success, false);
+  assert.equal(schema.safeParse({ tabRef: "browser_tab_test", text: "Clickable card title", x: 100, y: 200 }).success, false);
   assert.equal(schema.safeParse({ tabRef: "browser_tab_test", role: "button", name: "Reply", scopeUrl: "https://example.test", nodeId: "comment-1" }).success, false);
   assert.equal(schema.safeParse({ tabRef: "browser_tab_test", text: "Clickable card title", url: "https://example.test" }).success, false);
   assert.match(prepareClick.description ?? "", /exact visible text/i);
   assert.match(prepareClick.description ?? "", /scopeUrl/i);
+  assert.match(prepareClick.description ?? "", /left or right click/i);
   assert.match(prepareClick.description ?? "", /no CSS selector\/JavaScript\/coordinates\/node ids\/item indexes\/ancestor depth/i);
+});
+
+test("Browser model-route probe is a narrow household diagnostic surface", () => {
+  const registered = new Map();
+  const server = { registerTool(name, definition, handler) { registered.set(name, { definition, handler }); } };
+  registerBrowserPreviewTools(server, {});
+  const probe = registered.get("codex.browser_model_route_probe")?.definition;
+  assert.ok(probe, "browser_model_route_probe must be registered");
+  assert.equal(probe.inputSchema.safeParse({ tabRef: "browser_tab_test" }).success, true);
+  assert.equal(probe.inputSchema.safeParse({ tabRef: "browser_tab_test", rawCdpMethod: "Network.getAllCookies" }).success, false);
+  assert.deepEqual(Object.keys(probe.inputSchema.shape), ["tabRef", "cwd"]);
+  assert.equal(probe.annotations?.readOnlyHint, false, "the probe submits one fixed Web verification message");
+  assert.equal(probe.annotations?.idempotentHint, false, "the probe must never be auto-replayed after possible submission");
+  assert.match(probe.description ?? "", /request may originate from any normal client or Main Road entry/i);
+  assert.match(probe.description ?? "", /healthy Chrome Browser extension\/backend/i);
+  assert.match(probe.description ?? "", /usable ChatGPT login state/i);
+  assert.match(probe.description ?? "", /only two product modes/i);
+  assert.match(probe.description ?? "", /current\/opened ChatGPT Web conversation/i);
+  assert.match(probe.description ?? "", /Temporary vs normal and project vs non-project/i);
+  assert.match(probe.description ?? "", /Do not attempt brittle automatic reconstruction/i);
+  assert.match(probe.description ?? "", /你现在是什么模型？/i);
+  assert.match(probe.description ?? "", /does not expose raw CDP/i);
+  assert.match(probe.description ?? "", /never auto-retries/i);
+  assert.match(probe.description ?? "", /short visually distinct evidence block/i);
+  assert.match(probe.description ?? "", /actual verified surface as Chat, Work, or unknown/i);
+  assert.match(probe.description ?? "", /do not bury the result or blocker inside a long paragraph/i);
+  assert.match(probe.description ?? "", /do not imitate the formal Codex approval\/result presentation/i);
+});
+
+test("Browser model-route probe accepts user-selected current and project Web chat surfaces but rejects non-chat pages", async () => {
+  for (const { url, expected } of [
+    { url: "https://chatgpt.com/c/current-conversation", expected: { temporaryChat: false, projectScoped: false, existingConversation: true, surfaceMode: "chat" } },
+    { url: "https://chatgpt.com/g/g-p-example-project/c/project-conversation", expected: { temporaryChat: false, projectScoped: true, existingConversation: true, surfaceMode: "chat" } },
+    { url: "https://chatgpt.com/?temporary-chat=true", expected: { temporaryChat: true, projectScoped: false, existingConversation: false, surfaceMode: "chat" } },
+  ]) {
+    const workbench = makeWorkbench();
+    workbench.state.tabs[0] = { ...workbench.state.tabs[0], title: "ChatGPT", url };
+    const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+    const listed = await browser.listTabs({});
+    const result = await browser.modelRouteProbe({ tabRef: listed.tabs[0].tabRef });
+    assert.equal(result.status, "ok");
+    assert.deepEqual(result.verificationContext, expected);
+    assert.equal(result.assistantClaim.text, "我是 GPT-5.6 Sol。");
+    assert.equal(result.fields.resolved_model_slug, "gpt-5-6-thinking");
+    assert.match(result.note, /current\/opened conversation or a newly opened chat/i);
+    assert.match(result.note, /not an already-completed phone turn/i);
+  }
+
+  const workbench = makeWorkbench();
+  workbench.state.tabs[0] = { ...workbench.state.tabs[0], title: "Settings", url: "https://chatgpt.com/settings" };
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  await assert.rejects(
+    () => browser.modelRouteProbe({ tabRef: listed.tabs[0].tabRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_MODEL_ROUTE_CHAT_SURFACE_REQUIRED");
+      assert.match(error.message, /user-selected ChatGPT Web chat surface/i);
+      return true;
+    }
+  );
+});
+
+test("Browser model-route probe rejects an Edge-bound tabRef before Chrome-specific dispatch", async () => {
+  const workbench = makeWorkbench({
+    browserBackends: [
+      { name: "Chrome", family: "chrome", type: "extension" },
+      { name: "Edge", family: "edge", type: "extension" },
+    ],
+  });
+  workbench.state.tabs[0] = {
+    ...workbench.state.tabs[0],
+    title: "ChatGPT",
+    url: "https://chatgpt.com/c/edge-bound-conversation",
+  };
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({ family: "edge" });
+  const callsBeforeProbe = workbench.calls.length;
+  await assert.rejects(
+    () => browser.modelRouteProbe({ tabRef: listed.tabs[0].tabRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_MODEL_ROUTE_FAMILY_DENIED");
+      assert.match(error.message, /Chrome-specific/i);
+      assert.match(error.nextActions.join(" "), /Chrome tabRef/i);
+      return true;
+    }
+  );
+  assert.equal(workbench.calls.length, callsBeforeProbe, "Edge rejection must happen before any model-route Browser dispatch");
+});
+
+test("Browser model-route probe reports a known ChatGPT login redirect as a prerequisite instead of a generic host failure", async () => {
+  const workbench = makeWorkbench();
+  workbench.state.tabs[0] = {
+    ...workbench.state.tabs[0],
+    title: "Sign in",
+    url: "https://auth.openai.com/log-in",
+  };
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  await assert.rejects(
+    () => browser.modelRouteProbe({ tabRef: listed.tabs[0].tabRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_MODEL_ROUTE_LOGIN_REQUIRED");
+      assert.match(error.message, /usable ChatGPT login state/i);
+      assert.match(error.nextActions.join(" "), /Sign in to ChatGPT once/i);
+      return true;
+    }
+  );
 });
 
 test("Browser prepared download schema stays semantic and destination-free", () => {
@@ -1304,7 +1993,7 @@ test("Browser prepared download schema stays semantic and destination-free", () 
   assert.deepEqual(Object.keys(download.inputSchema.shape), ["actionApprovalRef"]);
   assert.equal(prepareDownload.annotations?.readOnlyHint, true);
   assert.equal(download.annotations?.destructiveHint, true);
-  assert.match(download.description ?? "", /browser-managed local download path/i);
+  assert.match(download.description ?? "", /browser family's managed local download path/i);
   assert.match(download.description ?? "", /never opens, parses, executes, uploads, or trusts/i);
 });
 
@@ -1350,8 +2039,44 @@ test("Browser close-tab schemas bind only an opaque tabRef at prepare time and o
   assert.equal(closeTab.annotations?.readOnlyHint, false);
   assert.equal(closeTab.annotations?.destructiveHint, true);
   assert.match(prepareClose.description ?? "", /unsaved page input|unsaved input/i);
-  assert.match(closeTab.description ?? "", /official Chrome Tab\.close\(\)/i);
+  assert.match(closeTab.description ?? "", /official Browser Tab\.close\(\)/i);
   assert.match(closeTab.description ?? "", /never auto-retries/i);
+});
+
+test("Browser emergency reset and exact-set bulk-close schemas stay administrator-bounded", () => {
+  const registered = new Map();
+  const server = { registerTool(name, definition, handler) { registered.set(name, { definition, handler }); } };
+  registerBrowserPreviewTools(server, {});
+  const reset = registered.get("codex.browser_emergency_reset")?.definition;
+  const prepareBulk = registered.get("codex.browser_prepare_bulk_close_tabs")?.definition;
+  const bulk = registered.get("codex.browser_bulk_close_tabs")?.definition;
+  assert.ok(reset);
+  assert.ok(prepareBulk);
+  assert.ok(bulk);
+  assert.deepEqual(Object.keys(reset.inputSchema.shape), ["cwd"]);
+  assert.equal(reset.inputSchema.safeParse({}).success, true);
+  assert.equal(reset.inputSchema.safeParse({ selector: "*" }).success, false);
+  assert.equal(reset.inputSchema.safeParse({ providerTabId: "raw" }).success, false);
+  assert.equal(reset.inputSchema.safeParse({ javascript: "location.reload()" }).success, false);
+  assert.equal(reset.annotations?.destructiveHint, true);
+  assert.match(reset.description ?? "", /never closes, navigates, reloads, clicks, fills, submits/i);
+  assert.match(reset.description ?? "", /mutation is still in flight/i);
+
+  assert.equal(prepareBulk.inputSchema.safeParse({ tabRefs: ["browser_tab_a", "browser_tab_b"] }).success, true);
+  assert.equal(prepareBulk.inputSchema.safeParse({ tabRefs: [] }).success, false);
+  assert.equal(prepareBulk.inputSchema.safeParse({ tabRefs: Array.from({ length: 101 }, (_, i) => `browser_tab_${i}`) }).success, false);
+  assert.equal(prepareBulk.inputSchema.safeParse({ tabRefs: ["browser_tab_a"], urlRegex: "reddit" }).success, false);
+  assert.equal(prepareBulk.inputSchema.safeParse({ tabRefs: ["browser_tab_a"], domain: "example.test" }).success, false);
+  assert.equal(prepareBulk.inputSchema.safeParse({ tabRefs: ["browser_tab_a"], providerTabId: "raw" }).success, false);
+  assert.equal(prepareBulk.inputSchema.safeParse({ tabRefs: ["browser_tab_a"], selector: ".tab" }).success, false);
+  assert.deepEqual(Object.keys(bulk.inputSchema.shape), ["actionApprovalRef"]);
+  assert.equal(bulk.inputSchema.safeParse({ actionApprovalRef: "browser_action_test" }).success, true);
+  assert.equal(bulk.inputSchema.safeParse({ actionApprovalRef: "browser_action_test", tabRefs: ["browser_tab_a"] }).success, false);
+  assert.equal(bulk.inputSchema.safeParse({ actionApprovalRef: "browser_action_test", x: 1, y: 2 }).success, false);
+  assert.equal(prepareBulk.annotations?.readOnlyHint, true);
+  assert.equal(bulk.annotations?.destructiveHint, true);
+  assert.match(prepareBulk.description ?? "", /exact set of 1\.\.100 opaque tabRef/i);
+  assert.match(bulk.description ?? "", /first drift, busy claim.*uncertain close.*stops immediately/i);
 });
 
 test("Browser navigation and placeholder-fill schemas stay narrow", () => {
@@ -1370,6 +2095,7 @@ test("Browser navigation and placeholder-fill schemas stay narrow", () => {
   const prepareNavigate = registered.get("codex.browser_prepare_navigate")?.definition;
   const navigate = registered.get("codex.browser_navigate")?.definition;
   const prepareFill = registered.get("codex.browser_prepare_fill")?.definition;
+  const fill = registered.get("codex.browser_fill")?.definition;
   assert.ok(prepareOpenTab);
   assert.ok(openTab);
   assert.ok(scroll);
@@ -1377,14 +2103,19 @@ test("Browser navigation and placeholder-fill schemas stay narrow", () => {
   assert.ok(prepareNavigate);
   assert.ok(navigate);
   assert.ok(prepareFill);
-  assert.equal(prepareOpenTab.inputSchema.safeParse({ url: "https://example.test/new" }).success, true);
-  assert.equal(prepareOpenTab.inputSchema.safeParse({ url: "https://example.test/new", tabRef: "browser_tab_test" }).success, false);
+  assert.ok(fill);
+  assert.equal(prepareOpenTab.inputSchema.safeParse({ family: "chrome", url: "https://example.test/new" }).success, true);
+  assert.equal(prepareOpenTab.inputSchema.safeParse({ family: "edge", url: "https://example.test/new" }).success, true);
+  assert.equal(prepareOpenTab.inputSchema.safeParse({ url: "https://example.test/new" }).success, false);
+  assert.equal(prepareOpenTab.inputSchema.safeParse({ family: "firefox", url: "https://example.test/new" }).success, false);
+  assert.equal(prepareOpenTab.inputSchema.safeParse({ family: "chrome", url: "https://example.test/new", tabRef: "browser_tab_test" }).success, false);
   assert.equal(openTab.inputSchema.safeParse({ actionApprovalRef: "browser_action_test" }).success, true);
   assert.equal(openTab.inputSchema.safeParse({ actionApprovalRef: "browser_action_test", url: "https://example.test" }).success, false);
   assert.equal(scroll.inputSchema.safeParse({ tabRef: "browser_tab_test", direction: "down", amount: "page" }).success, true);
   assert.equal(scroll.inputSchema.safeParse({ tabRef: "browser_tab_test", direction: "down", amount: "page", node_id: "n1" }).success, false);
   assert.equal(scroll.inputSchema.safeParse({ tabRef: "browser_tab_test", direction: "sideways" }).success, false);
   assert.match(prepareOpenTab.description ?? "", /explicit http\(s\) URL/i);
+  assert.match(prepareOpenTab.description ?? "", /explicitly choose family=chrome\|edge/i);
   assert.match(scroll.description ?? "", /no caller-supplied selectors, coordinates, node ids, or keys/i);
   assert.equal(keypress.inputSchema.safeParse({ tabRef: "browser_tab_test", key: "Enter" }).success, true);
   assert.equal(keypress.inputSchema.safeParse({ tabRef: "browser_tab_test", key: "Tab" }).success, true);
@@ -1402,6 +2133,13 @@ test("Browser navigation and placeholder-fill schemas stay narrow", () => {
   assert.equal(prepareFill.inputSchema.safeParse({ tabRef: "browser_tab_test", role: "textbox", placeholder: "Search Reddit", text: "x" }).success, true);
   assert.equal(prepareFill.inputSchema.safeParse({ tabRef: "browser_tab_test", role: "textbox", scopeUrl: "https://www.reddit.com/r/codex/comments/example/comment/abc123/", text: "x" }).success, true);
   assert.equal(prepareFill.inputSchema.safeParse({ tabRef: "browser_tab_test", role: "textbox", scopeUrl: "https://example.test", text: "x", nodeId: "editor-1" }).success, false);
+  assert.equal(prepareFill.inputSchema.safeParse({ tabRef: "browser_tab_test", role: "textbox", name: "Search", text: "x", selector: "textarea" }).success, false);
+  assert.equal(prepareFill.inputSchema.safeParse({ tabRef: "browser_tab_test", role: "textbox", placeholder: "パスワード", text: "x", type: "password" }).success, false);
+  assert.equal(prepareFill.inputSchema.safeParse({ tabRef: "browser_tab_test", role: "textbox", name: "Search", text: "x", javascript: "el.value='x'" }).success, false);
+  assert.equal(prepareFill.inputSchema.safeParse({ tabRef: "browser_tab_test", role: "textbox", name: "Search", text: "x", x: 100, y: 200 }).success, false);
+  assert.equal(prepareFill.inputSchema.safeParse({ tabRef: "browser_tab_test", role: "textbox", name: "Search", text: "x", arbitraryKey: true }).success, false);
+  assert.deepEqual(Object.keys(prepareFill.inputSchema.shape), ["tabRef", "role", "name", "placeholder", "scopeUrl", "text", "cwd"]);
+  assert.deepEqual(Object.keys(fill.inputSchema.shape), ["actionApprovalRef"]);
   assert.equal(Object.hasOwn(prepareFill.inputSchema.shape, "scopeUrl"), true);
   assert.equal(Object.hasOwn(prepareFill.inputSchema.shape, "selector"), false);
   assert.equal(Object.hasOwn(prepareFill.inputSchema.shape, "nodeId"), false);
@@ -1455,8 +2193,10 @@ test("Browser Preview injects nested Codex turn metadata and exposes opaque read
 
   const listed = await browser.listTabs({ cwd: "C:\\workspace" });
   assert.equal(listed.status, "ok");
+  assert.equal(listed.browser, "chrome");
   assert.equal(listed.count, 1);
   assert.match(listed.tabs[0].tabRef, /^browser_tab_/);
+  assert.equal(listed.tabs[0].family, "chrome");
   assert.equal(listed.tabs[0].title, "Inbox - Example Mail");
   assert.equal(Object.hasOwn(listed.tabs[0], "providerTabId"), false);
   assert.equal(JSON.stringify(listed).includes("browser-instance"), false);
@@ -1473,6 +2213,319 @@ test("Browser Preview injects nested Codex turn metadata and exposes opaque read
   const metas = workbench.calls.map((call) => call.meta["x-codex-turn-metadata"]);
   assert.equal(new Set(metas.map((meta) => meta.session_id)).size, 1, "browser session_id must stay stable per executor");
   assert.equal(new Set(metas.map((meta) => meta.turn_id)).size, metas.length, "browser turn_id must be unique per call");
+});
+
+test("Browser tab listing thin-projects the stock Edge family and keeps opaque refs family-bound", async () => {
+  const workbench = makeWorkbench({
+    browserBackends: [
+      { name: "Chrome", family: "chrome", type: "extension" },
+      { name: "Edge", family: "edge", type: "extension" },
+    ],
+  });
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+
+  const chrome = await browser.listTabs({ family: "chrome", cwd: "C:\\workspace" });
+  const edge = await browser.listTabs({ family: "edge", cwd: "C:\\workspace" });
+  assert.equal(chrome.browser, "chrome");
+  assert.equal(edge.browser, "edge");
+  assert.equal(chrome.tabs[0].family, "chrome");
+  assert.equal(edge.tabs[0].family, "edge");
+  assert.notEqual(chrome.tabs[0].tabRef, edge.tabs[0].tabRef, "same provider id across families must never share an opaque ref");
+
+  const edgeRead = await browser.readTab({ tabRef: edge.tabs[0].tabRef, cwd: "C:\\workspace", maxChars: 1000 });
+  assert.equal(edgeRead.status, "ok");
+  assert.equal(edgeRead.browser, "edge");
+  assert.equal(edgeRead.tab.family, "edge");
+  await assert.rejects(
+    () => browser.prepareBulkCloseTabs({ tabRefs: [chrome.tabs[0].tabRef, edge.tabs[0].tabRef], cwd: "C:\\workspace" }),
+    (error) => error?.code === "BROWSER_BULK_CLOSE_FAMILY_MIXED",
+    "one destructive prepared set must never mix Chrome and Edge opaque refs"
+  );
+
+  const browserGetCalls = workbench.calls
+    .filter((call) => call.arguments?.title === "List current Chrome tabs")
+    .map((call) => call.arguments.code);
+  assert.ok(browserGetCalls.some((code) => code.includes('browsers.get("chrome")')));
+  assert.ok(browserGetCalls.some((code) => code.includes('browsers.get("edge")')));
+
+  const preparedEdgeNavigate = await browser.prepareNavigate({
+    tabRef: edge.tabs[0].tabRef,
+    url: "https://mail.example.test/edge-next",
+    cwd: "C:\\workspace",
+  });
+  const prepareNavigateCode = [...workbench.calls]
+    .reverse()
+    .find((call) => call.arguments?.title === "Prepare exact Chrome navigation")?.arguments?.code ?? "";
+  assert.match(prepareNavigateCode, /browsers\.get\("edge"\)/, "an Edge opaque ref must prepare against the Edge family even when Chrome exposes the same provider id");
+  assert.doesNotMatch(prepareNavigateCode, /browsers\.get\("chrome"\)/, "Edge prepare must never cross-resolve the colliding provider id through Chrome");
+
+  const navigatedEdge = await browser.navigate({ actionApprovalRef: preparedEdgeNavigate.actionApprovalRef });
+  assert.equal(navigatedEdge.status, "navigated");
+  assert.equal(navigatedEdge.tab.family, "edge");
+  assert.equal(navigatedEdge.afterUrl, "https://mail.example.test/edge-next");
+  const executeNavigateCode = [...workbench.calls]
+    .reverse()
+    .find((call) => call.arguments?.title === "Execute prepared Chrome navigation")?.arguments?.code ?? "";
+  assert.match(executeNavigateCode, /browsers\.get\("edge"\)/, "prepared Edge operate dispatch must stay in the family sealed into the ref");
+  assert.doesNotMatch(executeNavigateCode, /browsers\.get\("chrome"\)/, "prepared Edge operate must not be misdirected to Chrome");
+});
+
+test("Browser WebMCP thin projection reuses one stock fetched handle and exposes no registration identity", async () => {
+  const workbench = makeWorkbench();
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({ cwd: "C:\\workspace" });
+
+  const discovered = await browser.discoverWebMcp({ tabRef: listed.tabs[0].tabRef, cwd: "C:\\workspace" });
+  assert.equal(discovered.status, "discovered");
+  assert.match(discovered.webMcpRef, /^browser_webmcp_/);
+  assert.equal(discovered.tab.tabRef, listed.tabs[0].tabRef);
+  assert.equal(discovered.description, "WebMCP tools available: save_note");
+  assert.equal(workbench.state.webMcpFetches, 1);
+  assert.equal(JSON.stringify(discovered).includes("providerTabId"), false);
+  assert.equal(JSON.stringify(discovered).includes("registration_id"), false);
+
+  const called = await browser.callWebMcp({
+    webMcpRef: discovered.webMcpRef,
+    toolName: "save_note",
+    input: { text: "hello" },
+  });
+  assert.equal(called.status, "called");
+  assert.equal(called.callConfirmed, true);
+  assert.deepEqual(called.result, { saved: true });
+  assert.equal(called.resultOmitted, false);
+  assert.equal(called.noAutomaticReplay, true);
+  assert.equal(workbench.state.webMcpFetches, 1, "call must use the fetched stock handle rather than refetching before dispatch");
+  assert.equal(workbench.state.webMcpCalls, 1);
+  await assert.rejects(
+    () => browser.callWebMcp({ webMcpRef: discovered.webMcpRef, toolName: "save_note", input: { text: "replay" } }),
+    (error) => error?.code === "BROWSER_WEBMCP_REF_UNKNOWN",
+    "a confirmed dispatch must consume the opaque ref so the same page-defined side effect cannot be replayed"
+  );
+
+  const callCode = workbench.calls.find((call) => call.arguments?.title === "Call current Browser WebMCP tool")?.arguments?.code ?? "";
+  assert.match(callCode, /__codexlessWebMcpHandles\?\.get/);
+  assert.match(callCode, /\.tools\.call\(/);
+  assert.doesNotMatch(callCode, /fetchTools\(\)/);
+  assert.doesNotMatch(callCode, /registration_id\s*:/);
+});
+
+test("Browser WebMCP fails closed on stale/page drift and makes ambiguous dispatch non-replayable", async () => {
+  const staleWorkbench = makeWorkbench();
+  const staleBrowser = new CodexBrowserExecutor({ workbench: staleWorkbench, defaultCwd: "C:\\workspace" });
+  const staleTabs = await staleBrowser.listTabs({ cwd: "C:\\workspace" });
+  const staleDiscovery = await staleBrowser.discoverWebMcp({ tabRef: staleTabs.tabs[0].tabRef, cwd: "C:\\workspace" });
+  staleWorkbench.state.webMcpCallErrorText = "TOOLWIRE_BROWSER_WEBMCP_HANDLE_STALE";
+  await assert.rejects(
+    () => staleBrowser.callWebMcp({ webMcpRef: staleDiscovery.webMcpRef, toolName: "save_note", input: { text: "one" } }),
+    (error) => error?.code === "BROWSER_WEBMCP_REF_STALE"
+  );
+  await assert.rejects(
+    () => staleBrowser.callWebMcp({ webMcpRef: staleDiscovery.webMcpRef, toolName: "save_note", input: { text: "one" } }),
+    (error) => error?.code === "BROWSER_WEBMCP_REF_UNKNOWN"
+  );
+
+  const driftWorkbench = makeWorkbench();
+  const driftBrowser = new CodexBrowserExecutor({ workbench: driftWorkbench, defaultCwd: "C:\\workspace" });
+  const driftTabs = await driftBrowser.listTabs({ cwd: "C:\\workspace" });
+  const driftDiscovery = await driftBrowser.discoverWebMcp({ tabRef: driftTabs.tabs[0].tabRef, cwd: "C:\\workspace" });
+  driftWorkbench.state.webMcpCallErrorText = "TOOLWIRE_BROWSER_WEBMCP_PAGE_CHANGED";
+  await assert.rejects(
+    () => driftBrowser.callWebMcp({ webMcpRef: driftDiscovery.webMcpRef, toolName: "save_note", input: { text: "two" } }),
+    (error) => error?.code === "BROWSER_WEBMCP_PAGE_CHANGED"
+  );
+
+  const notListedWorkbench = makeWorkbench();
+  const notListedBrowser = new CodexBrowserExecutor({ workbench: notListedWorkbench, defaultCwd: "C:\\workspace" });
+  const notListedTabs = await notListedBrowser.listTabs({ cwd: "C:\\workspace" });
+  const notListedDiscovery = await notListedBrowser.discoverWebMcp({ tabRef: notListedTabs.tabs[0].tabRef, cwd: "C:\\workspace" });
+  notListedWorkbench.state.webMcpCallErrorText = "TOOLWIRE_BROWSER_WEBMCP_TOOL_NOT_LISTED";
+  await assert.rejects(
+    () => notListedBrowser.callWebMcp({ webMcpRef: notListedDiscovery.webMcpRef, toolName: "not_listed", input: {} }),
+    (error) => error?.code === "BROWSER_WEBMCP_TOOL_NOT_LISTED"
+  );
+  notListedWorkbench.state.webMcpCallErrorText = null;
+  const corrected = await notListedBrowser.callWebMcp({
+    webMcpRef: notListedDiscovery.webMcpRef,
+    toolName: "save_note",
+    input: { text: "corrected" },
+  });
+  assert.equal(corrected.status, "called", "definitive pre-dispatch tool-not-listed must leave a current fetched handle reusable");
+
+  const uncertainWorkbench = makeWorkbench();
+  const uncertainBrowser = new CodexBrowserExecutor({ workbench: uncertainWorkbench, defaultCwd: "C:\\workspace" });
+  const uncertainTabs = await uncertainBrowser.listTabs({ cwd: "C:\\workspace" });
+  const uncertainDiscovery = await uncertainBrowser.discoverWebMcp({ tabRef: uncertainTabs.tabs[0].tabRef, cwd: "C:\\workspace" });
+  uncertainWorkbench.state.webMcpCallErrorText = "simulated transport loss after WebMCP dispatch";
+  await assert.rejects(
+    () => uncertainBrowser.callWebMcp({ webMcpRef: uncertainDiscovery.webMcpRef, toolName: "save_note", input: { text: "three" } }),
+    (error) => error?.code === "BROWSER_WEBMCP_CALL_RESULT_UNCERTAIN"
+  );
+  await assert.rejects(
+    () => uncertainBrowser.callWebMcp({ webMcpRef: uncertainDiscovery.webMcpRef, toolName: "save_note", input: { text: "three" } }),
+    (error) => error?.code === "BROWSER_WEBMCP_REF_UNKNOWN",
+    "an uncertain dispatch must poison the same opaque ref mechanically, not only by guidance text"
+  );
+});
+
+test("Browser WebMCP discovery failure explicitly drops any node-side handle that may have been committed before the response failed", async () => {
+  const workbench = makeWorkbench();
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({ cwd: "C:\\workspace" });
+  workbench.state.webMcpDiscoverErrorText = "simulated discovery response failure after node-side handle commit";
+
+  await assert.rejects(
+    () => browser.discoverWebMcp({ tabRef: listed.tabs[0].tabRef, cwd: "C:\\workspace" })
+  );
+  assert.equal(workbench.state.webMcpFetches, 1);
+  assert.equal(workbench.state.webMcpDrops, 1, "failed discovery must run the explicit node-side handle discard path");
+});
+
+test("Browser WebMCP tool schemas keep upstream registration and execute-time tab identity server-side", () => {
+  const registered = new Map();
+  registerBrowserPreviewTools({
+    registerTool(name, definition, handler) {
+      registered.set(name, { definition, handler });
+    },
+  }, {});
+  const discover = registered.get("codex.browser_webmcp_discover")?.definition;
+  const call = registered.get("codex.browser_webmcp_call")?.definition;
+  assert.ok(discover);
+  assert.ok(call);
+  assert.deepEqual(Object.keys(discover.inputSchema.shape).sort(), ["cwd", "tabRef"]);
+  assert.deepEqual(Object.keys(call.inputSchema.shape).sort(), ["input", "timeoutMs", "toolName", "webMcpRef"]);
+  for (const forbidden of ["registrationId", "registration_id", "providerTabId", "tabRef", "url", "selector", "browserId", "family"]) {
+    assert.equal(Object.hasOwn(call.inputSchema.shape, forbidden), false, `call schema must not expose ${forbidden}`);
+  }
+  assert.equal(discover.annotations?.readOnlyHint, true);
+  assert.equal(call.annotations?.idempotentHint, false);
+  assert.match(discover.description ?? "", /stock Codex Browser/i);
+  assert.match(call.description ?? "", /registration IDs/i);
+});
+
+test("Browser WebMCP follows the server-bound Edge family and accepts no execute-time family selector", async () => {
+  const workbench = makeWorkbench({
+    browserBackends: [
+      { name: "Chrome", family: "chrome", type: "extension" },
+      { name: "Edge", family: "edge", type: "extension" },
+    ],
+  });
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const edge = await browser.listTabs({ family: "edge", cwd: "C:\\workspace" });
+  const discovered = await browser.discoverWebMcp({ tabRef: edge.tabs[0].tabRef, cwd: "C:\\workspace" });
+  assert.equal(discovered.browser, "edge");
+  assert.equal(discovered.tab.family, "edge");
+
+  const discoverCode = [...workbench.calls]
+    .reverse()
+    .find((call) => call.arguments?.title === "Discover current Browser WebMCP tools")?.arguments?.code ?? "";
+  assert.match(discoverCode, /browsers\.get\("edge"\)/);
+  assert.doesNotMatch(discoverCode, /browsers\.get\("chrome"\)/);
+
+  const called = await browser.callWebMcp({
+    webMcpRef: discovered.webMcpRef,
+    toolName: "save_note",
+    input: { text: "edge-bound" },
+  });
+  assert.equal(called.status, "called");
+  assert.equal(called.browser, "edge");
+  const callCode = [...workbench.calls]
+    .reverse()
+    .find((call) => call.arguments?.title === "Call current Browser WebMCP tool")?.arguments?.code ?? "";
+  assert.match(callCode, /browsers\.get\("edge"\)/);
+  assert.doesNotMatch(callCode, /browsers\.get\("chrome"\)/);
+});
+
+test("Browser password snapshot sanitizer redacts password nodes while preserving ordinary textbox/searchbox content and targeting metadata", () => {
+  const rawSnapshot = [
+    '- textbox "Account password" [ref=e10]: fixture-secret-one',
+    '- textbox "Password field" [ref=e11]:',
+    '  - /placeholder: "Password"',
+    '  - text: fixture-secret-two',
+    '- password "Legacy password role" [ref=e12]: fixture-secret-three',
+    '- textbox "Search" [ref=e13]: ordinary-visible-query',
+    '- searchbox "Lookup" [ref=e14]: ordinary-search-value',
+  ].join("\n");
+  const sanitized = sanitizePasswordDomSnapshot(rawSnapshot, [
+    { type: "password", role: "", candidateNames: ["Account password"] },
+    { type: "password", role: "", candidateNames: ["Password"] },
+    { type: "", role: "password", candidateNames: ["Legacy password role"] },
+  ]);
+
+  assert.equal(sanitized.redactedNodeCount, 3);
+  assert.doesNotMatch(sanitized.snapshot, /fixture-secret-(?:one|two|three)/);
+  assert.match(sanitized.snapshot, /textbox "Account password" \[ref=e10\]: \[PASSWORD_REDACTED\]/);
+  assert.match(sanitized.snapshot, /\/placeholder: "Password"/);
+  assert.match(sanitized.snapshot, /textbox "Password field" \[ref=e11\]:\n  - \/placeholder: "Password"\n  - text: \[PASSWORD_REDACTED\]/);
+  assert.match(sanitized.snapshot, /textbox "Search" \[ref=e13\]: ordinary-visible-query/);
+  assert.match(sanitized.snapshot, /searchbox "Lookup" \[ref=e14\]: ordinary-search-value/);
+});
+
+test("Browser password snapshot sanitizer binds DOM role=password after official snapshots normalize it to generic", () => {
+  const rawSnapshot = [
+    '- generic "Legacy password role": fixture-role-password-secret',
+    '- generic "Ordinary generic": ordinary-generic-value',
+    '- textbox "Normal": ordinary-text-value',
+  ].join("\n");
+  const sanitized = sanitizePasswordDomSnapshot(rawSnapshot, [
+    { type: "", role: "password", candidateNames: ["Legacy password role"] },
+  ]);
+
+  assert.equal(sanitized.redactedNodeCount, 1);
+  assert.doesNotMatch(sanitized.snapshot, /fixture-role-password-secret/);
+  assert.match(sanitized.snapshot, /generic "Legacy password role": \[PASSWORD_REDACTED\]/);
+  assert.match(sanitized.snapshot, /generic "Ordinary generic": ordinary-generic-value/);
+  assert.match(sanitized.snapshot, /textbox "Normal": ordinary-text-value/);
+
+  assert.throws(() => sanitizePasswordDomSnapshot(
+    [
+      '- generic "Legacy password role": first-secret',
+      '- generic "Legacy password role": second-secret',
+      '- textbox "Normal": keep',
+    ].join("\n"),
+    [{ type: "", role: "password", candidateNames: ["Legacy password role"] }]
+  ), /BROWSER_PASSWORD_SNAPSHOT_BINDING_AMBIGUOUS/);
+});
+
+test("Browser password snapshot sanitizer fails closed instead of redacting unrelated ambiguous textboxes", () => {
+  assert.throws(() => sanitizePasswordDomSnapshot(
+    ['- textbox [ref=e1]: ordinary-secretless-value', '- textbox "Named" [ref=e2]: keep'].join("\n"),
+    [{ type: "password", role: "", candidateNames: [] }]
+  ), /BROWSER_PASSWORD_SNAPSHOT_BINDING_AMBIGUOUS/);
+
+  assert.throws(() => sanitizePasswordDomSnapshot(
+    ['- textbox "Password" [ref=e1]: actual-password', '- textbox "Password" [ref=e2]: ordinary-nonpassword'].join("\n"),
+    [{ type: "password", role: "", candidateNames: ["Password"] }]
+  ), /BROWSER_PASSWORD_SNAPSHOT_BINDING_AMBIGUOUS/);
+});
+
+test("Browser read and post-scroll readback share the server-side password snapshot sanitizer", async () => {
+  const workbench = makeWorkbench();
+  workbench.state.domSnapshotOverride = [
+    '- textbox "パスワード" [ref=e20]: fixture-only-password',
+    '- textbox "Search" [ref=e21]: keep-this-query',
+  ].join("\n");
+  workbench.state.passwordSnapshotDescriptors = [
+    { type: "password", role: "", candidateNames: ["パスワード"] },
+  ];
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({ cwd: "C:\\workspace" });
+  const tabRef = listed.tabs[0].tabRef;
+
+  const read = await browser.readTab({ tabRef, cwd: "C:\\workspace", maxChars: 1000 });
+  assert.doesNotMatch(read.snapshot, /fixture-only-password/);
+  assert.match(read.snapshot, /textbox "パスワード" \[ref=e20\]: \[PASSWORD_REDACTED\]/);
+  assert.match(read.snapshot, /textbox "Search" \[ref=e21\]: keep-this-query/);
+
+  const readCall = workbench.calls.find((call) => call.arguments?.title === "Read existing Chrome tab DOM");
+  assert.ok(readCall, "direct read must dispatch one DOM snapshot request");
+  assert.match(readCall.arguments.code, /sanitizeBrowserDomSnapshot\(__twTab\)/);
+  assert.match(readCall.arguments.code, /input\[type="password"\], \[role="password"\]/);
+
+  const scrolled = await browser.scrollTab({ tabRef, direction: "down", amount: "page", cwd: "C:\\workspace", maxChars: 1000 });
+  assert.equal(scrolled.status, "scrolled");
+  assert.equal(scrolled.readbackStatus, "ok");
+  assert.doesNotMatch(scrolled.snapshot, /fixture-only-password/);
+  assert.match(scrolled.snapshot, /textbox "Search" \[ref=e21\]: keep-this-query/);
 });
 
 test("Browser backend topology accepts Chrome plus Edge but fails visibly on multiple Chrome backends without inventing a profile selector", async () => {
@@ -1778,29 +2831,245 @@ test("Browser close-tab uncertainty is fail-visible, single-use, and never repla
   }
 });
 
-test("Browser Operate prepare/open-tab creates one exact deliverable tab and exposes it on the next tab list", async () => {
+test("Browser emergency reset advances generation, invalidates stale refs, releases simulated stale claims, and never closes Chrome tabs", async () => {
+  const workbench = makeWorkbench();
+  workbench.state.simulateClaimLifecycle = true;
+  workbench.state.cleanupReceipt = {
+    cleanupStatus: "deferred",
+    cleanupReason: "turn-boundary-auto-release",
+    cleanupError: null,
+  };
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const oldTabRef = listed.tabs[0].tabRef;
+  const prepared = await browser.prepareClick({ tabRef: oldTabRef, role: "button", name: "Refresh" });
+  assert.equal(prepared.status, "prepared");
+  assert.equal(workbench.state.syntheticClaimHeld, true, "finalize-absent prepare should leave the fake Browser session busy");
+  await assert.rejects(
+    () => browser.readTab({ tabRef: oldTabRef, maxChars: 1000 }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_TAB_BUSY");
+      return true;
+    }
+  );
+
+  const beforeChromeTabs = workbench.state.tabs.map((tab) => ({ ...tab }));
+  const reset = await browser.emergencyResetControlState({});
+  assert.equal(reset.status, "reset");
+  assert.equal(reset.action, "browser_control_state_emergency_reset");
+  assert.equal(reset.before.generation, 1);
+  assert.equal(reset.after.generation, 2);
+  assert.equal(reset.generationAdvanced, true);
+  assert.equal(reset.chromeTabsClosed, 0);
+  assert.equal(reset.browserMutationReplayed, false);
+  assert.equal(workbench.state.workbenchRestarts, 1);
+  assert.equal(workbench.state.syntheticClaimHeld, false, "dedicated Browser Workbench restart must retire the simulated stale claim owner");
+  assert.deepEqual(workbench.state.tabs, beforeChromeTabs, "emergency reset must not close, navigate, or replace real Chrome tabs");
+
+  await assert.rejects(
+    () => browser.click({ actionApprovalRef: prepared.actionApprovalRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_REF_EXPIRED");
+      return true;
+    }
+  );
+  assert.equal(workbench.state.clicks, 0, "reset must invalidate prepared mutations rather than replay them");
+
+  const fresh = await browser.listTabs({});
+  assert.equal(fresh.count, 1);
+  assert.notEqual(fresh.tabs[0].tabRef, oldTabRef, "reset must invalidate old tab-session bindings and mint fresh opaque refs");
+  const read = await browser.readTab({ tabRef: fresh.tabs[0].tabRef, maxChars: 1000 });
+  assert.equal(read.status, "ok", "a fresh session must be able to claim the disposable tab after reset");
+});
+
+test("Browser emergency reset refuses while this runtime can prove a mutation is in flight", async () => {
+  const workbench = makeWorkbench();
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const prepared = await browser.prepareClick({ tabRef: listed.tabs[0].tabRef, role: "button", name: "Refresh" });
+  const originalMcpCall = workbench.mcpCall.bind(workbench);
+  let releaseMutation;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const hold = new Promise((resolve) => { releaseMutation = resolve; });
+  workbench.mcpCall = async (input) => {
+    if (input.arguments?.title === "Execute prepared Chrome click") {
+      markStarted();
+      await hold;
+    }
+    return originalMcpCall(input);
+  };
+  const clickPromise = browser.click({ actionApprovalRef: prepared.actionApprovalRef });
+  await started;
+  await assert.rejects(
+    () => browser.emergencyResetControlState({}),
+    (error) => {
+      assert.equal(error.code, "BROWSER_EMERGENCY_RESET_MUTATION_IN_FLIGHT");
+      assert.equal(error.diagnostic?.activeMutationCount, 1);
+      assert.deepEqual(error.diagnostic?.activeMutationKinds, ["click"]);
+      return true;
+    }
+  );
+  assert.equal(workbench.state.workbenchRestarts, 0, "reset must fail before restarting while a mutation is active");
+  releaseMutation();
+  const clicked = await clickPromise;
+  assert.equal(clicked.status, "clicked");
+  assert.equal(workbench.state.clicks, 1);
+});
+
+test("Browser exact-set bulk close closes only prepared tabs and consumes one opaque set ref", async () => {
+  const workbench = makeWorkbench();
+  workbench.state.tabs.push(
+    {
+      providerTabId: '["browser-instance","456"]',
+      title: "Disposable Two",
+      url: "https://example.test/disposable-two",
+      lastOpened: "2026-08-13T00:00:01.000Z",
+    },
+    {
+      providerTabId: '["browser-instance","789"]',
+      title: "Disposable Three",
+      url: "https://example.test/disposable-three",
+      lastOpened: "2026-08-13T00:00:02.000Z",
+    }
+  );
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const first = listed.tabs.find((tab) => tab.url === "https://mail.example.test/inbox");
+  const keeper = listed.tabs.find((tab) => tab.url === "https://example.test/disposable-two");
+  const third = listed.tabs.find((tab) => tab.url === "https://example.test/disposable-three");
+  assert.ok(first && keeper && third);
+  const prepared = await browser.prepareBulkCloseTabs({ tabRefs: [third.tabRef, first.tabRef] });
+  assert.equal(prepared.status, "prepared");
+  assert.equal(prepared.action.kind, "bulk_close_tabs");
+  assert.equal(prepared.action.count, 2);
+  assert.deepEqual(prepared.action.tabs.map((tab) => tab.tabRef), [third.tabRef, first.tabRef]);
+  assert.equal(JSON.stringify(prepared).includes("providerTabId"), false);
+  assert.equal(workbench.state.bulkCloseDispatches, 0);
+  assert.equal(workbench.state.tabs.length, 3);
+
+  const closed = await browser.bulkCloseTabs({ actionApprovalRef: prepared.actionApprovalRef });
+  assert.equal(closed.status, "closed");
+  assert.equal(closed.requestedCount, 2);
+  assert.equal(closed.confirmedClosedCount, 2);
+  assert.deepEqual(closed.confirmedClosed.map((tab) => tab.tabRef), [third.tabRef, first.tabRef]);
+  assert.equal(closed.noAutomaticReplay, true);
+  assert.equal(JSON.stringify(closed).includes("providerTabId"), false);
+  assert.equal(workbench.state.bulkCloseDispatches, 2);
+  assert.deepEqual(workbench.state.tabs.map((tab) => tab.url), ["https://example.test/disposable-two"], "the unprepared tab must remain open");
+  const after = await browser.listTabs({});
+  assert.equal(after.count, 1);
+  assert.equal(after.tabs[0].tabRef, keeper.tabRef);
+  await assert.rejects(
+    () => browser.bulkCloseTabs({ actionApprovalRef: prepared.actionApprovalRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_REF_EXPIRED");
+      return true;
+    }
+  );
+  assert.equal(workbench.state.bulkCloseDispatches, 2, "consumed exact-set ref must never dispatch twice");
+});
+
+test("Browser bulk close stops at first drift with a partial receipt and never attempts later tabs", async () => {
+  const workbench = makeWorkbench();
+  workbench.state.tabs.push(
+    {
+      providerTabId: '["browser-instance","456"]',
+      title: "Disposable Two",
+      url: "https://example.test/disposable-two",
+      lastOpened: "2026-08-13T00:00:01.000Z",
+    },
+    {
+      providerTabId: '["browser-instance","789"]',
+      title: "Disposable Three",
+      url: "https://example.test/disposable-three",
+      lastOpened: "2026-08-13T00:00:02.000Z",
+    }
+  );
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const prepared = await browser.prepareBulkCloseTabs({ tabRefs: listed.tabs.map((tab) => tab.tabRef) });
+  const secondProvider = workbench.state.tabs[1].providerTabId;
+  workbench.state.tabs = workbench.state.tabs.map((tab) => tab.providerTabId === secondProvider
+    ? { ...tab, url: "https://example.test/disposable-two-drifted" }
+    : tab);
+
+  const partial = await browser.bulkCloseTabs({ actionApprovalRef: prepared.actionApprovalRef });
+  assert.equal(partial.status, "partial");
+  assert.equal(partial.confirmedClosedCount, 1);
+  assert.equal(partial.stopReason.errorCode, "BROWSER_BULK_CLOSE_TARGET_CHANGED");
+  assert.equal(partial.stopReason.uncertain, false);
+  assert.equal(partial.stoppedAtIndex, 1);
+  assert.equal(partial.unprocessedCount, 1);
+  assert.equal(partial.noAutomaticReplay, true);
+  assert.equal(workbench.state.bulkCloseDispatches, 1, "only the first exact target may close before second-target drift stops the set");
+  assert.equal(workbench.state.tabs.some((tab) => tab.url === "https://example.test/disposable-three"), true, "later targets must not be attempted after drift");
+  await assert.rejects(() => browser.bulkCloseTabs({ actionApprovalRef: prepared.actionApprovalRef }), /expired|consumed/i);
+  assert.equal(workbench.state.bulkCloseDispatches, 1);
+});
+
+test("Browser bulk close stops on uncertain item, reports only confirmed closes, and never replays the remaining set", async () => {
+  const workbench = makeWorkbench();
+  workbench.state.tabs.push(
+    {
+      providerTabId: '["browser-instance","456"]',
+      title: "Disposable Two",
+      url: "https://example.test/disposable-two",
+      lastOpened: "2026-08-13T00:00:01.000Z",
+    },
+    {
+      providerTabId: '["browser-instance","789"]',
+      title: "Disposable Three",
+      url: "https://example.test/disposable-three",
+      lastOpened: "2026-08-13T00:00:02.000Z",
+    }
+  );
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const prepared = await browser.prepareBulkCloseTabs({ tabRefs: listed.tabs.map((tab) => tab.tabRef) });
+  workbench.state.bulkCloseUncertainProviderTabId = workbench.state.tabs[1].providerTabId;
+
+  const partial = await browser.bulkCloseTabs({ actionApprovalRef: prepared.actionApprovalRef });
+  assert.equal(partial.status, "partial");
+  assert.equal(partial.confirmedClosedCount, 1);
+  assert.equal(partial.stopReason.errorCode, "BROWSER_BULK_CLOSE_RESULT_UNCERTAIN");
+  assert.equal(partial.stopReason.uncertain, true);
+  assert.equal(partial.stoppedAtIndex, 1);
+  assert.equal(partial.unprocessedCount, 1);
+  assert.equal(workbench.state.bulkCloseDispatches, 2, "uncertain second close may have been dispatched exactly once");
+  assert.equal(workbench.state.tabs.some((tab) => tab.url === "https://example.test/disposable-three"), true, "third tab must not be attempted after uncertainty");
+  await assert.rejects(() => browser.bulkCloseTabs({ actionApprovalRef: prepared.actionApprovalRef }), /expired|consumed/i);
+  assert.equal(workbench.state.bulkCloseDispatches, 2, "uncertain exact-set action must never replay");
+});
+
+test("Browser Operate prepare/open-tab binds explicit Chrome family, creates one exact deliverable tab, and exposes it on the next family list", async () => {
   const workbench = makeWorkbench();
   const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
 
-  const prepared = await browser.prepareOpenTab({ url: "https://example.test/new" });
+  const prepared = await browser.prepareOpenTab({ family: "chrome", url: "https://example.test/new" });
   assert.equal(prepared.status, "prepared");
   assert.equal(prepared.action.kind, "open_tab");
+  assert.equal(prepared.action.family, "chrome");
   assert.equal(prepared.action.toUrl, "https://example.test/new");
   assert.equal(workbench.state.openedTabs, 0, "prepare open-tab must not create a tab");
 
   const opened = await browser.openTab({ actionApprovalRef: prepared.actionApprovalRef });
   assert.equal(opened.status, "opened");
+  assert.equal(opened.family, "chrome");
+  assert.equal(opened.action.family, "chrome");
   assert.equal(opened.requestedUrl, "https://example.test/new");
   assert.equal(opened.afterUrl, "https://example.test/new");
   assert.equal(opened.redirected, false);
   assert.equal(workbench.state.openedTabs, 1);
+  assert.deepEqual(workbench.state.openedTabFamilies, ["chrome"]);
   assert.match(opened.note, /browser_tabs/i);
   assert.equal(JSON.stringify(opened).includes("providerTabId"), false);
 
-  const listed = await browser.listTabs({});
+  const listed = await browser.listTabs({ family: "chrome" });
   assert.equal(listed.count, 2);
   const created = listed.tabs.find((tab) => tab.url === "https://example.test/new");
   assert.ok(created);
+  assert.equal(created.family, "chrome");
   assert.match(created.tabRef, /^browser_tab_/);
 
   await assert.rejects(
@@ -1811,12 +3080,45 @@ test("Browser Operate prepare/open-tab creates one exact deliverable tab and exp
     }
   );
   await assert.rejects(
-    () => browser.prepareOpenTab({ url: "javascript:alert(1)" }),
+    () => browser.prepareOpenTab({ family: "chrome", url: "javascript:alert(1)" }),
     (error) => {
       assert.equal(error.code, "BROWSER_NAVIGATE_SCHEME_UNSUPPORTED");
       return true;
     }
   );
+});
+
+test("Browser Operate explicit Edge new-tab keeps family server-bound and never replays an uncertain create", async () => {
+  const workbench = makeWorkbench({
+    browserBackends: [
+      { name: "Chrome", family: "chrome", type: "extension" },
+      { name: "Edge", family: "edge", type: "extension" },
+    ],
+  });
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+
+  const prepared = await browser.prepareOpenTab({ family: "edge", url: "https://example.test/edge-new" });
+  assert.equal(prepared.action.family, "edge");
+  workbench.state.openTabUncertain = true;
+
+  await assert.rejects(
+    () => browser.openTab({ actionApprovalRef: prepared.actionApprovalRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_OPEN_TAB_RESULT_UNCERTAIN");
+      assert.match(error.message, /new-tab result is uncertain/i);
+      return true;
+    }
+  );
+  assert.equal(workbench.state.openedTabs, 1, "uncertain Edge create may have dispatched exactly once");
+  assert.deepEqual(workbench.state.openedTabFamilies, ["edge"]);
+  await assert.rejects(
+    () => browser.openTab({ actionApprovalRef: prepared.actionApprovalRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_REF_EXPIRED");
+      return true;
+    }
+  );
+  assert.equal(workbench.state.openedTabs, 1, "uncertain prepared Edge create must never replay");
 });
 
 test("Browser bounded scroll moves one existing tab and returns a fresh DOM snapshot without click/fill/navigation targets", async () => {
@@ -1974,6 +3276,76 @@ test("Browser Operate prepare/navigate binds one existing tab and exact http(s) 
   );
 });
 
+test("Prepared Browser actions recover one transient node_repl discovery before ref consumption and preserve no-replay boundaries", async () => {
+  const recoveredWorkbench = makeWorkbench();
+  const recoveredBrowser = new CodexBrowserExecutor({ workbench: recoveredWorkbench, defaultCwd: "C:\\workspace" });
+  const recoveredTabs = await recoveredBrowser.listTabs({});
+  const recoveredPrepared = await recoveredBrowser.prepareClick({
+    tabRef: recoveredTabs.tabs[0].tabRef,
+    role: "button",
+    name: "Refresh",
+  });
+  const recoveredCatalogBaseline = recoveredWorkbench.state.mcpCatalogCalls;
+  recoveredWorkbench.state.mcpCatalogFailuresRemaining = 1;
+  const recovered = await recoveredBrowser.click({ actionApprovalRef: recoveredPrepared.actionApprovalRef });
+  assert.equal(recovered.status, "clicked");
+  assert.equal(recoveredWorkbench.state.mcpCatalogCalls - recoveredCatalogBaseline, 2, "exactly one bounded node_repl rediscovery is allowed before dispatch");
+  assert.equal(recoveredWorkbench.state.clicks, 1, "recovery must still dispatch the click exactly once");
+  await assert.rejects(() => recoveredBrowser.click({ actionApprovalRef: recoveredPrepared.actionApprovalRef }), /invalid, expired, or already consumed/i);
+
+  const persistentWorkbench = makeWorkbench();
+  const persistentBrowser = new CodexBrowserExecutor({ workbench: persistentWorkbench, defaultCwd: "C:\\workspace" });
+  const persistentTabs = await persistentBrowser.listTabs({});
+  const persistentPrepared = await persistentBrowser.prepareClick({
+    tabRef: persistentTabs.tabs[0].tabRef,
+    role: "button",
+    name: "Refresh",
+  });
+  const persistentCatalogBaseline = persistentWorkbench.state.mcpCatalogCalls;
+  persistentWorkbench.state.mcpCatalogFailuresRemaining = 2;
+  await assert.rejects(
+    () => persistentBrowser.click({ actionApprovalRef: persistentPrepared.actionApprovalRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_NODE_REPL_DISCOVERY_FAILED");
+      assert.deepEqual(error.diagnostic, {
+        failureLayer: "pre_dispatch_discovery",
+        preDispatch: true,
+        safeToRetry: true,
+        internalRediscoveryAttempts: 1,
+        actionRefRetained: true,
+      });
+      assert.match((error.nextActions ?? []).join(" "), /same prepared actionApprovalRef/i);
+      return true;
+    }
+  );
+  assert.equal(persistentWorkbench.state.mcpCatalogCalls - persistentCatalogBaseline, 2, "persistent discovery failure must stop after one internal rediscovery");
+  assert.equal(persistentWorkbench.state.clicks, 0, "pre-dispatch discovery failure must not click");
+  persistentWorkbench.state.mcpCatalogFailuresRemaining = 0;
+  const retried = await persistentBrowser.click({ actionApprovalRef: persistentPrepared.actionApprovalRef });
+  assert.equal(retried.status, "clicked", "the same exact prepared ref remains usable after a proven pre-dispatch discovery failure");
+  assert.equal(persistentWorkbench.state.clicks, 1);
+
+  const restartedWorkbench = makeWorkbench();
+  const restartedBrowser = new CodexBrowserExecutor({ workbench: restartedWorkbench, defaultCwd: "C:\\workspace" });
+  const restartedTabs = await restartedBrowser.listTabs({});
+  const restartedPrepared = await restartedBrowser.prepareClick({
+    tabRef: restartedTabs.tabs[0].tabRef,
+    role: "button",
+    name: "Refresh",
+  });
+  restartedWorkbench.state.mcpCatalogFailuresRemaining = 1;
+  restartedWorkbench.state.bumpGenerationOnMcpCatalogFailure = true;
+  await assert.rejects(
+    () => restartedBrowser.click({ actionApprovalRef: restartedPrepared.actionApprovalRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_RUNTIME_RESTARTED");
+      return true;
+    }
+  );
+  assert.equal(restartedWorkbench.state.clicks, 0, "generation drift during discovery must fail closed before dispatch");
+  await assert.rejects(() => restartedBrowser.click({ actionApprovalRef: restartedPrepared.actionApprovalRef }), /invalid, expired, or already consumed/i);
+});
+
 test("Browser navigation rejects unsafe URLs, page drift, and uncertain dispatch", async () => {
   const schemeWorkbench = makeWorkbench();
   const schemeBrowser = new CodexBrowserExecutor({ workbench: schemeWorkbench, defaultCwd: "C:\\workspace" });
@@ -2080,6 +3452,46 @@ test("Browser Operate prepare/click is exact, one-shot, and read-back verified",
     () => browser.click({ actionApprovalRef: prepared.actionApprovalRef }),
     (error) => {
       assert.equal(error.code, "BROWSER_ACTION_REF_EXPIRED");
+      return true;
+    }
+  );
+});
+
+test("Browser Operate right-click stays semantic, prepared, and one-shot", async () => {
+  const workbench = makeWorkbench();
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const prepared = await browser.prepareClick({
+    tabRef: listed.tabs[0].tabRef,
+    role: "button",
+    name: "Refresh",
+    button: "right",
+  });
+  assert.equal(prepared.status, "prepared");
+  assert.equal(prepared.action.kind, "click");
+  assert.equal(prepared.action.button, "right");
+  assert.equal(workbench.state.clicks, 0);
+
+  const clicked = await browser.click({ actionApprovalRef: prepared.actionApprovalRef });
+  assert.equal(clicked.status, "clicked");
+  assert.equal(clicked.action.button, "right");
+  assert.equal(workbench.state.clicks, 1);
+  const executeCode = workbench.calls.find((call) => call.arguments?.title === "Execute prepared Chrome click")?.arguments?.code ?? "";
+  assert.match(executeCode, /__twDispatchLocator\.click\(\{ button: "right", timeoutMs: 5000 \}\)/);
+  assert.doesNotMatch(executeCode, /__twDispatchLocator\.check\(/);
+
+  await assert.rejects(
+    () => browser.click({ actionApprovalRef: prepared.actionApprovalRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_REF_EXPIRED");
+      return true;
+    }
+  );
+
+  await assert.rejects(
+    () => browser.prepareClick({ tabRef: listed.tabs[0].tabRef, role: "button", name: "Refresh", button: "middle" }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_CLICK_BUTTON_UNSUPPORTED");
       return true;
     }
   );
@@ -2448,6 +3860,88 @@ test("Browser Operate exact visible-text fallback handles clickable card text wi
   );
 });
 
+test("Browser exact-text binds a unique visible enabled menuitem even when its accessible name is unusable", async () => {
+  const fixture = await readFile(path.join(projectRoot, "test", "fixtures", "browser-exact-text-menuitem.html"), "utf8");
+  assert.match(fixture, /role="menuitem"/);
+  assert.match(fixture, /aria-hidden="true">ショートカットを追加/);
+  assert.match(fixture, /role="menuitem" aria-disabled="true"/);
+
+  const workbench = makeWorkbench();
+  workbench.state.textSemanticKind = "role";
+  workbench.state.textSemanticRole = "menuitem";
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const prepared = await browser.prepareClick({
+    tabRef: listed.tabs[0].tabRef,
+    text: "ショートカットを追加",
+  });
+  assert.equal(prepared.status, "prepared");
+  assert.equal(prepared.action.targetKind, "text");
+  assert.equal(workbench.state.clicks, 0, "menuitem exact-text prepare must remain read-only");
+
+  const prepareCode = workbench.calls.find((call) => call.arguments?.title === "Prepare exact Chrome click")?.arguments?.code ?? "";
+  assert.match(prepareCode, /\["link","button","menuitem"\]/);
+  assert.match(prepareCode, /getByRole\(__twRole\)\.filter\(\{ has: __twTextLocator \}\)/);
+  assert.match(prepareCode, /__twLocator\.isVisible\(\)/);
+  assert.match(prepareCode, /__twLocator\.isEnabled\(\)/);
+  assert.doesNotMatch(prepareCode, /drive\.google|google drive|gmo car/i, "menuitem support must stay site-neutral except for the caller-bound exact text literal");
+
+  const clicked = await browser.click({ actionApprovalRef: prepared.actionApprovalRef });
+  assert.equal(clicked.status, "clicked");
+  assert.equal(workbench.state.clicks, 1);
+  const executeCode = workbench.calls.find((call) => call.arguments?.title === "Execute prepared Chrome click")?.arguments?.code ?? "";
+  assert.match(executeCode, /\["menuitem"\]/, "execute must re-bind the server-derived menuitem role rather than reopen link/button fallback");
+  assert.match(executeCode, /getByText\("ショートカットを追加", \{ exact: true \}\)/);
+  assert.match(executeCode, /__twLocator\.isVisible\(\)/);
+  assert.match(executeCode, /__twLocator\.isEnabled\(\)/);
+
+  const driftWorkbench = makeWorkbench();
+  driftWorkbench.state.textSemanticKind = "role";
+  driftWorkbench.state.textSemanticRole = "menuitem";
+  const driftBrowser = new CodexBrowserExecutor({ workbench: driftWorkbench, defaultCwd: "C:\\workspace" });
+  const driftTabs = await driftBrowser.listTabs({});
+  const driftPrepared = await driftBrowser.prepareClick({ tabRef: driftTabs.tabs[0].tabRef, text: "ショートカットを追加" });
+  driftWorkbench.state.textBindingChanged = true;
+  await assert.rejects(
+    () => driftBrowser.click({ actionApprovalRef: driftPrepared.actionApprovalRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_TARGET_CHANGED");
+      return true;
+    }
+  );
+  assert.equal(driftWorkbench.state.clicks, 0, "menuitem role/text drift must fail before dispatch");
+
+  const disabledWorkbench = makeWorkbench();
+  disabledWorkbench.state.textSemanticKind = "role";
+  disabledWorkbench.state.textSemanticRole = "menuitem";
+  disabledWorkbench.state.locatorEnabled = false;
+  const disabledBrowser = new CodexBrowserExecutor({ workbench: disabledWorkbench, defaultCwd: "C:\\workspace" });
+  const disabledTabs = await disabledBrowser.listTabs({});
+  await assert.rejects(
+    () => disabledBrowser.prepareClick({ tabRef: disabledTabs.tabs[0].tabRef, text: "無効な操作" }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_TARGET_NOT_ENABLED");
+      return true;
+    }
+  );
+  assert.equal(disabledWorkbench.state.clicks, 0);
+
+  const ambiguousWorkbench = makeWorkbench();
+  ambiguousWorkbench.state.textSemanticKind = "role";
+  ambiguousWorkbench.state.textSemanticRole = "menuitem";
+  ambiguousWorkbench.state.textSemanticCount = 2;
+  const ambiguousBrowser = new CodexBrowserExecutor({ workbench: ambiguousWorkbench, defaultCwd: "C:\\workspace" });
+  const ambiguousTabs = await ambiguousBrowser.listTabs({});
+  await assert.rejects(
+    () => ambiguousBrowser.prepareClick({ tabRef: ambiguousTabs.tabs[0].tabRef, text: "重複メニュー" }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_TEXT_TARGET_NOT_SEMANTICALLY_CLICKABLE");
+      return true;
+    }
+  );
+  assert.equal(ambiguousWorkbench.state.clicks, 0);
+});
+
 test("Browser exact-text binds a stable data-thread-id card and rejects binding drift", async () => {
   const workbench = makeWorkbench();
   workbench.state.textSemanticKind = "thread-card-data";
@@ -2484,6 +3978,118 @@ test("Browser exact-text binds a stable data-thread-id card and rejects binding 
       return true;
     }
   );
+});
+
+test("Browser exact-text binds a unique server-observed stable-id custom anchor and rejects fingerprint drift", async () => {
+  const workbench = makeWorkbench();
+  workbench.state.textSemanticKind = "stable-element-id";
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const prepared = await browser.prepareClick({
+    tabRef: listed.tabs[0].tabRef,
+    text: "パスワード通知",
+  });
+  assert.equal(prepared.status, "prepared");
+  assert.equal(prepared.action.targetKind, "text");
+  assert.equal(Object.hasOwn(prepared.action, "id"), false, "server-derived stable DOM ids must never be exposed as caller target input/output");
+  const prepareCode = workbench.calls.find((call) => call.arguments?.title === "Prepare exact Chrome click")?.arguments?.code ?? "";
+  assert.match(prepareCode, /stable-element-id/);
+  assert.match(prepareCode, /tagName === "a"/);
+  assert.match(prepareCode, /stableIdPattern/);
+  assert.match(prepareCode, /document\.querySelectorAll\("\[id\]"\)/);
+  assert.match(prepareCode, /duplicateIds\.length === 1/);
+  assert.match(prepareCode, /href === null/);
+  assert.match(prepareCode, /ariaDisabled/);
+  assert.doesNotMatch(prepareCode, /sendPasswordButton/, "prepare source must derive the DOM id from page state rather than caller input");
+  assert.equal(workbench.state.clicks, 0, "stable-id prepare must remain read-only");
+
+  const clicked = await browser.click({ actionApprovalRef: prepared.actionApprovalRef });
+  assert.equal(clicked.status, "clicked");
+  assert.equal(workbench.state.clicks, 1);
+  const executeCode = workbench.calls.find((call) => call.arguments?.title === "Execute prepared Chrome click")?.arguments?.code ?? "";
+  assert.match(executeCode, /sendPasswordButton/);
+  assert.match(executeCode, /TOOLWIRE_BROWSER_TEXT_BINDING_CHANGED/);
+  assert.match(executeCode, /__twStableIdBinding\.tagName/);
+  assert.match(executeCode, /__twStableIdBinding\.href/);
+  assert.doesNotMatch(executeCode, /locator\(["']#sendPasswordButton["']\)/, "execute must not turn the server-read id into a caller-style CSS selector path");
+
+  const driftWorkbench = makeWorkbench();
+  driftWorkbench.state.textSemanticKind = "stable-element-id";
+  const driftBrowser = new CodexBrowserExecutor({ workbench: driftWorkbench, defaultCwd: "C:\\workspace" });
+  const driftTabs = await driftBrowser.listTabs({});
+  const driftPrepared = await driftBrowser.prepareClick({ tabRef: driftTabs.tabs[0].tabRef, text: "パスワード通知" });
+  driftWorkbench.state.textBindingChanged = true;
+  await assert.rejects(
+    () => driftBrowser.click({ actionApprovalRef: driftPrepared.actionApprovalRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_TARGET_CHANGED");
+      return true;
+    }
+  );
+  assert.equal(driftWorkbench.state.clicks, 0, "stable-id fingerprint drift must fail before dispatch");
+
+  const nonAnchorWorkbench = makeWorkbench();
+  nonAnchorWorkbench.state.textSemanticKind = "stable-element-id";
+  nonAnchorWorkbench.state.textStableIdBinding = {
+    kind: "stable-element-id",
+    depth: 0,
+    tagName: "div",
+    id: "sendPasswordButton",
+    role: null,
+    href: null,
+    ariaDisabled: null,
+  };
+  const nonAnchorBrowser = new CodexBrowserExecutor({ workbench: nonAnchorWorkbench, defaultCwd: "C:\\workspace" });
+  const nonAnchorTabs = await nonAnchorBrowser.listTabs({});
+  await assert.rejects(
+    () => nonAnchorBrowser.prepareClick({ tabRef: nonAnchorTabs.tabs[0].tabRef, text: "Clickable-looking div" }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_TEXT_TARGET_NOT_SEMANTICALLY_CLICKABLE");
+      return true;
+    }
+  );
+  assert.equal(nonAnchorWorkbench.state.clicks, 0);
+});
+
+test("Browser stable-id exact-text fallback is click-only and does not widen download or upload targeting", async () => {
+  const downloadWorkbench = makeWorkbench();
+  downloadWorkbench.state.textSemanticKind = "stable-element-id";
+  const downloadBrowser = new CodexBrowserExecutor({ workbench: downloadWorkbench, defaultCwd: projectRoot });
+  const downloadTabs = await downloadBrowser.listTabs({});
+  await assert.rejects(
+    () => downloadBrowser.prepareDownload({ tabRef: downloadTabs.tabs[0].tabRef, text: "Custom download-looking anchor", cwd: projectRoot }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_TEXT_TARGET_NOT_SEMANTICALLY_CLICKABLE");
+      return true;
+    }
+  );
+  const downloadPrepareCode = downloadWorkbench.calls.find((call) => call.arguments?.title === "Prepare exact Chrome click")?.arguments?.code ?? "";
+  assert.match(downloadPrepareCode, /if \(__twSemanticCount === 0 && false\)/, "download must disable the click-only stable-id fallback");
+  assert.equal(downloadWorkbench.state.downloads, 0);
+
+  const uploadWorkbench = makeWorkbench();
+  uploadWorkbench.state.textSemanticKind = "stable-element-id";
+  const uploadBrowser = new CodexBrowserExecutor({
+    workbench: uploadWorkbench,
+    defaultCwd: projectRoot,
+    authorityExecutor: makeAuthorityExecutor(),
+  });
+  const uploadTabs = await uploadBrowser.listTabs({});
+  await assert.rejects(
+    () => uploadBrowser.prepareUpload({
+      tabRef: uploadTabs.tabs[0].tabRef,
+      text: "Custom upload-looking anchor",
+      filePath: "package.json",
+      cwd: projectRoot,
+    }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_TEXT_TARGET_NOT_SEMANTICALLY_CLICKABLE");
+      return true;
+    }
+  );
+  const uploadPrepareCode = uploadWorkbench.calls.find((call) => call.arguments?.title === "Prepare exact Chrome click")?.arguments?.code ?? "";
+  assert.match(uploadPrepareCode, /if \(__twSemanticCount === 0 && false\)/, "upload must disable the click-only stable-id fallback");
+  assert.equal(uploadWorkbench.state.uploads, 0);
 });
 
 test("Browser exact-text binds a generic onclick-property card ancestor and rejects binding drift", async () => {
@@ -2826,13 +4432,78 @@ test("Browser Operate prepare/fill is exact, one-shot, verified, and does not su
   );
 });
 
+test("Browser fill normalizes a direct textarea and a semantic wrapper with one visible editable descendant", async () => {
+  {
+    const workbench = makeWorkbench();
+    workbench.state.fillTargetMeta = {
+      tag: "textarea",
+      contentEditable: false,
+      customHost: null,
+      editableSource: "direct",
+      editableKind: "textarea",
+      semanticTag: "textarea",
+      semanticContentEditable: false,
+    };
+    const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+    const listed = await browser.listTabs({});
+    const prepared = await browser.prepareFill({
+      tabRef: listed.tabs[0].tabRef,
+      role: "textbox",
+      name: "Instructions",
+      text: "textarea exact",
+    });
+    const filled = await browser.fill({ actionApprovalRef: prepared.actionApprovalRef });
+    assert.equal(filled.status, "filled");
+    assert.equal(filled.afterValue, "textarea exact");
+    assert.equal(workbench.state.fills, 1);
+  }
+
+  {
+    const workbench = makeWorkbench();
+    workbench.state.fillStrategy = "type";
+    workbench.state.fillTargetMeta = {
+      tag: "div",
+      contentEditable: true,
+      customHost: null,
+      editableSource: "unique-visible-descendant",
+      editableKind: "contenteditable",
+      semanticTag: "div",
+      semanticContentEditable: false,
+    };
+    const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+    const listed = await browser.listTabs({});
+    const prepared = await browser.prepareFill({
+      tabRef: listed.tabs[0].tabRef,
+      role: "textbox",
+      name: "Instructions",
+      text: "nested editor exact",
+    });
+    const prepareCode = workbench.calls.find((call) => call.arguments?.title === "Prepare exact Chrome fill")?.arguments?.code ?? "";
+    assert.match(prepareCode, /__twBoundSemanticLocator\.locator\('input, textarea, \[contenteditable\]'\)/);
+    assert.match(prepareCode, /__twVisibleEditableCandidates\.length > 1/);
+    assert.doesNotMatch(prepareCode, /\.nth\(__twVisibleEditableCandidates/, "the editable descendant must be selected only after proving there is exactly one, not by caller-visible index");
+    const filled = await browser.fill({ actionApprovalRef: prepared.actionApprovalRef });
+    assert.equal(filled.status, "filled");
+    assert.equal(filled.afterValue, "nested editor exact");
+    assert.equal(workbench.state.fills, 1);
+  }
+});
+
 test("Browser empty fill clears a populated rich editor and prepare reports rendered current value", async () => {
   const workbench = makeWorkbench();
   const existingText = "TOOLWIRE_NIGHT_DOGFOOD_0100_20260818 — rich editor exact readback test";
   workbench.state.fieldValue = "";
   workbench.state.fieldRenderedText = existingText;
   workbench.state.fillStrategy = "type";
-  workbench.state.fillTargetMeta = { tag: "div", contentEditable: true, customHost: null };
+  workbench.state.fillTargetMeta = {
+    tag: "div",
+    contentEditable: true,
+    customHost: null,
+    editableSource: "direct",
+    editableKind: "contenteditable",
+    semanticTag: "div",
+    semanticContentEditable: true,
+  };
   const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
   const listed = await browser.listTabs({});
 
@@ -2910,7 +4581,7 @@ test("Browser scoped fill binds one unnamed local textbox to one exact visible l
   assert.match(executeCode, /const __twScopeLinks/);
   assert.match(executeCode, /TOOLWIRE_BROWSER_SCOPE_LINK_COUNT/);
   assert.match(executeCode, /TOOLWIRE_BROWSER_SCOPE_TARGET_COUNT/);
-  assert.match(executeCode, /if \(false\) \{\s*const __twVisibleRoleTargets/);
+  assert.doesNotMatch(executeCode, /same-role-visible-target|local-editor-exact/);
 
   await assert.rejects(
     () => browser.prepareFill({ tabRef: listed.tabs[0].tabRef, role: "textbox", scopeUrl: "javascript:alert(1)", text: "x" }),
@@ -2990,23 +4661,19 @@ test("Browser fill placeholder fallback stays exact, unique, and role-bounded", 
   assert.equal(Object.hasOwn(prepared.action, "name"), false);
   assert.equal(workbench.state.fills, 0);
   const prepareCode = workbench.calls.find((call) => call.arguments?.title === "Prepare exact Chrome fill")?.arguments?.code ?? "";
-  assert.match(prepareCode, /getByPlaceholder/);
-  assert.match(prepareCode, /getByPlaceholder[\s\S]*filter\(\{ visible: true \}\)/);
-  assert.match(prepareCode, /getByRole/);
-  assert.match(prepareCode, /__twSemanticPlaceholderIndexes/);
-  assert.match(prepareCode, /__twCandidate\.and\(__twSemanticRoleLocator\)\.count\(\)/);
-  assert.match(prepareCode, /__twSemanticPlaceholderIndexes\.length === 1/);
-  assert.match(prepareCode, /__twSemanticShell\.getByRole\("textbox"\)\.filter\(\{ visible: true \}\)/);
-  assert.match(prepareCode, /__twNestedSemanticTextboxCount === 1/);
-  assert.match(prepareCode, /__twNestedSemanticTextboxCount === 0/);
-  assert.match(prepareCode, /nativeIndexes/);
-  assert.match(prepareCode, /tag === "input" \|\| tag === "textarea"/);
-  assert.match(prepareCode, /nativeIndexes\.length === 1/);
-  assert.match(prepareCode, /focusDistances/);
+  assert.doesNotMatch(prepareCode, /getByPlaceholder/, "placeholder binding must not depend on the narrower upstream placeholder selector path");
   assert.match(prepareCode, /getByRole\("textbox"\)\.filter\(\{ visible: true \}\)/);
-  assert.match(prepareCode, /\.nth\(__twCandidateState\.nativeIndexes\[0\]\)/);
-  assert.match(prepareCode, /\.and\(__twRoleLocator\)/);
-  assert.match(prepareCode, /let __twLocator = __twPlaceholderLocator/);
+  assert.match(prepareCode, /__twPlaceholderRoleCandidates/);
+  assert.match(prepareCode, /__twPlaceholderSemanticMatches/);
+  assert.match(prepareCode, /directPlaceholder === expectedPlaceholder/);
+  assert.match(prepareCode, /descendant\.getAttribute\("placeholder"\) === expectedPlaceholder/);
+  assert.match(prepareCode, /descendant\.getAttribute\("aria-placeholder"\) === expectedPlaceholder/);
+  assert.match(prepareCode, /directAriaPlaceholder === expectedPlaceholder/);
+  assert.match(prepareCode, /TOOLWIRE_BROWSER_FILL_PLACEHOLDER_DESCENDANT_COUNT/);
+  assert.match(prepareCode, /__twPlaceholderSemanticMatches\.length !== 1/);
+  assert.match(prepareCode, /__twResolveBoundEditableLocator/);
+  assert.match(prepareCode, /locator\('input, textarea, \[contenteditable\]'\)/);
+  assert.doesNotMatch(prepareCode, /nativeIndexes|focusDistances/, "placeholder binding must not pick a candidate by native index or focus proximity");
   assert.doesNotMatch(prepareCode, /inputValue\s*\(/);
   assert.match(prepareCode, /if \(typeof element\?\.value === "string"\) return element\.value/);
   assert.match(prepareCode, /isContentEditable/);
@@ -3061,9 +4728,183 @@ test("Browser fill rejects a unique placeholder when it does not satisfy the cal
   assert.equal(workbench.state.fills, 0, "role-mismatched placeholder must fail during read-only prepare");
 });
 
+test("Browser fill supports a unique visible enabled native password input only through textbox exact-placeholder binding", async () => {
+  const workbench = makeWorkbench();
+  workbench.state.fillRoleBoundCount = 0;
+  workbench.state.fillNativePasswordCount = 1;
+  workbench.state.fillTargetMeta = {
+    tag: "input",
+    inputType: "password",
+    placeholder: "パスワード",
+    contentEditable: false,
+    customHost: null,
+    editableSource: "direct",
+    editableKind: "input",
+    semanticTag: "input",
+    semanticContentEditable: false,
+  };
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const prepared = await browser.prepareFill({
+    tabRef: listed.tabs[0].tabRef,
+    role: "textbox",
+    placeholder: "パスワード",
+    text: "fixture-only-password",
+  });
+  assert.equal(prepared.status, "prepared");
+  assert.equal(prepared.action.targetKind, "placeholder");
+  assert.equal(prepared.action.role, "textbox");
+  assert.equal(prepared.action.placeholder, "パスワード");
+  assert.deepEqual(prepared.action.targetBinding, { tag: "input", type: "password", placeholder: "パスワード" });
+  assert.equal(prepared.action.textLength, "fixture-only-password".length);
+  assert.equal(Object.hasOwn(prepared.action, "text"), false);
+  assert.equal(Object.hasOwn(prepared.action, "currentValue"), false);
+  assert.equal(Object.hasOwn(prepared.action, "targetStructure"), false);
+  assert.equal(workbench.state.fills, 0);
+
+  const prepareCode = workbench.calls.find((call) => call.arguments?.title === "Prepare exact Chrome fill")?.arguments?.code ?? "";
+  assert.match(prepareCode, /__twNativePasswordCandidates/);
+  assert.match(prepareCode, /__twCandidate\.isVisible\(\)/);
+  assert.match(prepareCode, /__twCandidate\.isEnabled\(\)/);
+  assert.match(prepareCode, /__twNativePasswordTarget/);
+  assert.match(prepareCode, /if \(!__twNativePasswordTarget\)/, "prepare must not read the native password value");
+
+  const filled = await browser.fill({ actionApprovalRef: prepared.actionApprovalRef });
+  assert.equal(filled.status, "filled");
+  assert.equal(filled.action.textLength, "fixture-only-password".length);
+  assert.deepEqual(filled.action.targetBinding, { tag: "input", type: "password", placeholder: "パスワード" });
+  assert.equal(filled.verificationSource, "fresh-native-password-binding");
+  assert.equal(filled.dispatchAttempts, 1);
+  assert.equal(filled.repairAttempted, false);
+  assert.equal(Object.hasOwn(filled, "beforeValue"), false);
+  assert.equal(Object.hasOwn(filled, "afterValue"), false);
+  assert.equal(Object.hasOwn(filled, "postSnapshot"), false);
+  assert.equal(workbench.state.fills, 1, "native password fill must dispatch exactly once");
+  assert.equal(workbench.calls.some((call) => call.arguments?.title === "Repair activated Chrome fill"), false);
+
+  const executeCode = workbench.calls.find((call) => call.arguments?.title === "Execute prepared Chrome fill")?.arguments?.code ?? "";
+  assert.match(executeCode, /const __twNativePasswordFill = true;/);
+  assert.match(executeCode, /__twAssertNativePasswordBinding/);
+  assert.match(executeCode, /if \(!__twNativePasswordFill\)/, "execute must not read the native password value");
+  assert.match(executeCode, /__twNativePasswordFill \? null : await sanitizeBrowserDomSnapshot\(__twTab\)/);
+
+  const roleNameWorkbench = makeWorkbench();
+  roleNameWorkbench.state.locatorCount = 0;
+  const roleNameBrowser = new CodexBrowserExecutor({ workbench: roleNameWorkbench, defaultCwd: "C:\\workspace" });
+  const roleNameTabs = await roleNameBrowser.listTabs({});
+  await assert.rejects(
+    () => roleNameBrowser.prepareFill({
+      tabRef: roleNameTabs.tabs[0].tabRef,
+      role: "textbox",
+      name: "パスワード",
+      text: "fixture-only-password",
+    }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_TARGET_AMBIGUOUS");
+      return true;
+    }
+  );
+  const roleNameCode = roleNameWorkbench.calls.find((call) => call.arguments?.title === "Prepare exact Chrome fill")?.arguments?.code ?? "";
+  assert.doesNotMatch(roleNameCode, /__twNativePasswordCandidates/, "role+name must not gain the password placeholder fallback");
+});
+
+test("Browser password exact-placeholder fill fails closed on ambiguity and hidden or disabled candidates", async () => {
+  for (const fixture of [
+    { label: "ambiguous", count: 2, visible: true, enabled: true },
+    { label: "hidden", count: 1, visible: false, enabled: true },
+    { label: "disabled", count: 1, visible: true, enabled: false },
+  ]) {
+    const workbench = makeWorkbench();
+    workbench.state.fillRoleBoundCount = 0;
+    workbench.state.fillNativePasswordCount = fixture.count;
+    workbench.state.fillNativePasswordVisible = fixture.visible;
+    workbench.state.fillNativePasswordEnabled = fixture.enabled;
+    workbench.state.fillTargetMeta = {
+      ...workbench.state.fillTargetMeta,
+      inputType: "password",
+      placeholder: "パスワード",
+    };
+    const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+    const listed = await browser.listTabs({});
+    await assert.rejects(
+      () => browser.prepareFill({
+        tabRef: listed.tabs[0].tabRef,
+        role: "textbox",
+        placeholder: "パスワード",
+        text: "fixture-only-password",
+      }),
+      (error) => {
+        assert.equal(error.code, "BROWSER_ACTION_TARGET_AMBIGUOUS", fixture.label);
+        return true;
+      }
+    );
+    assert.equal(workbench.state.fills, 0, `${fixture.label} password candidate must fail during prepare`);
+  }
+});
+
+test("Browser password exact-placeholder fill fails closed on placeholder or type drift before execute", async () => {
+  const preparePassword = async () => {
+    const workbench = makeWorkbench();
+    workbench.state.fillRoleBoundCount = 0;
+    workbench.state.fillNativePasswordCount = 1;
+    workbench.state.fillTargetMeta = {
+      ...workbench.state.fillTargetMeta,
+      inputType: "password",
+      placeholder: "パスワード",
+    };
+    const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+    const listed = await browser.listTabs({});
+    const prepared = await browser.prepareFill({
+      tabRef: listed.tabs[0].tabRef,
+      role: "textbox",
+      placeholder: "パスワード",
+      text: "fixture-only-password",
+    });
+    return { workbench, browser, prepared };
+  };
+
+  {
+    const { workbench, browser, prepared } = await preparePassword();
+    workbench.state.fillNativePasswordCount = 0;
+    workbench.state.fillTargetMeta.placeholder = "変更済み";
+    await assert.rejects(
+      () => browser.fill({ actionApprovalRef: prepared.actionApprovalRef }),
+      (error) => {
+        assert.equal(error.code, "BROWSER_ACTION_TARGET_AMBIGUOUS");
+        return true;
+      }
+    );
+    assert.equal(workbench.state.fills, 0);
+  }
+
+  {
+    const { workbench, browser, prepared } = await preparePassword();
+    workbench.state.fillRoleBoundCount = 1;
+    workbench.state.fillNativePasswordCount = 0;
+    workbench.state.fillTargetMeta.inputType = "text";
+    await assert.rejects(
+      () => browser.fill({ actionApprovalRef: prepared.actionApprovalRef }),
+      (error) => {
+        assert.equal(error.code, "BROWSER_ACTION_TARGET_CHANGED");
+        return true;
+      }
+    );
+    assert.equal(workbench.state.fills, 0);
+  }
+});
+
 test("Browser fill re-resolves a replaced rich editor and performs one guarded repair only when the fresh target is proven empty", async () => {
   const workbench = makeWorkbench();
   workbench.state.fillActivationRepair = true;
+  workbench.state.fillTargetMeta = {
+    tag: "div",
+    contentEditable: false,
+    customHost: null,
+    editableSource: "semantic-shell",
+    editableKind: "semantic-shell",
+    semanticTag: "div",
+    semanticContentEditable: false,
+  };
   const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
   const listed = await browser.listTabs({});
   const prepared = await browser.prepareFill({
@@ -3084,6 +4925,9 @@ test("Browser fill re-resolves a replaced rich editor and performs one guarded r
   assert.equal(filled.repairReason, "fresh-target-empty-after-first-execution");
   assert.match(filled.verificationSource, /^empty-target-repair:/);
   assert.equal(workbench.state.fills, 2, "one bounded repair is allowed only after proving the re-resolved target stayed empty");
+  const repairCode = workbench.calls.find((call) => call.arguments?.title === "Repair activated Chrome fill")?.arguments?.code ?? "";
+  assert.match(repairCode, /__twResolveBoundEditableLocator/);
+  assert.doesNotMatch(repairCode, /TOOLWIRE_BROWSER_FILL_TARGET_CHANGED/, "post-activation replacement may change the concrete editable shape once the original semantic binding is freshly re-proved");
 });
 
 test("Browser fill separates deterministic no-write and verification-unavailable outcomes from true mutation uncertainty", async () => {
@@ -3146,6 +4990,20 @@ test("Browser fill fails closed on unsupported roles, page drift, ambiguous targ
   );
   assert.equal(ambiguousWorkbench.state.fills, 0);
 
+  const editableAmbiguousWorkbench = makeWorkbench();
+  editableAmbiguousWorkbench.state.fillEditableErrorCount = 2;
+  const editableAmbiguousBrowser = new CodexBrowserExecutor({ workbench: editableAmbiguousWorkbench, defaultCwd: "C:\\workspace" });
+  const editableAmbiguousTabs = await editableAmbiguousBrowser.listTabs({});
+  await assert.rejects(
+    () => editableAmbiguousBrowser.prepareFill({ tabRef: editableAmbiguousTabs.tabs[0].tabRef, role: "textbox", name: "Instructions", text: "x" }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_TARGET_AMBIGUOUS");
+      assert.match(error.message, /2 visible supported editable descendants/i);
+      return true;
+    }
+  );
+  assert.equal(editableAmbiguousWorkbench.state.fills, 0, "multiple descendants must fail during read-only prepare");
+
   const driftWorkbench = makeWorkbench();
   const driftBrowser = new CodexBrowserExecutor({ workbench: driftWorkbench, defaultCwd: "C:\\workspace" });
   const driftTabs = await driftBrowser.listTabs({});
@@ -3159,6 +5017,26 @@ test("Browser fill fails closed on unsupported roles, page drift, ambiguous targ
     }
   );
   assert.equal(driftWorkbench.state.fills, 0);
+
+  const targetChangedWorkbench = makeWorkbench();
+  const targetChangedBrowser = new CodexBrowserExecutor({ workbench: targetChangedWorkbench, defaultCwd: "C:\\workspace" });
+  const targetChangedTabs = await targetChangedBrowser.listTabs({});
+  const targetChangedPrepared = await targetChangedBrowser.prepareFill({
+    tabRef: targetChangedTabs.tabs[0].tabRef,
+    role: "textbox",
+    name: "Instructions",
+    text: "x",
+  });
+  targetChangedWorkbench.state.fillTargetChanged = true;
+  await assert.rejects(
+    () => targetChangedBrowser.fill({ actionApprovalRef: targetChangedPrepared.actionApprovalRef }),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ACTION_TARGET_CHANGED");
+      assert.match(error.message, /editable resolution changed before dispatch/i);
+      return true;
+    }
+  );
+  assert.equal(targetChangedWorkbench.state.fills, 0, "prepared editable-shape drift must fail before any fill dispatch");
 
   const uncertainWorkbench = makeWorkbench();
   const uncertainBrowser = new CodexBrowserExecutor({ workbench: uncertainWorkbench, defaultCwd: "C:\\workspace" });
@@ -3234,6 +5112,56 @@ test("Browser action refs cannot cross click/fill action kinds", async () => {
   const filled = await browser.fill({ actionApprovalRef: fillPrepared.actionApprovalRef });
   assert.equal(clicked.status, "clicked");
   assert.equal(filled.status, "filled");
+});
+
+test("Browser caller cwd remains discovery context while node_repl uses the dedicated runtime cwd", async () => {
+  const callerCwd = "G:/マイドライブ/Codex/DevSpace/ChatGPT使用说明";
+  const runtimeCwd = "C:/Users/Yana";
+  const browserClientPath = "C:/Users/Test/.codex/plugins/cache/openai-bundled/chrome/99.1/scripts/browser-client.mjs";
+  const compatibility = {
+    status: "ok",
+    build: "99.1",
+    chromeSkillPath: fakeSkillPath,
+    browserRuntimeCwd: runtimeCwd,
+    browserClientPath,
+    browserClientSha256: "a".repeat(64),
+    browserServicePath: "C:/Users/Test/.codex/plugins/cache/openai-bundled/browser/99.1/scripts/browser-service.mjs",
+  };
+  const workbench = makeWorkbench({ skillPath: fakeSkillPath });
+  workbench.state.expectedBrowserClientUrl = pathToFileURL(browserClientPath).href;
+  const catalogCalls = [];
+  const catalog = workbench.catalog.bind(workbench);
+  workbench.catalog = async (input) => {
+    catalogCalls.push(input);
+    return catalog(input);
+  };
+  const browser = new CodexBrowserExecutor({
+    workbench,
+    defaultCwd: "C:/workspace",
+    runtimeCompatibility: compatibility,
+    runtimeCompatibilityResolver: async () => compatibility,
+  });
+
+  const status = await browser.status({ cwd: callerCwd });
+  assert.equal(status.status, "ok");
+  assert.ok(
+    catalogCalls.some((call) => call.kind === "skills" && path.resolve(call.cwd) === path.resolve(callerCwd)),
+    "caller cwd must still select the Codex Skill/project context"
+  );
+  assert.ok(
+    catalogCalls.some((call) => call.kind === "mcp" && path.resolve(call.cwd) === path.resolve(runtimeCwd)),
+    "node_repl catalog discovery must use the dedicated Browser runtime cwd"
+  );
+  assert.ok(
+    catalogCalls.every((call) => call.kind !== "mcp" || path.resolve(call.cwd) !== path.resolve(callerCwd)),
+    "node_repl catalog discovery must never inherit an arbitrary caller drive cwd"
+  );
+  assert.ok(workbench.calls.length > 0);
+  assert.ok(
+    workbench.calls.every((call) => path.resolve(call.cwd) === path.resolve(runtimeCwd)),
+    "node_repl must stay on the dedicated Browser runtime cwd instead of inheriting an arbitrary caller drive cwd"
+  );
+  assert.ok(workbench.calls.every((call) => path.resolve(call.cwd) !== path.resolve(callerCwd)));
 });
 
 test("Browser runtime compatibility binding uses the canonical client and rejects cache upgrade drift until main runtime restart", async () => {

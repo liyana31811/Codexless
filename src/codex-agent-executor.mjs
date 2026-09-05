@@ -142,7 +142,14 @@ function approvalDetails(request, item = null) {
       permissions: boundedApprovalValue(params.permissions ?? {}),
     };
   }
-  return { kind: "unknown" };
+  const humanText = [params.message, params.reason, params.prompt, params.title, params.description]
+    .find((value) => typeof value === "string" && value.trim());
+  return {
+    kind: "unknown",
+    humanText: humanText ? humanText.trim().slice(0, 16_384) : null,
+    schema: boundedApprovalValue(params.schema ?? params.requestSchema ?? params.inputSchema ?? null),
+    availableDecisions: boundedApprovalValue(params.availableDecisions ?? null),
+  };
 }
 
 function approvalSummary(request, item = null) {

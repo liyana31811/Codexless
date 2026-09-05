@@ -55,14 +55,19 @@ export function defaultBrowserRuntimeCwd({ env = process.env } = {}) {
   return path.resolve(override || os.homedir());
 }
 
-export async function resolveBrowserRuntimeCompatibility({ codexBin, chromeSkillPath, env = process.env } = {}) {
+export async function resolveBrowserRuntimeCompatibility({ codexBin, chromeSkillPath, chromePluginBuild, env = process.env } = {}) {
   if (typeof codexBin !== "string" || !codexBin.trim()) {
     throw new Error("resolveBrowserRuntimeCompatibility requires codexBin");
   }
 
   const browserRuntimeCwd = defaultBrowserRuntimeCwd({ env });
-  if (typeof chromeSkillPath !== "string" || !chromeSkillPath.trim()) {
+  const hasSkillPath = typeof chromeSkillPath === "string" && Boolean(chromeSkillPath.trim());
+  const normalizedPluginBuild = typeof chromePluginBuild === "string" ? chromePluginBuild.trim() : "";
+  if (!hasSkillPath && !normalizedPluginBuild) {
     return unavailable("current_chrome_skill_unavailable", { browserRuntimeCwd });
+  }
+  if (normalizedPluginBuild && (!/^[0-9A-Za-z._-]+$/.test(normalizedPluginBuild) || normalizedPluginBuild === "." || normalizedPluginBuild === "..")) {
+    return unavailable("current_chrome_plugin_build_untrusted", { build: normalizedPluginBuild, browserRuntimeCwd });
   }
 
   const codexHome = path.resolve(
@@ -73,28 +78,36 @@ export async function resolveBrowserRuntimeCompatibility({ codexBin, chromeSkill
   const expectedBundleRoot = path.join(codexHome, "plugins", "cache", "openai-bundled");
 
   let bundleRoot;
-  let skillPath;
   try {
-    [bundleRoot, skillPath] = await Promise.all([
-      realpath(expectedBundleRoot),
-      realpath(path.resolve(chromeSkillPath)),
-    ]);
+    bundleRoot = await realpath(expectedBundleRoot);
   } catch {
-    return unavailable("current_chrome_skill_path_untrusted", {
-      chromeSkillPath: path.resolve(chromeSkillPath),
-      browserRuntimeCwd,
-    });
+    return unavailable("current_browser_plugin_path_escape", { browserRuntimeCwd });
   }
 
-  if (!isPathWithin(bundleRoot, skillPath)) {
-    return unavailable("current_chrome_skill_path_untrusted", { chromeSkillPath: skillPath, browserRuntimeCwd });
-  }
-
-  const relativeSkillPath = path.relative(bundleRoot, skillPath);
-  const segments = relativeSkillPath.split(path.sep).filter(Boolean);
-  const [pluginName, build] = segments;
-  if (pluginName?.toLowerCase() !== "chrome" || !build || segments.length < 3) {
-    return unavailable("current_chrome_skill_path_untrusted", { chromeSkillPath: skillPath, browserRuntimeCwd });
+  let skillPath = null;
+  let build = normalizedPluginBuild || null;
+  if (hasSkillPath) {
+    try {
+      skillPath = await realpath(path.resolve(chromeSkillPath));
+    } catch {
+      return unavailable("current_chrome_skill_path_untrusted", {
+        chromeSkillPath: path.resolve(chromeSkillPath),
+        browserRuntimeCwd,
+      });
+    }
+    if (!isPathWithin(bundleRoot, skillPath)) {
+      return unavailable("current_chrome_skill_path_untrusted", { chromeSkillPath: skillPath, browserRuntimeCwd });
+    }
+    const relativeSkillPath = path.relative(bundleRoot, skillPath);
+    const segments = relativeSkillPath.split(path.sep).filter(Boolean);
+    const [pluginName, skillBuild] = segments;
+    if (pluginName?.toLowerCase() !== "chrome" || !skillBuild || segments.length < 3) {
+      return unavailable("current_chrome_skill_path_untrusted", { chromeSkillPath: skillPath, browserRuntimeCwd });
+    }
+    if (build && build !== skillBuild) {
+      return unavailable("current_chrome_plugin_manifest_mismatch", { build, chromeSkillPath: skillPath, browserRuntimeCwd });
+    }
+    build = skillBuild;
   }
 
   const expectedChromeVersionRoot = path.join(bundleRoot, "chrome", build);
@@ -114,7 +127,7 @@ export async function resolveBrowserRuntimeCompatibility({ codexBin, chromeSkill
     });
   }
 
-  if (!isPathWithin(chromeVersionRoot, skillPath)) {
+  if (skillPath && !isPathWithin(chromeVersionRoot, skillPath)) {
     return unavailable("current_chrome_skill_path_untrusted", { build, chromeSkillPath: skillPath, browserRuntimeCwd });
   }
 
@@ -181,9 +194,10 @@ export async function resolveBrowserRuntimeCompatibility({ codexBin, chromeSkill
 
   return {
     status: "ok",
-    source: "codex-skills-list",
+    source: skillPath ? "codex-skills-list" : "codex-plugin-list",
     build,
     chromeSkillPath: skillPath,
+    chromePluginRoot: chromeVersionRoot,
     browserRuntimeCwd,
     browserServicePath,
     browserClientPath,

@@ -2,6 +2,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { resolveAuthorizedExistingFile } from "./construction-tools.mjs";
+import { browserModelRouteRuntimeParserSource } from "./browser-model-route-probe.mjs";
+import { BrowserElementRefRegistry, browserElementNodesFromVisibleDom } from "./browser-element-ref.mjs";
 
 const CHROME_SKILL_NAME = "chrome:control-chrome";
 const NODE_REPL_SERVER = "node_repl";
@@ -9,18 +11,197 @@ const NODE_REPL_TOOL = "js";
 const DEFAULT_MAX_SNAPSHOT_CHARS = 80_000;
 const MAX_SNAPSHOT_CHARS = 200_000;
 const BROWSER_ACTION_APPROVAL_TTL_MS = 5 * 60_000;
+const MAX_BROWSER_BULK_CLOSE_TABS = 100;
 const BROWSER_POST_ACTION_MAX_CHARS = 20_000;
 const BROWSER_FILL_ROLES = new Set(["textbox", "searchbox"]);
 const BROWSER_FIXED_KEYS = new Set(["Enter", "Tab", "Escape"]);
 const MAX_BROWSER_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES = 5_000_000;
+const MAX_WEBMCP_DESCRIPTOR_BYTES = 256_000;
+const MAX_WEBMCP_INPUT_BYTES = 256_000;
+const MAX_WEBMCP_RESULT_BYTES = 200_000;
+const MAX_WEBMCP_HANDLES = 64;
+const BROWSER_MODEL_ROUTE_PROBE_TEXT = "你现在是什么模型？";
+const BROWSER_MODEL_ROUTE_RUNTIME_PARSER_SOURCE = browserModelRouteRuntimeParserSource();
 const PNG_SIGNATURE_HEX = "89504e470d0a1a0a";
 const JPEG_SIGNATURE_HEX = "ffd8ff";
+
+export function sanitizePasswordDomSnapshot(snapshot, descriptors = []) {
+  if (typeof snapshot !== "string" || !snapshot) {
+    return { snapshot, redactedNodeCount: 0, protectedDescriptorCount: 0 };
+  }
+
+  const normalizeText = (value) => typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  const parseRenderedScalar = (value) => {
+    const raw = typeof value === "string" ? value.trim() : "";
+    if (!raw) return "";
+    if (raw.startsWith('"') && raw.endsWith('"')) {
+      try { return normalizeText(JSON.parse(raw)); } catch {}
+    }
+    return normalizeText(raw);
+  };
+  const protectedDescriptors = (Array.isArray(descriptors) ? descriptors : []).map((descriptor) => {
+    const type = normalizeText(descriptor?.type).toLowerCase();
+    const role = normalizeText(descriptor?.role).toLowerCase();
+    if (type !== "password" && role !== "password") return null;
+    const candidateNames = new Set(
+      (Array.isArray(descriptor?.candidateNames) ? descriptor.candidateNames : [])
+        .map(normalizeText)
+        .filter(Boolean)
+    );
+    return { type, role, candidateNames };
+  }).filter(Boolean);
+
+  const lineEnding = snapshot.includes("\r\n") ? "\r\n" : "\n";
+  const lines = snapshot.split(/\r?\n/);
+  const semanticNodes = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = lines[index].match(/^(\s*)-\s+([A-Za-z][\w-]*)(?:\s+("(?:\\.|[^"\\])*"))?/);
+    if (!header || header[2] === "text") continue;
+    const indent = header[1].length;
+    let end = lines.length;
+    for (let next = index + 1; next < lines.length; next += 1) {
+      const peer = lines[next].match(/^(\s*)-\s+([A-Za-z][\w-]*)(?:\s+|:|$)/);
+      if (peer && peer[1].length <= indent) {
+        end = next;
+        break;
+      }
+    }
+    let name = "";
+    if (header[3]) {
+      try { name = normalizeText(JSON.parse(header[3])); } catch {}
+    }
+    const renderedNames = new Set(name ? [name] : []);
+    for (let cursor = index + 1; cursor < end; cursor += 1) {
+      const placeholder = lines[cursor].match(/^\s*-\s+\/placeholder:\s*(.*)$/);
+      if (placeholder) {
+        const rendered = parseRenderedScalar(placeholder[1]);
+        if (rendered) renderedNames.add(rendered);
+      }
+    }
+    semanticNodes.push({ index, end, indent, role: header[2].toLowerCase(), renderedNames });
+  }
+
+  const protectedNodeIndexes = new Set(
+    semanticNodes.filter((node) => node.role === "password").map((node) => node.index)
+  );
+  const bindDescriptorByExactRenderedName = (descriptor, candidateRoles, claimedIndexes) => {
+    if (descriptor.candidateNames.size === 0) {
+      throw new Error("BROWSER_PASSWORD_SNAPSHOT_BINDING_AMBIGUOUS");
+    }
+    const matches = semanticNodes.filter((node) => {
+      if (!candidateRoles.has(node.role) || claimedIndexes.has(node.index)) return false;
+      for (const renderedName of node.renderedNames) {
+        if (descriptor.candidateNames.has(renderedName)) return true;
+      }
+      return false;
+    });
+    if (matches.length !== 1) {
+      throw new Error("BROWSER_PASSWORD_SNAPSHOT_BINDING_AMBIGUOUS");
+    }
+    claimedIndexes.add(matches[0].index);
+    protectedNodeIndexes.add(matches[0].index);
+  };
+
+  const fallbackDescriptors = protectedDescriptors.filter((descriptor) => descriptor.role !== "password");
+  if (fallbackDescriptors.length > 0) {
+    const claimedFallbackIndexes = new Set();
+    for (const descriptor of fallbackDescriptors) {
+      bindDescriptorByExactRenderedName(descriptor, new Set(["textbox", "searchbox"]), claimedFallbackIndexes);
+    }
+  }
+
+  const normalizedRolePasswordDescriptors = protectedDescriptors.filter((descriptor) => descriptor.role === "password");
+  if (normalizedRolePasswordDescriptors.length > 0) {
+    const literalPasswordNodes = semanticNodes.filter((node) => node.role === "password");
+    const claimedGenericIndexes = new Set();
+    for (const descriptor of normalizedRolePasswordDescriptors) {
+      const representedAsLiteralPassword = literalPasswordNodes.some((node) => {
+        if (descriptor.candidateNames.size === 0) return true;
+        for (const renderedName of node.renderedNames) {
+          if (descriptor.candidateNames.has(renderedName)) return true;
+        }
+        return false;
+      });
+      if (representedAsLiteralPassword) continue;
+      bindDescriptorByExactRenderedName(descriptor, new Set(["generic"]), claimedGenericIndexes);
+    }
+  }
+
+  let redactedNodeCount = 0;
+  for (const node of semanticNodes) {
+    if (!protectedNodeIndexes.has(node.index)) continue;
+    let changed = false;
+    const inline = lines[node.index].match(/^(\s*-\s+[A-Za-z][\w-]*(?:\s+"(?:\\.|[^"\\])*")?(?:\s+\[[^\]]+\])*)(:\s*)(.*)$/);
+    if (inline && inline[3].trim()) {
+      lines[node.index] = `${inline[1]}${inline[2]}[PASSWORD_REDACTED]`;
+      changed = true;
+    }
+    for (let cursor = node.index + 1; cursor < node.end; cursor += 1) {
+      const childIndent = lines[cursor].match(/^(\s*)/)?.[1]?.length ?? 0;
+      if (childIndent <= node.indent) continue;
+      const textChild = lines[cursor].match(/^(\s*-\s+text:\s*)(.*)$/);
+      if (textChild && textChild[2].trim()) {
+        lines[cursor] = `${textChild[1]}[PASSWORD_REDACTED]`;
+        changed = true;
+      }
+    }
+    if (changed) redactedNodeCount += 1;
+  }
+
+  return {
+    snapshot: lines.join(lineEnding),
+    redactedNodeCount,
+    protectedDescriptorCount: protectedDescriptors.length,
+  };
+}
+
+const BROWSER_PASSWORD_SNAPSHOT_SANITIZER_SOURCE = `
+const sanitizePasswordDomSnapshot = ${sanitizePasswordDomSnapshot.toString()};
+async function sanitizeBrowserDomSnapshot(tab) {
+  const snapshot = await tab.playwright.domSnapshot();
+  if (typeof snapshot !== "string" || !snapshot) return snapshot;
+  const descriptors = await tab.playwright
+    .locator('input[type="password"], [role="password"]')
+    .filter({ visible: true })
+    .evaluateAll((elements) => elements.map((element) => {
+      const normalize = (value) => typeof value === "string" ? value.replace(/\\s+/g, " ").trim() : "";
+      const candidateNames = [];
+      const add = (value) => {
+        const normalized = normalize(value);
+        if (normalized && !candidateNames.includes(normalized)) candidateNames.push(normalized);
+      };
+      add(element.getAttribute("aria-label"));
+      add(element.getAttribute("placeholder"));
+      add(element.getAttribute("title"));
+      try {
+        for (const label of Array.from(element.labels ?? [])) add(label.innerText ?? label.textContent);
+      } catch {}
+      const labelledBy = normalize(element.getAttribute("aria-labelledby"));
+      if (labelledBy) {
+        try {
+          for (const id of labelledBy.split(/\\s+/)) {
+            const label = element.ownerDocument?.getElementById?.(id);
+            if (label) add(label.innerText ?? label.textContent);
+          }
+        } catch {}
+      }
+      return {
+        type: normalize(element.getAttribute("type")).toLowerCase(),
+        role: normalize(element.getAttribute("role")).toLowerCase(),
+        candidateNames,
+      };
+    }));
+  return sanitizePasswordDomSnapshot(snapshot, descriptors).snapshot;
+}
+`;
+
 const BROWSER_MUTATION_DEFINITIVE_RESPONSE_CODES = new Set([
   "BROWSER_FILL_NOT_APPLIED",
   "BROWSER_FILL_VERIFICATION_UNAVAILABLE",
   "BROWSER_FILL_VERIFY_MISMATCH",
   "BROWSER_FILL_VALUE_UNREADABLE",
+  "BROWSER_FILL_TARGET_NOT_EDITABLE",
   "BROWSER_ACTION_PAGE_CHANGED",
   "BROWSER_ACTION_TARGET_CHANGED",
   "BROWSER_TEXT_TARGET_NOT_SEMANTICALLY_CLICKABLE",
@@ -32,7 +213,124 @@ const BROWSER_MUTATION_DEFINITIVE_RESPONSE_CODES = new Set([
   "BROWSER_ACTION_TARGET_NOT_ENABLED",
   "BROWSER_EXISTING_TAB_RELEASE_UNAVAILABLE",
   "BROWSER_TAB_STALE",
+  "BROWSER_MODEL_ROUTE_HOST_DENIED",
+  "BROWSER_MODEL_ROUTE_LOGIN_REQUIRED",
+  "BROWSER_MODEL_ROUTE_CHAT_SURFACE_REQUIRED",
+  "BROWSER_MODEL_ROUTE_CDP_UNAVAILABLE",
+  "BROWSER_MODEL_ROUTE_LOGIN_OR_PAGE_NOT_READY",
+  "BROWSER_MODEL_ROUTE_EDITOR_NOT_UNIQUE",
+  "BROWSER_MODEL_ROUTE_EDITOR_NOT_EMPTY",
+  "BROWSER_MODEL_ROUTE_EDITOR_FILL_FAILED",
+  "BROWSER_BULK_CLOSE_TAB_STALE",
+  "BROWSER_BULK_CLOSE_TARGET_CHANGED",
+  "BROWSER_BULK_CLOSE_URL_UNAVAILABLE",
+  "BROWSER_BULK_CLOSE_PREDISPATCH_RELEASE_UNPROVEN",
+  "BROWSER_WEBMCP_REF_STALE",
+  "BROWSER_WEBMCP_PAGE_CHANGED",
+  "BROWSER_WEBMCP_TOOL_NOT_LISTED",
+  "BROWSER_ELEMENT_STALE",
+  "BROWSER_ELEMENT_TARGET_CHANGED",
+  "BROWSER_ELEMENT_VISIBLE_DOM_INVALID",
+  "BROWSER_ELEMENT_ACTION_UNSUPPORTED",
 ]);
+
+export function browserFillEditableElementProfile(element) {
+  const tag = typeof element?.tagName === "string" ? element.tagName.toLowerCase() : "";
+  const contentEditableAttr = typeof element?.getAttribute === "function" ? element.getAttribute("contenteditable") : null;
+  const normalizedContentEditableAttr = typeof contentEditableAttr === "string" ? contentEditableAttr.trim().toLowerCase() : null;
+  const effectiveContentEditable = element?.isContentEditable === true
+    || normalizedContentEditableAttr === ""
+    || normalizedContentEditableAttr === "true"
+    || normalizedContentEditableAttr === "plaintext-only";
+  const disabled = element?.disabled === true
+    || element?.inert === true
+    || (typeof element?.getAttribute === "function" && String(element.getAttribute("aria-disabled") ?? "").trim().toLowerCase() === "true");
+  const readOnly = element?.readOnly === true
+    || (typeof element?.hasAttribute === "function" && element.hasAttribute("readonly"))
+    || (typeof element?.getAttribute === "function" && String(element.getAttribute("aria-readonly") ?? "").trim().toLowerCase() === "true");
+  const inputType = tag === "input"
+    ? String((typeof element?.getAttribute === "function" ? element.getAttribute("type") : null) ?? element?.type ?? "text").trim().toLowerCase() || "text"
+    : null;
+  const textInputType = inputType === null || ["text", "search", "email", "url", "tel", "password"].includes(inputType);
+  const blocksSemanticShell = tag === "input"
+    || tag === "textarea"
+    || typeof contentEditableAttr === "string"
+    || element?.isContentEditable === true
+    || disabled
+    || readOnly;
+  if (disabled || readOnly) {
+    return {
+      supported: false,
+      kind: null,
+      tag,
+      inputType,
+      effectiveContentEditable,
+      blocksSemanticShell,
+    };
+  }
+  if (tag === "textarea") {
+    return { supported: true, kind: "textarea", tag, inputType: null, effectiveContentEditable: false, blocksSemanticShell: true };
+  }
+  if (tag === "input") {
+    return {
+      supported: textInputType,
+      kind: textInputType ? "input" : null,
+      tag,
+      inputType,
+      effectiveContentEditable: false,
+      blocksSemanticShell: true,
+    };
+  }
+  if (effectiveContentEditable) {
+    return { supported: true, kind: "contenteditable", tag, inputType: null, effectiveContentEditable: true, blocksSemanticShell: true };
+  }
+  return { supported: false, kind: null, tag, inputType: null, effectiveContentEditable: false, blocksSemanticShell };
+}
+
+export function resolveBoundFillEditableElement(element, isVisibleOverride = null) {
+  if (!element) return { source: null, editableCount: 0, kind: null };
+  const direct = browserFillEditableElementProfile(element);
+  const isVisible = typeof isVisibleOverride === "function"
+    ? isVisibleOverride
+    : (candidate) => {
+        if (!candidate || candidate.nodeType !== 1) return false;
+        const view = candidate.ownerDocument?.defaultView ?? globalThis.window ?? null;
+        const getComputedStyle = typeof view?.getComputedStyle === "function" ? view.getComputedStyle.bind(view) : null;
+        if (getComputedStyle) {
+          const style = getComputedStyle(candidate);
+          if (style.display === "none" || style.visibility !== "visible" || Number(style.opacity) <= 0.01) return false;
+        }
+        if (typeof candidate.getClientRects === "function") {
+          return Array.from(candidate.getClientRects()).some((rect) => rect.width > 0 && rect.height > 0);
+        }
+        return true;
+      };
+  const rawDescendants = typeof element.querySelectorAll === "function"
+    ? Array.from(element.querySelectorAll("input, textarea, [contenteditable]"))
+    : [];
+  const visibleKnownDescendants = rawDescendants.filter((candidate) => isVisible(candidate));
+  const editableDescendants = visibleKnownDescendants.filter((candidate) => browserFillEditableElementProfile(candidate).supported);
+  if (direct.supported) {
+    if (editableDescendants.length > 0) {
+      return { source: null, editableCount: 1 + editableDescendants.length, kind: null };
+    }
+    return { source: "direct", editableCount: 1, kind: direct.kind };
+  }
+  if (editableDescendants.length === 1) {
+    return {
+      source: "unique-visible-descendant",
+      editableCount: 1,
+      kind: browserFillEditableElementProfile(editableDescendants[0]).kind,
+    };
+  }
+  if (editableDescendants.length > 1) {
+    return { source: null, editableCount: editableDescendants.length, kind: null };
+  }
+  if (direct.blocksSemanticShell || visibleKnownDescendants.length > 0) {
+    return { source: null, editableCount: 0, kind: null };
+  }
+  return { source: "semantic-shell", editableCount: 0, kind: "semantic-shell" };
+}
 
 export function canonicalizeContentEditableParagraphText(element) {
   if (!element) return null;
@@ -146,6 +444,7 @@ export function resolveBoundContentEditableParagraphText(element, isVisibleOverr
   };
 }
 
+const BROWSER_FILL_EDITABLE_ELEMENT_PROFILE_SOURCE = browserFillEditableElementProfile.toString();
 const CONTENTEDITABLE_PARAGRAPH_CANONICALIZER_SOURCE = canonicalizeContentEditableParagraphText.toString();
 const BOUND_CONTENTEDITABLE_PARAGRAPH_RESOLVER_SOURCE = resolveBoundContentEditableParagraphText.toString();
 
@@ -180,7 +479,8 @@ export function normalizeBrowserLifecycleShape(browser, tab = null) {
   if (hasMarkDeliverable || hasMarkHandoff) {
     return {
       shape: "finalize-absent-turn-cleanup",
-      existingTabRelease: "unavailable",
+      existingTabRelease: "turn-boundary-auto-release",
+      continuation: hasMarkHandoff ? "markHandoff" : "unavailable",
       deliverable: hasMarkDeliverable ? "markDeliverable" : "unavailable",
     };
   }
@@ -210,9 +510,9 @@ export async function cleanupBrowserClaim(browser, tab) {
     };
   }
   return {
-    cleanupStatus: "unavailable",
+    cleanupStatus: lifecycle.shape === "finalize-absent-turn-cleanup" ? "deferred" : "unavailable",
     cleanupReason: lifecycle.shape === "finalize-absent-turn-cleanup"
-      ? "turn-cleanup-unproven"
+      ? "turn-boundary-auto-release"
       : "explicit-release-unavailable",
     lifecycleShape: lifecycle.shape,
   };
@@ -220,6 +520,15 @@ export async function cleanupBrowserClaim(browser, tab) {
 
 export async function releaseBrowserClaim(browser, tab) {
   return cleanupBrowserClaim(browser, tab);
+}
+
+export async function markBrowserHandoff(browser, tab) {
+  const lifecycle = normalizeBrowserLifecycleShape(browser, tab);
+  if (lifecycle.shape === "finalize-absent-turn-cleanup" && lifecycle.continuation === "markHandoff") {
+    await tab.markHandoff();
+    return lifecycle.shape;
+  }
+  throw new Error(`TOOLWIRE_BROWSER_HANDOFF_API_UNAVAILABLE:${lifecycle.shape}`);
 }
 
 export async function markBrowserDeliverable(browser, tab) {
@@ -240,12 +549,14 @@ const BROWSER_LIFECYCLE_ADAPTER_SOURCE = [
   assertBrowserExistingTabReleaseAvailable.toString(),
   cleanupBrowserClaim.toString(),
   releaseBrowserClaim.toString(),
+  markBrowserHandoff.toString(),
   markBrowserDeliverable.toString(),
 ].join("\n");
 
 export class CodexBrowserExecutor {
   #workbench;
   #defaultCwd;
+  #runtimeCwd;
   #authorityExecutor;
   #runtimeCompatibility = null;
   #runtimeCompatibilityFailure = null;
@@ -255,7 +566,11 @@ export class CodexBrowserExecutor {
   #browserClientUrl = null;
   #tabs = new Map();
   #providerToRef = new Map();
+  #webMcpHandles = new Map();
   #actionApprovals = new Map();
+  #activeMutations = new Map();
+  #elementRefs = new BrowserElementRefRegistry();
+  #emergencyResetInProgress = false;
   #workbenchGeneration = 0;
 
   constructor({
@@ -272,6 +587,12 @@ export class CodexBrowserExecutor {
     }
     this.#workbench = workbench;
     this.#defaultCwd = path.resolve(defaultCwd);
+    const browserRuntimeCwd = runtimeCompatibility?.status === "ok"
+      && typeof runtimeCompatibility?.browserRuntimeCwd === "string"
+      && runtimeCompatibility.browserRuntimeCwd.trim()
+      ? runtimeCompatibility.browserRuntimeCwd
+      : defaultCwd;
+    this.#runtimeCwd = path.resolve(browserRuntimeCwd);
     this.#authorityExecutor = authorityExecutor;
     if (runtimeCompatibility?.status === "unavailable") {
       this.#runtimeCompatibilityFailure = normalizeRuntimeCompatibilityFailure(runtimeCompatibility);
@@ -292,17 +613,67 @@ export class CodexBrowserExecutor {
     return Number.isInteger(this.#workbench?.generation) ? this.#workbench.generation : 0;
   }
 
-  #syncWorkbenchGeneration() {
-    const current = this.#currentWorkbenchGeneration();
-    if (current === this.#workbenchGeneration) return false;
+  #resetLocalBrowserControlBindings(nextGeneration = this.#currentWorkbenchGeneration()) {
     this.#tabs.clear();
     this.#providerToRef.clear();
+    this.#webMcpHandles.clear();
     this.#actionApprovals.clear();
+    this.#elementRefs.clear();
     this.#browserClientUrl = null;
     this.#sessionId = `toolwire-browser-${randomUUID()}`;
     this.#turnSeq = 0;
-    this.#workbenchGeneration = current;
+    this.#workbenchGeneration = nextGeneration;
+  }
+
+  #syncWorkbenchGeneration() {
+    const current = this.#currentWorkbenchGeneration();
+    if (current === this.#workbenchGeneration) return false;
+    this.#resetLocalBrowserControlBindings(current);
     return true;
+  }
+
+  async #readyPreparedAction(actionApprovalRef, prepared) {
+    const effectiveCwd = prepared.cwd;
+    const assertPreparedGeneration = () => {
+      if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
+        throw new BrowserPreviewError(
+          "BROWSER_ACTION_RUNTIME_RESTARTED",
+          "The prepared Browser action belongs to an older Codex Workbench generation and cannot be dispatched",
+          ["Refresh browser_tabs and prepare a fresh exact action from the current Browser runtime."]
+        );
+      }
+    };
+
+    try {
+      await this.#requireReady(effectiveCwd, normalizeBrowserFamily(prepared.family ?? "chrome"));
+    } catch (error) {
+      assertPreparedGeneration();
+      const classified = classifyBrowserError(error);
+      if (classified.code !== "BROWSER_NODE_REPL_DISCOVERY_FAILED") throw classified;
+      try {
+        await this.#requireReady(effectiveCwd, normalizeBrowserFamily(prepared.family ?? "chrome"));
+      } catch (retryError) {
+        assertPreparedGeneration();
+        const retryClassified = classifyBrowserError(retryError);
+        if (retryClassified.code !== "BROWSER_NODE_REPL_DISCOVERY_FAILED") throw retryClassified;
+        throw new BrowserPreviewError(
+          "BROWSER_NODE_REPL_DISCOVERY_FAILED",
+          "Browser node_repl discovery remained unavailable after one bounded pre-dispatch rediscovery attempt; no Browser mutation was dispatched and the prepared action ref remains unconsumed.",
+          ["Retry the same prepared actionApprovalRef after Browser/node_repl recovers. A browser_status warm-up or full re-prepare is not required unless the Browser runtime generation or page state changed."],
+          {
+            failureLayer: "pre_dispatch_discovery",
+            preDispatch: true,
+            safeToRetry: true,
+            internalRediscoveryAttempts: 1,
+            actionRefRetained: true,
+          }
+        );
+      }
+    }
+
+    assertPreparedGeneration();
+    this.#actionApprovals.delete(actionApprovalRef);
+    return effectiveCwd;
   }
 
   async status({ cwd = this.#defaultCwd } = {}) {
@@ -383,11 +754,89 @@ nodeRepl.write(JSON.stringify({ policy: __twPolicy }));
     };
   }
 
-  async listTabs({ cwd = this.#defaultCwd } = {}) {
+  async emergencyResetControlState({ cwd = this.#defaultCwd } = {}) {
+    path.resolve(cwd);
+    this.#syncWorkbenchGeneration();
+    if (typeof this.#workbench?.restart !== "function") {
+      throw new BrowserPreviewError(
+        "BROWSER_EMERGENCY_RESET_UNAVAILABLE",
+        "This Browser runtime does not expose the dedicated Workbench restart primitive required for bounded emergency control-state reset",
+        ["Do not kill Chrome or close user tabs as a substitute. Use a runtime that exposes the dedicated Browser Workbench restart path."]
+      );
+    }
+    if (this.#emergencyResetInProgress) {
+      throw new BrowserPreviewError(
+        "BROWSER_EMERGENCY_RESET_IN_PROGRESS",
+        "A Browser emergency control-state reset is already in progress",
+        ["Do not start another reset or mutation until the current reset returns a receipt."]
+      );
+    }
+    const activeMutations = [...this.#activeMutations.values()];
+    if (activeMutations.length > 0) {
+      throw new BrowserPreviewError(
+        "BROWSER_EMERGENCY_RESET_MUTATION_IN_FLIGHT",
+        "Emergency Browser control-state reset was refused because this Codexless Browser runtime can prove a mutation is still in flight",
+        ["Wait for the current mutation receipt. If its result is uncertain, read current state and follow the no-replay rule before considering a reset."],
+        {
+          activeMutationCount: activeMutations.length,
+          activeMutationKinds: [...new Set(activeMutations.map((entry) => entry.kind))].sort(),
+          generation: this.#workbenchGeneration,
+        }
+      );
+    }
+
+    const before = {
+      generation: this.#workbenchGeneration,
+      tabBindingCount: this.#tabs.size,
+      preparedActionCount: this.#actionApprovals.size,
+      activeMutationCount: 0,
+    };
+    this.#emergencyResetInProgress = true;
+    try {
+      await this.#workbench.restart();
+      const afterGeneration = this.#currentWorkbenchGeneration();
+      this.#resetLocalBrowserControlBindings(afterGeneration);
+      return {
+        status: "reset",
+        action: "browser_control_state_emergency_reset",
+        before,
+        after: {
+          generation: afterGeneration,
+          tabBindingCount: 0,
+          preparedActionCount: 0,
+          activeMutationCount: 0,
+        },
+        generationAdvanced: afterGeneration > before.generation,
+        chromeTabsClosed: 0,
+        browserMutationReplayed: false,
+        note: "Emergency reset restarted only the dedicated Browser Workbench/control plane, invalidated all prior Browser tabRef/prepared-action bindings, and did not close, navigate, click, fill, submit, or replay any Chrome page action. This is an administrator fallback, not a replacement for normal claim handback/stale-owner recovery.",
+      };
+    } catch (error) {
+      const afterGeneration = this.#currentWorkbenchGeneration();
+      this.#resetLocalBrowserControlBindings(afterGeneration);
+      throw new BrowserPreviewError(
+        "BROWSER_EMERGENCY_RESET_FAILED",
+        `Emergency Browser control-state reset did not complete cleanly: ${error instanceof Error ? error.message : String(error)}`,
+        ["Treat all prior Browser tabRef/prepared-action refs as invalid. Check browser_status/browser_tabs before any fresh action; do not replay a prior mutation automatically."],
+        {
+          beforeGeneration: before.generation,
+          afterGeneration,
+          localBindingsInvalidated: true,
+          chromeTabsClosed: 0,
+        }
+      );
+    } finally {
+      this.#emergencyResetInProgress = false;
+    }
+  }
+
+  async listTabs({ family = "chrome", cwd = this.#defaultCwd } = {}) {
     const effectiveCwd = path.resolve(cwd);
-    await this.#requireReady(effectiveCwd);
+    const browserFamily = normalizeBrowserFamily(family);
+    await this.#requireReady(effectiveCwd, browserFamily);
+    const familyLiteral = JSON.stringify(browserFamily);
     const rawTabs = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twTabs = await __twBrowser.user.openTabs();
 nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
   providerTabId: tab.providerTabId,
@@ -398,7 +847,7 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
 `, "List current Chrome tabs");
 
     if (!Array.isArray(rawTabs)) {
-      throw new BrowserPreviewError("BROWSER_PROTOCOL_ERROR", "Chrome openTabs returned a non-array result");
+      throw new BrowserPreviewError("BROWSER_PROTOCOL_ERROR", `${browserFamily} openTabs returned a non-array result`);
     }
 
     const currentProviders = new Set();
@@ -406,14 +855,16 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
     for (const raw of rawTabs) {
       const providerTabId = typeof raw?.providerTabId === "string" ? raw.providerTabId : null;
       if (!providerTabId) continue;
-      currentProviders.add(providerTabId);
-      let tabRef = this.#providerToRef.get(providerTabId);
+      const providerKey = `${browserFamily}:${providerTabId}`;
+      currentProviders.add(providerKey);
+      let tabRef = this.#providerToRef.get(providerKey);
       if (!tabRef) {
         tabRef = `browser_tab_${randomUUID()}`;
-        this.#providerToRef.set(providerTabId, tabRef);
+        this.#providerToRef.set(providerKey, tabRef);
       }
       const state = {
         tabRef,
+        family: browserFamily,
         providerTabId,
         workbenchGeneration: this.#workbenchGeneration,
         title: stringOrNull(raw.title),
@@ -425,19 +876,21 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
       tabs.push(publicTab(state));
     }
 
-    for (const [providerTabId, tabRef] of this.#providerToRef.entries()) {
-      if (!currentProviders.has(providerTabId)) {
-        this.#providerToRef.delete(providerTabId);
+    for (const [providerKey, tabRef] of this.#providerToRef.entries()) {
+      if (!providerKey.startsWith(`${browserFamily}:`)) continue;
+      if (!currentProviders.has(providerKey)) {
+        this.#providerToRef.delete(providerKey);
         this.#tabs.delete(tabRef);
+        this.#elementRefs.invalidateTab(tabRef);
       }
     }
 
     return {
       status: "ok",
-      browser: "chrome",
+      browser: browserFamily,
       count: tabs.length,
       tabs,
-      note: "tabRef values are opaque and valid only while this Workbench runtime can still match the same open Chrome tab. Call codex.browser_tabs again after a backend restart or when a tab closes/moves unexpectedly.",
+      note: `tabRef values are opaque, bound to the ${browserFamily} family, and valid only while this Workbench runtime can still match the same open tab. Call codex.browser_tabs again after a backend restart or when a tab closes/moves unexpectedly.`,
     };
   }
 
@@ -452,19 +905,21 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
         `maxChars must be an integer between 1000 and ${MAX_SNAPSHOT_CHARS}`
       );
     }
-    await this.#requireReady(effectiveCwd);
     const state = this.#tabs.get(tabRef);
     if (!state) {
       throw new BrowserPreviewError(
         "BROWSER_TAB_REF_UNKNOWN",
         `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
+        ["Call codex.browser_tabs again and use a fresh tabRef from the current browser family."]
       );
     }
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
+    const familyLiteral = JSON.stringify(browserFamily);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -502,7 +957,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     this.#tabs.set(tabRef, current);
     return {
       status: "ok",
-      browser: "chrome",
+      browser: browserFamily,
       tab: publicTab(current),
       snapshot: truncated ? snapshot.slice(0, maxChars) : snapshot,
       snapshotChars: snapshot.length,
@@ -513,24 +968,312 @@ nodeRepl.write(JSON.stringify(__twPayload));
     };
   }
 
-  async screenshotTab({ tabRef, cwd = this.#defaultCwd }) {
+  async #discardWebMcpNodeHandle(cwd, webMcpRef, expectedGeneration = null) {
+    this.#webMcpHandles.delete(webMcpRef);
+    try {
+      const refLiteral = JSON.stringify(webMcpRef);
+      await this.#runJson(cwd, `
+globalThis.__codexlessWebMcpHandles?.delete(${refLiteral});
+nodeRepl.write(JSON.stringify({ discarded: true }));
+`, "Discard current Browser WebMCP handle", { expectedGeneration });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async discoverWebMcp({ tabRef, cwd = this.#defaultCwd }) {
     const effectiveCwd = path.resolve(cwd);
     if (typeof tabRef !== "string" || !tabRef) {
       throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
     }
-    await this.#requireReady(effectiveCwd);
     const state = this.#tabs.get(tabRef);
     if (!state) {
       throw new BrowserPreviewError(
         "BROWSER_TAB_REF_UNKNOWN",
         `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
+        ["Call codex.browser_tabs again and use a fresh tabRef from the current browser family."]
+      );
+    }
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
+
+    const webMcpRef = `browser_webmcp_${randomUUID()}`;
+    const refLiteral = JSON.stringify(webMcpRef);
+    const providerLiteral = JSON.stringify(state.providerTabId);
+    const familyLiteral = JSON.stringify(browserFamily);
+    let result;
+    try {
+      result = await this.#runJson(effectiveCwd, `
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+const __twOpenTabs = await __twBrowser.user.openTabs();
+const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
+if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
+let __twTab = null;
+let __twPayload = null;
+let __twCleanup = null;
+let __twTools = null;
+try {
+  __twTab = await __twBrowser.user.claimTab(__twInfo);
+  const __twUrl = (await __twTab.url()) ?? __twInfo.url ?? null;
+  if (typeof __twUrl !== "string" || !__twUrl) throw new Error("TOOLWIRE_BROWSER_WEBMCP_URL_UNAVAILABLE");
+  const __twWebMcp = await __twTab.capabilities.get("webmcp");
+  __twTools = await __twWebMcp.fetchTools();
+  const __twDescription = __twTools.description();
+  if (typeof __twDescription !== "string") throw new Error("TOOLWIRE_BROWSER_WEBMCP_PROTOCOL_ERROR:description");
+  const __twDescriptionBytes = Buffer.byteLength(__twDescription, "utf8");
+  if (__twDescriptionBytes > ${MAX_WEBMCP_DESCRIPTOR_BYTES}) throw new Error("TOOLWIRE_BROWSER_WEBMCP_DESCRIPTOR_TOO_LARGE:" + __twDescriptionBytes);
+  __twPayload = {
+    title: __twInfo.title ?? null,
+    url: __twUrl,
+    lastOpened: __twInfo.lastOpened ?? null,
+    description: __twDescription,
+    descriptionBytes: __twDescriptionBytes,
+  };
+} finally {
+  if (__twTab) __twCleanup = await cleanupBrowserClaim(__twBrowser, __twTab);
+}
+if (__twPayload && __twCleanup) Object.assign(__twPayload, __twCleanup);
+if (__twPayload && __twTools) {
+  globalThis.__codexlessWebMcpHandles ??= new Map();
+  while (globalThis.__codexlessWebMcpHandles.size >= ${MAX_WEBMCP_HANDLES}) {
+    const __twOldest = globalThis.__codexlessWebMcpHandles.keys().next().value;
+    if (__twOldest === undefined) break;
+    globalThis.__codexlessWebMcpHandles.delete(__twOldest);
+  }
+  globalThis.__codexlessWebMcpHandles.set(${refLiteral}, { tools: __twTools, family: ${familyLiteral}, providerTabId: ${providerLiteral}, url: __twPayload.url });
+}
+nodeRepl.write(JSON.stringify(__twPayload));
+`, "Discover current Browser WebMCP tools", { expectedGeneration: state.workbenchGeneration });
+    } catch (error) {
+      await this.#discardWebMcpNodeHandle(effectiveCwd, webMcpRef, state.workbenchGeneration);
+      throw error;
+    }
+
+    const description = typeof result?.description === "string" ? result.description : null;
+    if (description === null) {
+      await this.#discardWebMcpNodeHandle(effectiveCwd, webMcpRef, state.workbenchGeneration);
+      throw new BrowserPreviewError("BROWSER_WEBMCP_PROTOCOL_ERROR", "The stock Browser WebMCP capability returned no tool description");
+    }
+    const current = {
+      ...state,
+      title: stringOrNull(result?.title) ?? state.title,
+      url: stringOrNull(result?.url) ?? state.url,
+      lastOpened: stringOrNull(result?.lastOpened) ?? state.lastOpened,
+      seenAt: Date.now(),
+    };
+    this.#tabs.set(tabRef, current);
+    while (this.#webMcpHandles.size >= MAX_WEBMCP_HANDLES) {
+      const oldest = this.#webMcpHandles.keys().next().value;
+      if (oldest === undefined) break;
+      const oldestBinding = this.#webMcpHandles.get(oldest);
+      await this.#discardWebMcpNodeHandle(
+        oldestBinding?.cwd ?? effectiveCwd,
+        oldest,
+        oldestBinding?.workbenchGeneration ?? state.workbenchGeneration
+      );
+    }
+    this.#webMcpHandles.set(webMcpRef, {
+      webMcpRef,
+      tabRef,
+      family: browserFamily,
+      providerTabId: state.providerTabId,
+      expectedUrl: current.url,
+      cwd: effectiveCwd,
+      workbenchGeneration: state.workbenchGeneration,
+    });
+    return {
+      status: "discovered",
+      browser: browserFamily,
+      webMcpRef,
+      tab: publicTab(current),
+      description,
+      descriptionBytes: Number.isInteger(result?.descriptionBytes) ? result.descriptionBytes : Buffer.byteLength(description, "utf8"),
+      ...browserCleanupReceipt(result),
+      note: "This directly reuses the stock Codex Browser tab WebMCP capability and its fetched tool handle. Call only a tool listed in description. This opaque webMcpRef is single-dispatch: once a page-defined call is attempted, Codexless consumes it so an uncertain or successful side effect cannot be replayed through the same ref. Rediscover from the same server-bound browser family/current page for any later distinct call. If description says no WebMCP tools are available, use the existing DOM Browser path instead.",
+    };
+  }
+
+  async callWebMcp({ webMcpRef, toolName, input, timeoutMs = undefined }) {
+    if (typeof webMcpRef !== "string" || !webMcpRef.startsWith("browser_webmcp_")) {
+      throw new BrowserPreviewError("BROWSER_WEBMCP_REF_INVALID", "webMcpRef must be the opaque reference returned by codex.browser_webmcp_discover");
+    }
+    const normalizedToolName = typeof toolName === "string" ? toolName.trim() : "";
+    if (!normalizedToolName || normalizedToolName.length > 256) {
+      throw new BrowserPreviewError("BROWSER_WEBMCP_TOOL_NAME_INVALID", "toolName must be a non-empty listed WebMCP tool name of at most 256 characters");
+    }
+    if (input === undefined) {
+      throw new BrowserPreviewError("BROWSER_WEBMCP_INPUT_REQUIRED", "input is required; use null only when the listed WebMCP tool accepts null");
+    }
+    if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000)) {
+      throw new BrowserPreviewError("BROWSER_WEBMCP_TIMEOUT_INVALID", "timeoutMs must be an integer between 1 and 120000 when provided");
+    }
+    const binding = this.#webMcpHandles.get(webMcpRef);
+    if (!binding) {
+      throw new BrowserPreviewError(
+        "BROWSER_WEBMCP_REF_UNKNOWN",
+        "The WebMCP handle is unknown or no longer bound to this Browser runtime",
+        ["Rediscover WebMCP tools from the current tab only if the page still needs a page-defined tool."]
+      );
+    }
+    const state = this.#tabs.get(binding.tabRef);
+    const browserFamily = normalizeBrowserFamily(binding.family ?? state?.family ?? "chrome");
+    if (
+      !state
+      || state.providerTabId !== binding.providerTabId
+      || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily
+      || state.workbenchGeneration !== binding.workbenchGeneration
+    ) {
+      await this.#discardWebMcpNodeHandle(binding.cwd, webMcpRef, binding.workbenchGeneration);
+      throw new BrowserPreviewError(
+        "BROWSER_WEBMCP_REF_STALE",
+        "The WebMCP handle no longer matches the server-bound Browser tab/runtime/family",
+        ["Refresh browser_tabs and rediscover WebMCP tools from the current page; do not replay a prior WebMCP call automatically."]
+      );
+    }
+    const effectiveCwd = binding.cwd;
+    await this.#requireReady(effectiveCwd, browserFamily);
+    if (binding.workbenchGeneration !== this.#workbenchGeneration) {
+      await this.#discardWebMcpNodeHandle(effectiveCwd, webMcpRef, binding.workbenchGeneration);
+      throw new BrowserPreviewError(
+        "BROWSER_WEBMCP_REF_STALE",
+        "The WebMCP handle belongs to an older Browser Workbench generation",
+        ["Refresh browser_tabs and rediscover WebMCP tools from the current page."]
       );
     }
 
+    let inputLiteral;
+    try { inputLiteral = JSON.stringify(input); } catch {}
+    if (inputLiteral === undefined) {
+      throw new BrowserPreviewError("BROWSER_WEBMCP_INPUT_INVALID", "input must be JSON-serializable");
+    }
+    const inputBytes = Buffer.byteLength(inputLiteral, "utf8");
+    if (inputBytes > MAX_WEBMCP_INPUT_BYTES) {
+      throw new BrowserPreviewError(
+        "BROWSER_WEBMCP_INPUT_TOO_LARGE",
+        `WebMCP input is ${inputBytes} bytes, above the Browser runtime's ${MAX_WEBMCP_INPUT_BYTES}-byte remote projection limit`,
+        ["Reduce the page-defined tool input instead of widening the remote projection automatically."]
+      );
+    }
+    const refLiteral = JSON.stringify(webMcpRef);
+    const familyLiteral = JSON.stringify(browserFamily);
+    const providerLiteral = JSON.stringify(binding.providerTabId);
+    const expectedUrlLiteral = JSON.stringify(binding.expectedUrl);
+    const toolNameLiteral = JSON.stringify(normalizedToolName);
+    const timeoutLiteral = timeoutMs === undefined ? "undefined" : String(timeoutMs);
+    let result;
+    try {
+      result = await this.#runJson(effectiveCwd, `
+const __twEntry = globalThis.__codexlessWebMcpHandles?.get(${refLiteral});
+if (!__twEntry || __twEntry.family !== ${familyLiteral} || __twEntry.providerTabId !== ${providerLiteral} || __twEntry.url !== ${expectedUrlLiteral}) throw new Error("TOOLWIRE_BROWSER_WEBMCP_HANDLE_STALE");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+const __twOpenTabs = await __twBrowser.user.openTabs();
+const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
+if (!__twInfo) {
+  globalThis.__codexlessWebMcpHandles.delete(${refLiteral});
+  throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
+}
+if ((__twInfo.url ?? null) !== ${expectedUrlLiteral}) {
+  globalThis.__codexlessWebMcpHandles.delete(${refLiteral});
+  throw new Error("TOOLWIRE_BROWSER_WEBMCP_PAGE_CHANGED");
+}
+let __twTab = null;
+let __twPayload = null;
+let __twCleanup = null;
+let __twCleanupError = null;
+try {
+  __twTab = await __twBrowser.user.claimTab(__twInfo);
+  const __twCurrentUrl = (await __twTab.url()) ?? __twInfo.url ?? null;
+  if (__twCurrentUrl !== ${expectedUrlLiteral}) {
+    globalThis.__codexlessWebMcpHandles.delete(${refLiteral});
+    throw new Error("TOOLWIRE_BROWSER_WEBMCP_PAGE_CHANGED");
+  }
+  let __twDispatchAttempted = false;
+  try {
+    globalThis.__codexlessWebMcpHandles.delete(${refLiteral});
+    __twDispatchAttempted = true;
+    const __twResult = await __twEntry.tools.call(${toolNameLiteral}, ${inputLiteral}, {
+      ...(${timeoutLiteral} === undefined ? {} : { timeoutMs: ${timeoutLiteral} }),
+    });
+    let __twResultJson = null;
+    try { __twResultJson = JSON.stringify(__twResult); } catch {}
+    const __twResultBytes = typeof __twResultJson === "string" ? Buffer.byteLength(__twResultJson, "utf8") : 0;
+    __twPayload = typeof __twResultJson !== "string" || __twResultBytes > ${MAX_WEBMCP_RESULT_BYTES}
+      ? { resultOmitted: true, resultBytes: __twResultBytes }
+      : { result: __twResult, resultOmitted: false, resultBytes: __twResultBytes };
+  } catch (__twError) {
+    const __twMessage = __twError instanceof Error ? __twError.message : String(__twError);
+    if (/registration is stale/i.test(__twMessage)) {
+      globalThis.__codexlessWebMcpHandles.delete(${refLiteral});
+      throw new Error("TOOLWIRE_BROWSER_WEBMCP_HANDLE_STALE");
+    }
+    if (/is not available in this snapshot/i.test(__twMessage)) {
+      if (__twDispatchAttempted) globalThis.__codexlessWebMcpHandles.set(${refLiteral}, __twEntry);
+      throw new Error("TOOLWIRE_BROWSER_WEBMCP_TOOL_NOT_LISTED");
+    }
+    throw __twError;
+  }
+} finally {
+  if (__twTab) {
+    try { __twCleanup = await cleanupBrowserClaim(__twBrowser, __twTab); } catch (__twError) { __twCleanupError = __twError; }
+  }
+}
+if (__twPayload && __twCleanupError) {
+  const __twCleanupMessage = __twCleanupError instanceof Error ? __twCleanupError.message : String(__twCleanupError);
+  throw new Error("TOOLWIRE_BROWSER_WEBMCP_CALL_RESULT_UNCERTAIN:cleanup failed after confirmed WebMCP call: " + __twCleanupMessage);
+}
+if (__twCleanupError) throw __twCleanupError;
+if (__twPayload && __twCleanup) Object.assign(__twPayload, __twCleanup);
+nodeRepl.write(JSON.stringify(__twPayload));
+`, "Call current Browser WebMCP tool", { mutationKind: "webmcp_call", expectedGeneration: binding.workbenchGeneration });
+    } catch (error) {
+      const reusablePreDispatch = error instanceof BrowserPreviewError
+        && ["BROWSER_WEBMCP_TOOL_NOT_LISTED", "BROWSER_TAB_BUSY"].includes(error.code);
+      if (!reusablePreDispatch) {
+        await this.#discardWebMcpNodeHandle(effectiveCwd, webMcpRef, binding.workbenchGeneration);
+      }
+      throw error;
+    }
+
+    this.#webMcpHandles.delete(webMcpRef);
+    const resultOmitted = result?.resultOmitted === true;
+    const resultBytes = Number.isInteger(result?.resultBytes) ? result.resultBytes : 0;
+    return {
+      status: "called",
+      browser: browserFamily,
+      webMcpRef,
+      toolName: normalizedToolName,
+      callConfirmed: true,
+      tabRef: binding.tabRef,
+      ...(resultOmitted ? { resultOmitted: true, resultBytes } : { result: result?.result, resultOmitted: false, resultBytes }),
+      ...browserCleanupReceipt(result),
+      noAutomaticReplay: true,
+      note: resultOmitted
+        ? "The stock WebMCP tool call returned successfully, but Codexless omitted the oversized or non-serializable result from the remote projection. Do not replay the call merely to recover output; read the page/current task state first."
+        : "The listed page-defined tool was called through the stock WebMCP handle. Upstream Browser confirmation/security semantics remain authoritative. This webMcpRef is now consumed and cannot be used again; rediscover from the same server-bound browser family/current page only for a later distinct call. If the call's side effect matters, read the bound tab/page state before deciding whether another action is needed.",
+    };
+  }
+
+  async screenshotTab({ tabRef, cwd = this.#defaultCwd }) {
+    const effectiveCwd = path.resolve(cwd);
+    if (typeof tabRef !== "string" || !tabRef) {
+      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
+    }
+    const state = this.#tabs.get(tabRef);
+    if (!state) {
+      throw new BrowserPreviewError(
+        "BROWSER_TAB_REF_UNKNOWN",
+        `unknown or expired browser tabRef: ${tabRef}`,
+        ["Call codex.browser_tabs again and use a fresh tabRef from the current browser family."]
+      );
+    }
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
+
     const providerLiteral = JSON.stringify(state.providerTabId);
+    const familyLiteral = JSON.stringify(browserFamily);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -593,7 +1336,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     this.#tabs.set(tabRef, current);
     return {
       status: "ok",
-      browser: "chrome",
+      browser: browserFamily,
       tab: publicTab(current),
       mimeType,
       byteLength: bytes.length,
@@ -611,7 +1354,6 @@ nodeRepl.write(JSON.stringify(__twPayload));
     if (typeof tabRef !== "string" || !tabRef) {
       throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
     }
-    await this.#requireReady(effectiveCwd);
     const state = this.#tabs.get(tabRef);
     if (!state) {
       throw new BrowserPreviewError(
@@ -621,9 +1363,12 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
 
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -657,6 +1402,7 @@ nodeRepl.write(JSON.stringify({
       actionApprovalRef,
       kind: "close_tab",
       tabRef,
+      family: browserFamily,
       providerTabId: state.providerTabId,
       expectedUrl: currentUrl,
       cwd: effectiveCwd,
@@ -693,9 +1439,7 @@ nodeRepl.write(JSON.stringify({
         ["Call codex.browser_tabs and codex.browser_prepare_close_tab again only if the exact tab still needs to be closed."]
       );
     }
-    this.#actionApprovals.delete(actionApprovalRef);
-    const effectiveCwd = prepared.cwd;
-    await this.#requireReady(effectiveCwd);
+    const effectiveCwd = await this.#readyPreparedAction(actionApprovalRef, prepared);
     if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_RUNTIME_RESTARTED",
@@ -704,18 +1448,20 @@ nodeRepl.write(JSON.stringify({
       );
     }
     const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
+    const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
+    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
-        "The prepared tab close no longer matches a current Browser runtime tab",
+        "The prepared tab close no longer matches a current Browser runtime tab or Browser family",
         ["Call codex.browser_tabs and prepare a fresh close only for the exact current tab that still needs closing."]
       );
     }
 
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -762,12 +1508,13 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     this.#tabs.delete(prepared.tabRef);
-    if (this.#providerToRef.get(prepared.providerTabId) === prepared.tabRef) {
-      this.#providerToRef.delete(prepared.providerTabId);
+    const providerKey = `${browserFamily}:${prepared.providerTabId}`;
+    if (this.#providerToRef.get(providerKey) === prepared.tabRef) {
+      this.#providerToRef.delete(providerKey);
     }
     return {
       status: "closed",
-      browser: "chrome",
+      browser: browserFamily,
       action: { kind: "close_tab" },
       tab: publicTab({
         ...state,
@@ -778,16 +1525,309 @@ nodeRepl.write(JSON.stringify(__twPayload));
     };
   }
 
-  async prepareOpenTab({ url, cwd = this.#defaultCwd }) {
+  async prepareBulkCloseTabs({ tabRefs, cwd = this.#defaultCwd }) {
     const effectiveCwd = path.resolve(cwd);
+    if (!Array.isArray(tabRefs) || tabRefs.length < 1 || tabRefs.length > MAX_BROWSER_BULK_CLOSE_TABS) {
+      throw new BrowserPreviewError(
+        "BROWSER_BULK_CLOSE_TAB_REFS_INVALID",
+        `tabRefs must contain between 1 and ${MAX_BROWSER_BULK_CLOSE_TABS} opaque refs returned by codex.browser_tabs`
+      );
+    }
+    if (!tabRefs.every((value) => typeof value === "string" && value.startsWith("browser_tab_"))) {
+      throw new BrowserPreviewError(
+        "BROWSER_BULK_CLOSE_TAB_REFS_INVALID",
+        "Every bulk-close target must be an opaque browser_tab_ ref returned by codex.browser_tabs; raw provider ids, URLs, titles, selectors, and indexes are not accepted"
+      );
+    }
+    if (new Set(tabRefs).size !== tabRefs.length) {
+      throw new BrowserPreviewError(
+        "BROWSER_BULK_CLOSE_DUPLICATE_TAB_REF",
+        "Bulk-close tabRefs must be an exact set with no duplicate tabRef values"
+      );
+    }
+    const requested = tabRefs.map((tabRef) => {
+      const state = this.#tabs.get(tabRef);
+      if (!state) {
+        throw new BrowserPreviewError(
+          "BROWSER_TAB_REF_UNKNOWN",
+          `unknown or expired browser tabRef in bulk-close set: ${tabRef}`,
+          ["Call codex.browser_tabs again and prepare a new exact set from current opaque tabRefs."]
+        );
+      }
+      return state;
+    });
+    const requestedFamilies = [...new Set(requested.map((state) => normalizeBrowserFamily(state.family ?? "chrome")))];
+    if (requestedFamilies.length !== 1) {
+      throw new BrowserPreviewError(
+        "BROWSER_BULK_CLOSE_FAMILY_MIXED",
+        "Bulk-close tabRefs must all belong to the same server-bound Browser family",
+        ["Prepare separate exact sets for Chrome and Edge; do not mix opaque refs across Browser families."]
+      );
+    }
+    const browserFamily = requestedFamilies[0];
+    await this.#requireReady(effectiveCwd, browserFamily);
+    const familyLiteral = JSON.stringify(browserFamily);
+    const requestedLiteral = JSON.stringify(requested.map((state) => ({ providerTabId: state.providerTabId })));
+    const result = await this.#runJson(effectiveCwd, `
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+const __twOpenTabs = await __twBrowser.user.openTabs();
+const __twRequested = ${requestedLiteral};
+const __twRows = [];
+for (let __twIndex = 0; __twIndex < __twRequested.length; __twIndex += 1) {
+  const __twTarget = __twRequested[__twIndex];
+  const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === __twTarget.providerTabId);
+  if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_BULK_CLOSE_TAB_STALE:" + __twIndex);
+  const __twUrl = typeof __twInfo.url === "string" ? __twInfo.url : null;
+  if (!__twUrl) throw new Error("TOOLWIRE_BROWSER_BULK_CLOSE_URL_UNAVAILABLE:" + __twIndex);
+  __twRows.push({
+    providerTabId: __twTarget.providerTabId,
+    title: __twInfo.title ?? null,
+    url: __twUrl,
+    lastOpened: __twInfo.lastOpened ?? null,
+  });
+}
+nodeRepl.write(JSON.stringify({ rows: __twRows }));
+`, "Prepare exact-set Chrome bulk tab close", { expectedGeneration: this.#workbenchGeneration });
+
+    const rows = Array.isArray(result?.rows) ? result.rows : [];
+    if (rows.length !== requested.length) {
+      throw new BrowserPreviewError(
+        "BROWSER_PROTOCOL_ERROR",
+        "Bulk-close preparation did not return one current binding for every requested tabRef"
+      );
+    }
+    const targets = rows.map((row, index) => {
+      const prior = requested[index];
+      if (row?.providerTabId !== prior.providerTabId || typeof row?.url !== "string" || !row.url) {
+        throw new BrowserPreviewError(
+          "BROWSER_PROTOCOL_ERROR",
+          "Bulk-close preparation returned a mismatched provider identity or missing URL"
+        );
+      }
+      const current = {
+        ...prior,
+        title: stringOrNull(row.title) ?? prior.title,
+        url: row.url,
+        lastOpened: stringOrNull(row.lastOpened) ?? prior.lastOpened,
+        seenAt: Date.now(),
+      };
+      this.#tabs.set(prior.tabRef, current);
+      return {
+        tabRef: prior.tabRef,
+        family: browserFamily,
+        providerTabId: prior.providerTabId,
+        expectedUrl: row.url,
+        title: current.title,
+        lastOpened: current.lastOpened,
+      };
+    });
+
+    this.#cleanupActionApprovals();
+    const actionApprovalRef = `browser_action_${randomUUID()}`;
+    const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
+    const prepared = {
+      actionApprovalRef,
+      kind: "bulk_close_tabs",
+      family: browserFamily,
+      targets,
+      cwd: effectiveCwd,
+      workbenchGeneration: this.#workbenchGeneration,
+      expiresAt,
+    };
+    this.#actionApprovals.set(actionApprovalRef, prepared);
+    return {
+      status: "prepared",
+      actionApprovalRef,
+      expiresAt,
+      action: {
+        kind: "bulk_close_tabs",
+        count: targets.length,
+        tabs: targets.map((target) => ({
+          tabRef: target.tabRef,
+          family: target.family,
+          title: target.title,
+          url: target.expectedUrl,
+          lastOpened: target.lastOpened,
+        })),
+      },
+      nextAction: "This is an explicitly destructive administrator action because closing real Chrome tabs can discard unsaved page state. Apply the current Browser confirmation policy and user authorization to this exact prepared set, then call codex.browser_bulk_close_tabs with only this opaque actionApprovalRef. Preparing did not claim or close any tab.",
+    };
+  }
+
+  async bulkCloseTabs({ actionApprovalRef }) {
+    this.#cleanupActionApprovals();
+    if (typeof actionApprovalRef !== "string" || !actionApprovalRef.startsWith("browser_action_")) {
+      throw new BrowserPreviewError(
+        "BROWSER_ACTION_REF_INVALID",
+        "actionApprovalRef must be the opaque single-use reference returned by codex.browser_prepare_bulk_close_tabs"
+      );
+    }
+    const prepared = this.#actionApprovals.get(actionApprovalRef);
+    if (!prepared || prepared.kind !== "bulk_close_tabs" || !Array.isArray(prepared.targets) || prepared.targets.length < 1) {
+      throw new BrowserPreviewError(
+        "BROWSER_ACTION_REF_EXPIRED",
+        "actionApprovalRef is invalid, expired, already consumed, or does not refer to a prepared exact-set bulk tab close",
+        ["Call codex.browser_tabs and prepare a new exact set only for tabs that still need closing."]
+      );
+    }
+    const effectiveCwd = await this.#readyPreparedAction(actionApprovalRef, prepared);
+    if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
+      throw new BrowserPreviewError(
+        "BROWSER_ACTION_RUNTIME_RESTARTED",
+        "The prepared bulk tab-close set belongs to an older Browser Workbench generation and cannot be dispatched",
+        ["Refresh browser_tabs and prepare a fresh exact set. Do not reuse or replay the old bulk-close ref."]
+      );
+    }
+
+    const browserFamily = normalizeBrowserFamily(prepared.family ?? prepared.targets[0]?.family ?? "chrome");
+    if (prepared.targets.some((target) => normalizeBrowserFamily(target.family ?? "chrome") !== browserFamily)) {
+      throw new BrowserPreviewError(
+        "BROWSER_ACTION_TAB_STALE",
+        "The prepared bulk tab-close set no longer has one consistent server-bound Browser family",
+        ["Refresh browser_tabs and prepare separate exact sets per Browser family."]
+      );
+    }
+    const familyLiteral = JSON.stringify(browserFamily);
+    const confirmedClosed = [];
+    const publicTarget = (target) => ({
+      tabRef: target.tabRef,
+      family: target.family ?? browserFamily,
+      title: target.title,
+      url: target.expectedUrl,
+      lastOpened: target.lastOpened,
+    });
+    for (let index = 0; index < prepared.targets.length; index += 1) {
+      const target = prepared.targets[index];
+      const providerLiteral = JSON.stringify(target.providerTabId);
+      const expectedUrlLiteral = JSON.stringify(target.expectedUrl);
+      let result;
+      try {
+        result = await this.#runJson(effectiveCwd, `
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+const __twOpenTabs = await __twBrowser.user.openTabs();
+const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
+if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_BULK_CLOSE_TAB_STALE");
+const __twObservedUrl = typeof __twInfo.url === "string" ? __twInfo.url : null;
+if (__twObservedUrl !== ${expectedUrlLiteral}) throw new Error("TOOLWIRE_BROWSER_BULK_CLOSE_URL_CHANGED");
+let __twTab = null;
+let __twPayload = null;
+let __twDispatchAttempted = false;
+let __twActionError = null;
+let __twCleanup = null;
+let __twCleanupError = null;
+try {
+  __twTab = await __twBrowser.user.claimTab(__twInfo);
+  const __twBeforeUrl = (await __twTab.url()) ?? __twObservedUrl;
+  if (__twBeforeUrl !== ${expectedUrlLiteral}) throw new Error("TOOLWIRE_BROWSER_BULK_CLOSE_URL_CHANGED");
+  __twDispatchAttempted = true;
+  await __twTab.close();
+  __twPayload = { beforeUrl: __twBeforeUrl, closed: true };
+} catch (__twError) {
+  __twActionError = __twError;
+} finally {
+  if (__twTab && !__twDispatchAttempted) {
+    try {
+      __twCleanup = await cleanupBrowserClaim(__twBrowser, __twTab);
+    } catch (__twError) {
+      __twCleanupError = __twError;
+    }
+  }
+}
+if (!__twDispatchAttempted && __twTab && (__twCleanupError || __twCleanup?.cleanupStatus !== "released")) {
+  const __twReason = __twCleanupError instanceof Error
+    ? __twCleanupError.message
+    : (__twCleanup?.cleanupReason ?? "unknown");
+  throw new Error("TOOLWIRE_BROWSER_BULK_CLOSE_PREDISPATCH_RELEASE_UNPROVEN:" + __twReason);
+}
+if (__twDispatchAttempted && __twActionError) {
+  const __twMessage = __twActionError instanceof Error ? __twActionError.message : String(__twActionError);
+  if (/TOOLWIRE_BROWSER_BULK_CLOSE_RESULT_UNCERTAIN/i.test(__twMessage)) throw __twActionError;
+  throw new Error("TOOLWIRE_BROWSER_BULK_CLOSE_RESULT_UNCERTAIN:" + __twMessage);
+}
+if (__twActionError) throw __twActionError;
+nodeRepl.write(JSON.stringify(__twPayload));
+`, `Execute prepared Chrome bulk tab close ${index + 1}/${prepared.targets.length}`, {
+          mutationKind: "bulk_close_tab",
+          expectedGeneration: prepared.workbenchGeneration,
+        });
+      } catch (error) {
+        const classified = classifyBrowserError(error);
+        const uncertain = classified.code === "BROWSER_BULK_CLOSE_RESULT_UNCERTAIN";
+        return {
+          status: "partial",
+          browser: browserFamily,
+          action: { kind: "bulk_close_tabs" },
+          requestedCount: prepared.targets.length,
+          confirmedClosedCount: confirmedClosed.length,
+          confirmedClosed,
+          stoppedAtIndex: index,
+          stoppedAt: publicTarget(target),
+          unprocessedCount: prepared.targets.length - index - 1,
+          unprocessed: prepared.targets.slice(index + 1).map(publicTarget),
+          stopReason: {
+            errorCode: classified.code ?? "BROWSER_BULK_CLOSE_STOPPED",
+            message: classified.message,
+            uncertain,
+          },
+          noAutomaticReplay: true,
+          note: "Bulk close stopped at the first drift, busy claim, pre-dispatch release problem, or uncertain close. Only tabs listed in confirmedClosed are proven closed. The stopped target may be uncertain when stopReason.uncertain=true, and no remaining target was attempted after the stop. Never auto-retry this consumed prepared ref.",
+        };
+      }
+      if (result?.closed !== true) {
+        return {
+          status: "partial",
+          browser: browserFamily,
+          action: { kind: "bulk_close_tabs" },
+          requestedCount: prepared.targets.length,
+          confirmedClosedCount: confirmedClosed.length,
+          confirmedClosed,
+          stoppedAtIndex: index,
+          stoppedAt: publicTarget(target),
+          unprocessedCount: prepared.targets.length - index - 1,
+          unprocessed: prepared.targets.slice(index + 1).map(publicTarget),
+          stopReason: {
+            errorCode: "BROWSER_BULK_CLOSE_RESULT_UNCERTAIN",
+            message: "Bulk-close item returned without a confirmed close receipt after dispatch may have occurred.",
+            uncertain: true,
+          },
+          noAutomaticReplay: true,
+        };
+      }
+      this.#tabs.delete(target.tabRef);
+      const providerKey = `${browserFamily}:${target.providerTabId}`;
+      if (this.#providerToRef.get(providerKey) === target.tabRef) {
+        this.#providerToRef.delete(providerKey);
+      }
+      confirmedClosed.push({
+        ...publicTarget(target),
+        beforeUrl: stringOrNull(result?.beforeUrl) ?? target.expectedUrl,
+      });
+    }
+
+    return {
+      status: "closed",
+      browser: browserFamily,
+      action: { kind: "bulk_close_tabs" },
+      requestedCount: prepared.targets.length,
+      confirmedClosedCount: confirmedClosed.length,
+      confirmedClosed,
+      noAutomaticReplay: true,
+      note: "Every tab in the prepared exact set was independently revalidated against its server-bound provider identity, URL, and Browser Workbench generation and then closed exactly once through the official Tab.close() primitive. No URL pattern, domain filter, selector, raw provider id, or automatic retry was used.",
+    };
+  }
+
+  async prepareOpenTab({ family, url, cwd = this.#defaultCwd }) {
+    const effectiveCwd = path.resolve(cwd);
+    const browserFamily = normalizeBrowserFamily(family);
     const targetUrl = normalizeBrowserHttpUrl(url);
-    await this.#requireReady(effectiveCwd);
+    await this.#requireReady(effectiveCwd, browserFamily);
     this.#cleanupActionApprovals();
     const actionApprovalRef = `browser_action_${randomUUID()}`;
     const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
     const prepared = {
       actionApprovalRef,
       kind: "open_tab",
+      family: browserFamily,
       targetUrl,
       cwd: effectiveCwd,
       workbenchGeneration: this.#workbenchGeneration,
@@ -800,6 +1840,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       expiresAt,
       action: {
         kind: "open_tab",
+        family: browserFamily,
         toUrl: targetUrl,
       },
       nextAction: "Apply codex.browser_confirmation_policy and current user-authored task context. If this bounded task does not require confirmation, or its task-level verbal confirmation is already satisfied, call codex.browser_open_tab immediately with this actionApprovalRef. Do not ask merely because the legacy ref name contains Approval. Preparing did not open or navigate any tab.",
@@ -822,9 +1863,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ["Call codex.browser_prepare_open_tab again to prepare a fresh exact URL."]
       );
     }
-    this.#actionApprovals.delete(actionApprovalRef);
-    const effectiveCwd = prepared.cwd;
-    await this.#requireReady(effectiveCwd);
+    const effectiveCwd = await this.#readyPreparedAction(actionApprovalRef, prepared);
     if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_RUNTIME_RESTARTED",
@@ -833,9 +1872,11 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
 
+    const browserFamily = normalizeBrowserFamily(prepared.family);
+    const familyLiteral = JSON.stringify(browserFamily);
     const targetUrlLiteral = JSON.stringify(prepared.targetUrl);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 let __twTab = null;
 let __twPayload = null;
 let __twDispatchAttempted = false;
@@ -878,15 +1919,17 @@ if (__twDispatchAttempted && (__twActionError || __twFinalizeError)) {
 if (__twActionError) throw __twActionError;
 if (__twFinalizeError) throw __twFinalizeError;
 nodeRepl.write(JSON.stringify(__twPayload));
-`, "Execute prepared Chrome new tab", { mutationKind: "open_tab", expectedGeneration: prepared.workbenchGeneration });
+`, `Execute prepared ${browserFamily === "edge" ? "Edge" : "Chrome"} new tab`, { mutationKind: "open_tab", expectedGeneration: prepared.workbenchGeneration });
 
     const snapshot = typeof result?.snapshot === "string" ? result.snapshot : "";
     const snapshotTruncated = snapshot.length > BROWSER_POST_ACTION_MAX_CHARS;
     const afterUrl = stringOrNull(result?.afterUrl) ?? prepared.targetUrl;
     return {
       status: "opened",
+      family: browserFamily,
       action: {
         kind: "open_tab",
+        family: browserFamily,
         toUrl: prepared.targetUrl,
       },
       requestedUrl: prepared.targetUrl,
@@ -896,7 +1939,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       postSnapshot: snapshotTruncated ? snapshot.slice(0, BROWSER_POST_ACTION_MAX_CHARS) : snapshot,
       postSnapshotChars: snapshot.length,
       postSnapshotTruncated: snapshotTruncated,
-      note: "Exactly one previously prepared Chrome tab was created with the official browser.tabs.new(), navigated to the bound http(s) URL, and finalized as a user-visible deliverable tab. Call codex.browser_tabs to obtain its normal opaque tabRef before later read/click/fill/scroll work.",
+      note: `Exactly one previously prepared ${browserFamily} tab was created with the official browser.tabs.new(), navigated to the bound http(s) URL, and finalized as a user-visible deliverable tab. Call codex.browser_tabs with family=${browserFamily} to obtain its normal opaque tabRef before later read/click/fill/scroll work.`,
     };
   }
 
@@ -917,7 +1960,6 @@ nodeRepl.write(JSON.stringify(__twPayload));
         `maxChars must be an integer between 1000 and ${MAX_SNAPSHOT_CHARS}`
       );
     }
-    await this.#requireReady(effectiveCwd);
     const state = this.#tabs.get(tabRef);
     if (!state) {
       throw new BrowserPreviewError(
@@ -927,6 +1969,9 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
 
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const expectedUrlLiteral = JSON.stringify(state.url);
     const deltaY = (amount === "small" ? 400 : 800) * (direction === "down" ? 1 : -1);
@@ -936,7 +1981,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     const keypresses = amount === "page" ? [keyName] : Array(6).fill(keyName);
     const keypressesLiteral = JSON.stringify(keypresses);
     const dispatch = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -999,7 +2044,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     const snapshot = typeof readback?.snapshot === "string" ? readback.snapshot : "";
     return {
       status: "scrolled",
-      browser: "chrome",
+      browser: browserFamily,
       tab: publicTab(current),
       direction,
       amount,
@@ -1045,7 +2090,6 @@ nodeRepl.write(JSON.stringify(__twPayload));
         `maxChars must be an integer between 1000 and ${MAX_SNAPSHOT_CHARS}`
       );
     }
-    await this.#requireReady(effectiveCwd);
     const state = this.#tabs.get(tabRef);
     if (!state) {
       throw new BrowserPreviewError(
@@ -1055,11 +2099,14 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
 
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const expectedUrlLiteral = JSON.stringify(state.url);
     const keyLiteral = JSON.stringify(key);
     const dispatch = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -1136,7 +2183,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     const snapshot = typeof readback?.snapshot === "string" ? readback.snapshot : "";
     return {
       status: "pressed",
-      browser: "chrome",
+      browser: browserFamily,
       tab: publicTab(current),
       key,
       inputMethod: stringOrNull(dispatch?.inputMethod) ?? "focused-keypress",
@@ -1163,25 +2210,445 @@ nodeRepl.write(JSON.stringify(__twPayload));
     };
   }
 
+  async modelRouteProbe({ tabRef, cwd = this.#defaultCwd }) {
+    const effectiveCwd = path.resolve(cwd);
+    if (typeof tabRef !== "string" || !tabRef) {
+      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
+    }
+    const state = this.#tabs.get(tabRef);
+    if (!state) {
+      throw new BrowserPreviewError(
+        "BROWSER_TAB_REF_UNKNOWN",
+        `unknown or expired browser tabRef: ${tabRef}`,
+        ["Call codex.browser_tabs again and use a fresh tabRef for the exact user-selected ChatGPT Web chat surface."]
+      );
+    }
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    if (browserFamily !== "chrome") {
+      throw new BrowserPreviewError(
+        "BROWSER_MODEL_ROUTE_FAMILY_DENIED",
+        "Model-route probing is Chrome-specific and refuses a tabRef bound to another Browser family",
+        ["Call codex.browser_tabs for Chrome and use a fresh Chrome tabRef for the exact user-selected ChatGPT Web chat surface."]
+      );
+    }
+    await this.#requireReady(effectiveCwd, browserFamily);
+    let initialUrl;
+    try {
+      initialUrl = new URL(state.url ?? "");
+    } catch {
+      throw new BrowserPreviewError("BROWSER_MODEL_ROUTE_HOST_DENIED", "Model-route probing requires a user-selected https://chatgpt.com Web chat tab");
+    }
+    const initialLoginHost = initialUrl.hostname === "auth.openai.com" || initialUrl.hostname.endsWith(".auth.openai.com");
+    const initialLoginPath = initialUrl.hostname === "chatgpt.com" && /\/(?:auth\/)?(?:log-?in|login)(?:\/|$)/i.test(initialUrl.pathname);
+    if (initialLoginHost || initialLoginPath) {
+      throw new BrowserPreviewError(
+        "BROWSER_MODEL_ROUTE_LOGIN_REQUIRED",
+        "The target Chrome does not currently expose a usable ChatGPT login state for model-route verification.",
+        ["Sign in to ChatGPT once in the target Chrome profile and keep the Browser extension connected; later probes can then run unattended from any normal request entry."]
+      );
+    }
+    if (initialUrl.protocol !== "https:" || initialUrl.hostname !== "chatgpt.com") {
+      throw new BrowserPreviewError("BROWSER_MODEL_ROUTE_HOST_DENIED", "Model-route probing is restricted to https://chatgpt.com");
+    }
+    const initialChatSurface = initialUrl.pathname === "/"
+      || initialUrl.pathname.startsWith("/c/")
+      || initialUrl.pathname.startsWith("/g/");
+    if (!initialChatSurface) {
+      throw new BrowserPreviewError(
+        "BROWSER_MODEL_ROUTE_CHAT_SURFACE_REQUIRED",
+        "Model-route probing requires a user-selected ChatGPT Web chat surface, not an arbitrary chatgpt.com page.",
+        ["Use the current/opened ChatGPT Web conversation, or open a new ChatGPT Web chat in the user-chosen Temporary/normal and project/non-project context, then retry with its fresh tabRef."]
+      );
+    }
+    const verificationContext = {
+      temporaryChat: initialUrl.searchParams.get("temporary-chat") === "true",
+      projectScoped: initialUrl.pathname.startsWith("/g/"),
+      existingConversation: initialUrl.pathname.includes("/c/"),
+    };
+
+    const familyLiteral = JSON.stringify(browserFamily);
+    const providerLiteral = JSON.stringify(state.providerTabId);
+    const expectedUrlLiteral = JSON.stringify(state.url);
+    const probeTextLiteral = JSON.stringify(BROWSER_MODEL_ROUTE_PROBE_TEXT);
+    const result = await this.#runJson(effectiveCwd, `
+${BROWSER_MODEL_ROUTE_RUNTIME_PARSER_SOURCE}
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+const __twOpenTabs = await __twBrowser.user.openTabs();
+const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
+if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
+let __twTab = null;
+let __twCleanup = null;
+let __twCleanupError = null;
+let __twMessageSubmitted = false;
+let __twPayload = null;
+try {
+  __twTab = await __twBrowser.user.claimTab(__twInfo);
+  const __twBeforeUrl = (await __twTab.url()) ?? __twInfo.url ?? null;
+  if (__twBeforeUrl !== ${expectedUrlLiteral}) throw new Error("TOOLWIRE_BROWSER_ACTION_URL_CHANGED");
+  let __twParsedUrl = null;
+  try { __twParsedUrl = new URL(__twBeforeUrl); } catch {}
+  if (!__twParsedUrl || __twParsedUrl.protocol !== "https:" || __twParsedUrl.hostname !== "chatgpt.com") {
+    throw new Error("TOOLWIRE_BROWSER_MODEL_ROUTE_HOST_DENIED");
+  }
+  const __twChatSurface = __twParsedUrl.pathname === "/"
+    || __twParsedUrl.pathname.startsWith("/c/")
+    || __twParsedUrl.pathname.startsWith("/g/");
+  if (!__twChatSurface) throw new Error("TOOLWIRE_BROWSER_MODEL_ROUTE_CHAT_SURFACE_REQUIRED");
+
+  await globalThis.__toolwireBrowserAgent.documentation.get("confirmations");
+  await globalThis.__toolwireBrowserAgent.documentation.get("capabilities/tab/cdp");
+  const __twCapabilities = __twTab.capabilities;
+  if (!__twCapabilities || typeof __twCapabilities.get !== "function") {
+    throw new Error("TOOLWIRE_BROWSER_MODEL_ROUTE_CDP_UNAVAILABLE");
+  }
+  const __twCdp = await __twCapabilities.get("cdp");
+  if (!__twCdp || typeof __twCdp.send !== "function" || typeof __twCdp.readEvents !== "function") {
+    throw new Error("TOOLWIRE_BROWSER_MODEL_ROUTE_CDP_UNAVAILABLE");
+  }
+
+  const __twReadEditorText = async (locator) => {
+    let direct = null;
+    try {
+      direct = await locator.evaluate((element) => ({
+        value: typeof element?.value === "string" ? element.value : null,
+        innerText: typeof element?.innerText === "string" ? element.innerText : null,
+        textContent: typeof element?.textContent === "string" ? element.textContent : null,
+      }));
+    } catch {}
+    const values = [direct?.value, direct?.innerText, direct?.textContent].filter((value) => typeof value === "string");
+    return {
+      values,
+      blank: values.length > 0 && values.every((value) => /^\\s*$/.test(value)),
+      exact: values.some((value) => value === ${probeTextLiteral}),
+    };
+  };
+  const __twResolveEditor = async () => {
+    const all = await __twTab.playwright.getByRole("textbox").all();
+    const visible = [];
+    for (const locator of all) {
+      let isVisible = false;
+      let isEnabled = false;
+      try { isVisible = await locator.isVisible(); } catch {}
+      try { isEnabled = await locator.isEnabled(); } catch {}
+      if (isVisible && isEnabled) visible.push(locator);
+    }
+    if (visible.length === 0) throw new Error("TOOLWIRE_BROWSER_MODEL_ROUTE_LOGIN_OR_PAGE_NOT_READY");
+    if (visible.length !== 1) throw new Error("TOOLWIRE_BROWSER_MODEL_ROUTE_EDITOR_NOT_UNIQUE:" + visible.length);
+    return visible[0];
+  };
+
+  const __twReadSurfaceMode = async () => {
+    for (const [mode, name] of [["chat", "Chat"], ["work", "Work"]]) {
+      try {
+        const radios = await __twTab.playwright.getByRole("radio", { name, exact: true }).all();
+        const visible = [];
+        for (const radio of radios) {
+          let isVisible = false;
+          try { isVisible = await radio.isVisible(); } catch {}
+          if (isVisible) visible.push(radio);
+        }
+        if (visible.length === 1) {
+          let checked = false;
+          try { checked = await visible[0].isChecked(); } catch {}
+          if (checked) return mode;
+        }
+      } catch {}
+    }
+    return "unknown";
+  };
+
+  let __twEditor = await __twResolveEditor();
+  let __twEditorState = await __twReadEditorText(__twEditor);
+  if (__twEditorState.values.length > 0 && !__twEditorState.blank) {
+    throw new Error("TOOLWIRE_BROWSER_MODEL_ROUTE_EDITOR_NOT_EMPTY");
+  }
+  const __twSurfaceMode = await __twReadSurfaceMode();
+
+  await __twCdp.send("Network.enable", {});
+  const __twMethods = [
+    "Network.requestWillBeSent",
+    "Network.responseReceived",
+    "Network.loadingFinished",
+    "Network.loadingFailed",
+    "Network.webSocketFrameReceived",
+  ];
+  const __twBaseline = await __twCdp.readEvents({ methods: __twMethods, limit: 1, timeoutMs: 1 });
+  let __twCursor = Number(__twBaseline?.cursor) || 0;
+
+  await __twEditor.fill(${probeTextLiteral}, {});
+  await __twTab.playwright.waitForTimeout(250);
+  __twEditor = await __twResolveEditor();
+  __twEditorState = await __twReadEditorText(__twEditor);
+  if (!__twEditorState.exact) {
+    if (!__twEditorState.blank) throw new Error("TOOLWIRE_BROWSER_MODEL_ROUTE_EDITOR_FILL_FAILED");
+    await __twEditor.fill(${probeTextLiteral}, {});
+    await __twTab.playwright.waitForTimeout(250);
+    __twEditor = await __twResolveEditor();
+    __twEditorState = await __twReadEditorText(__twEditor);
+    if (!__twEditorState.exact) throw new Error("TOOLWIRE_BROWSER_MODEL_ROUTE_EDITOR_FILL_FAILED");
+  }
+
+  __twMessageSubmitted = true;
+  await __twTab.dom_cua.keypress({ keys: ["Enter"] });
+
+  const __twRequests = new Map();
+  const __twFound = emptyRouteSets();
+  let __twResponse = null;
+  let __twLoadingFinished = false;
+  let __twLoadingFailed = false;
+  let __twBodyAvailable = false;
+  let __twBodyError = null;
+  let __twAssistantClaim = { text: null, truncated: false };
+  const __twStartedAt = Date.now();
+  const __twDeadline = __twStartedAt + 25_000;
+  let __twFinishedAt = null;
+  while (Date.now() < __twDeadline) {
+    const batch = await __twCdp.readEvents({
+      afterSequence: __twCursor,
+      methods: __twMethods,
+      timeoutMs: Math.min(1000, Math.max(1, __twDeadline - Date.now())),
+      limit: 200,
+    });
+    __twCursor = Math.max(__twCursor, Number(batch?.cursor) || 0);
+    for (const event of batch?.events ?? []) {
+      const requestId = event?.params?.requestId;
+      if (event?.method === "Network.requestWillBeSent" && requestId) {
+        const request = event?.params?.request;
+        __twRequests.set(requestId, { method: request?.method ?? null, url: request?.url ?? null });
+        continue;
+      }
+      if (event?.method === "Network.responseReceived" && requestId) {
+        const request = __twRequests.get(requestId);
+        let responseUrl = null;
+        try { responseUrl = new URL(event?.params?.response?.url ?? ""); } catch {}
+        if (
+          request?.method === "POST"
+          && responseUrl?.protocol === "https:"
+          && responseUrl?.hostname === "chatgpt.com"
+          && responseUrl.pathname.endsWith("/conversation")
+          && !responseUrl.pathname.endsWith("/conversation/prepare")
+          && !responseUrl.pathname.endsWith("/conversation/init")
+        ) {
+          __twResponse = {
+            requestId,
+            origin: responseUrl.origin,
+            pathname: responseUrl.pathname,
+            status: event?.params?.response?.status ?? null,
+            mimeType: event?.params?.response?.mimeType ?? null,
+          };
+        }
+        continue;
+      }
+      if (event?.method === "Network.webSocketFrameReceived") {
+        collectRouteFieldsFromTransportText(event?.params?.response?.payloadData, __twFound);
+        continue;
+      }
+      if (__twResponse?.requestId && requestId === __twResponse.requestId) {
+        if (event?.method === "Network.loadingFailed") {
+          __twLoadingFailed = true;
+          __twFinishedAt = Date.now();
+        }
+        if (event?.method === "Network.loadingFinished") {
+          __twLoadingFinished = true;
+          __twFinishedAt = Date.now();
+        }
+      }
+    }
+    const __twHaveAny = __twFound.resolved_model_slug.size > 0
+      || __twFound.serverSteModelSlug.size > 0
+      || __twFound.requested_model_experience.size > 0;
+    const __twHaveAll = __twFound.resolved_model_slug.size > 0
+      && __twFound.serverSteModelSlug.size > 0
+      && __twFound.requested_model_experience.size > 0;
+    if (__twResponse && __twLoadingFinished && __twHaveAll) break;
+    if (__twResponse && __twFinishedAt !== null && __twHaveAny && Date.now() - __twFinishedAt >= 1500) break;
+    if (__twResponse && __twFinishedAt !== null && Date.now() - __twFinishedAt >= 10_000) break;
+  }
+
+  if (__twResponse?.requestId && __twLoadingFinished) {
+    try {
+      const bodyResult = await __twCdp.send("Network.getResponseBody", { requestId: __twResponse.requestId });
+      const body = bodyResult?.base64Encoded
+        ? Buffer.from(String(bodyResult?.body ?? ""), "base64").toString("utf8")
+        : String(bodyResult?.body ?? "");
+      collectRouteFieldsFromTransportText(body, __twFound);
+      const __twClaims = [];
+      collectAssistantClaimsFromTransportText(body, __twClaims);
+      __twAssistantClaim = __twClaims.filter((claim) => claim?.text && claim.text !== ${probeTextLiteral}).at(-1) ?? { text: null, truncated: false };
+      __twBodyAvailable = true;
+    } catch (error) {
+      __twBodyError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  if (!__twAssistantClaim.text) {
+    try {
+      const __twAssistantHeadings = await __twTab.playwright.getByRole("heading", { name: "ChatGPT:" }).all();
+      const __twLatestAssistantHeading = __twAssistantHeadings.at(-1) ?? null;
+      if (__twLatestAssistantHeading) {
+        const __twDomClaim = await __twLatestAssistantHeading.evaluate((element, maxChars) => {
+          let sibling = element?.nextElementSibling ?? null;
+          while (sibling) {
+            const raw = typeof sibling.innerText === "string" ? sibling.innerText : sibling.textContent;
+            const text = typeof raw === "string" ? raw.trim() : "";
+            if (text) return { text: text.slice(0, maxChars), truncated: text.length > maxChars };
+            sibling = sibling.nextElementSibling;
+          }
+          return { text: null, truncated: false };
+        }, MAX_ASSISTANT_CLAIM_CHARS);
+        if (__twDomClaim?.text && __twDomClaim.text !== ${probeTextLiteral}) __twAssistantClaim = __twDomClaim;
+      }
+    } catch {}
+  }
+
+  const __twFields = routeFieldsFromSets(__twFound);
+  const __twHasRoute = Boolean(
+    __twFields.resolved_model_slug
+    || __twFields.server_ste_metadata?.model_slug
+    || __twFields.requested_model_experience
+  );
+  __twPayload = {
+    status: __twHasRoute ? "ok" : "route_fields_not_found",
+    origin: "https://chatgpt.com",
+    probeMessage: "server_fixed_non_sensitive",
+    submitted: true,
+    responseObserved: Boolean(__twResponse),
+    streamFinished: __twLoadingFinished,
+    streamFailed: __twLoadingFailed,
+    response: __twResponse ? {
+      origin: __twResponse.origin,
+      pathname: __twResponse.pathname,
+      status: __twResponse.status,
+      mimeType: __twResponse.mimeType,
+    } : null,
+    assistantClaim: __twAssistantClaim,
+    surfaceMode: __twSurfaceMode,
+    fields: __twFields,
+    evidence: {
+      cdpCapability: true,
+      networkEnabledBeforeSubmit: true,
+      eventBaselineBeforeSubmit: true,
+      websocketFramesObserved: __twFound.resolved_model_slug.size > 0
+        || __twFound.serverSteModelSlug.size > 0
+        || __twFound.requested_model_experience.size > 0,
+      responseBodyAvailable: __twBodyAvailable,
+      responseBodyError: __twBodyError ? "unavailable" : null,
+    },
+  };
+} catch (__twError) {
+  if (__twMessageSubmitted) {
+    const message = __twError instanceof Error ? __twError.message : String(__twError);
+    throw new Error("TOOLWIRE_BROWSER_MODEL_ROUTE_PROBE_RESULT_UNCERTAIN:" + message);
+  }
+  throw __twError;
+} finally {
+  if (__twTab) {
+    try {
+      __twCleanup = await cleanupBrowserClaim(__twBrowser, __twTab);
+    } catch (__twError) {
+      __twCleanupError = __twError instanceof Error ? __twError.message : String(__twError);
+    }
+  }
+}
+if (__twPayload) {
+  __twPayload.cleanupStatus = __twCleanup?.cleanupStatus ?? "unavailable";
+  __twPayload.cleanupReason = __twCleanup?.cleanupReason ?? (__twCleanupError ? "cleanup_error" : "unknown");
+  __twPayload.lifecycleShape = __twCleanup?.lifecycleShape ?? null;
+}
+nodeRepl.write(JSON.stringify(__twPayload));
+`, "Probe ChatGPT actual model route", { mutationKind: "model_route_probe", expectedGeneration: state.workbenchGeneration });
+
+    if (!result || typeof result !== "object") {
+      throw new BrowserPreviewError("BROWSER_MODEL_ROUTE_PROTOCOL_ERROR", "Model-route probe returned no structured result");
+    }
+    const assistantClaim = {
+      text: stringOrNull(result?.assistantClaim?.text),
+      truncated: result?.assistantClaim?.truncated === true,
+    };
+    const fields = {
+      resolved_model_slug: stringOrNull(result?.fields?.resolved_model_slug),
+      server_ste_metadata: { model_slug: stringOrNull(result?.fields?.server_ste_metadata?.model_slug) },
+      requested_model_experience: stringOrNull(result?.fields?.requested_model_experience),
+      observedValues: {
+        resolved_model_slug: Array.isArray(result?.fields?.observedValues?.resolved_model_slug)
+          ? result.fields.observedValues.resolved_model_slug.filter((value) => typeof value === "string").slice(0, 20)
+          : [],
+        server_ste_metadata_model_slug: Array.isArray(result?.fields?.observedValues?.server_ste_metadata_model_slug)
+          ? result.fields.observedValues.server_ste_metadata_model_slug.filter((value) => typeof value === "string").slice(0, 20)
+          : [],
+        requested_model_experience: Array.isArray(result?.fields?.observedValues?.requested_model_experience)
+          ? result.fields.observedValues.requested_model_experience.filter((value) => typeof value === "string").slice(0, 20)
+          : [],
+      },
+    };
+    return {
+      status: result.status === "ok" ? "ok" : "route_fields_not_found",
+      browser: browserFamily,
+      tabRef,
+      origin: "https://chatgpt.com",
+      verificationContext: {
+        ...verificationContext,
+        surfaceMode: result?.surfaceMode === "chat" || result?.surfaceMode === "work" ? result.surfaceMode : "unknown",
+      },
+      probe: {
+        message: "server_fixed_non_sensitive",
+        submitted: result?.submitted === true,
+        responseObserved: result?.responseObserved === true,
+        streamFinished: result?.streamFinished === true,
+        streamFailed: result?.streamFailed === true,
+      },
+      response: result?.response && typeof result.response === "object" ? {
+        origin: result.response.origin === "https://chatgpt.com" ? result.response.origin : null,
+        pathname: typeof result.response.pathname === "string" ? result.response.pathname : null,
+        status: Number.isFinite(result.response.status) ? result.response.status : null,
+        mimeType: typeof result.response.mimeType === "string" ? result.response.mimeType : null,
+      } : null,
+      assistantClaim,
+      fields,
+      evidence: {
+        cdpCapability: result?.evidence?.cdpCapability === true,
+        networkEnabledBeforeSubmit: result?.evidence?.networkEnabledBeforeSubmit === true,
+        eventBaselineBeforeSubmit: result?.evidence?.eventBaselineBeforeSubmit === true,
+        websocketFramesObserved: result?.evidence?.websocketFramesObserved === true,
+        responseBodyAvailable: result?.evidence?.responseBodyAvailable === true,
+        responseBodyError: result?.evidence?.responseBodyError === "unavailable" ? "unavailable" : null,
+      },
+      cleanupStatus: stringOrNull(result?.cleanupStatus) ?? "unavailable",
+      cleanupReason: stringOrNull(result?.cleanupReason),
+      lifecycleShape: stringOrNull(result?.lifecycleShape),
+      privacy: {
+        returnedFieldsOnly: ["assistant_claim", "requested_model_experience", "resolved_model_slug", "server_ste_metadata.model_slug"],
+        responseBodyReturned: false,
+        fixedProbeAssistantClaimReturned: Boolean(assistantClaim.text),
+        unrelatedMessageContentReturned: false,
+        cookiesReturned: false,
+        authorizationReturned: false,
+        headersReturned: false,
+      },
+      note: "This bounded household probe uses Full CDP only inside the Browser runtime for one user-selected https://chatgpt.com Web chat surface, either the current/opened conversation or a newly opened chat. It asks the fixed non-sensitive question '你现在是什么模型？', reports the actually observed Chat/Work surface mode when available, returns only the bounded assistant self-report for that probe plus allowlisted model-routing fields and minimal evidence, and never exposes raw CDP, cookies, Authorization, headers, response bodies, or unrelated conversation content. It verifies the newly submitted Web turn, not an already-completed phone turn. Do not auto-retry an uncertain result because the fixed probe message may already have been submitted.",
+    };
+  }
+
   async prepareNavigate({ tabRef, url, cwd = this.#defaultCwd }) {
     const effectiveCwd = path.resolve(cwd);
     if (typeof tabRef !== "string" || !tabRef) {
       throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
     }
     const targetUrl = normalizeBrowserHttpUrl(url);
-    await this.#requireReady(effectiveCwd);
     const state = this.#tabs.get(tabRef);
     if (!state) {
       throw new BrowserPreviewError(
         "BROWSER_TAB_REF_UNKNOWN",
         `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
+        ["Call codex.browser_tabs again and use a fresh tabRef from the current browser family."]
       );
     }
-
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -1207,6 +2674,7 @@ nodeRepl.write(JSON.stringify({
       actionApprovalRef,
       kind: "navigate",
       tabRef,
+      family: browserFamily,
       providerTabId: state.providerTabId,
       expectedUrl: currentUrl,
       targetUrl,
@@ -1250,9 +2718,7 @@ nodeRepl.write(JSON.stringify({
         ["Call codex.browser_tabs and codex.browser_prepare_navigate again to prepare a fresh exact navigation."]
       );
     }
-    this.#actionApprovals.delete(actionApprovalRef);
-    const effectiveCwd = prepared.cwd;
-    await this.#requireReady(effectiveCwd);
+    const effectiveCwd = await this.#readyPreparedAction(actionApprovalRef, prepared);
     if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_RUNTIME_RESTARTED",
@@ -1261,19 +2727,21 @@ nodeRepl.write(JSON.stringify({
       );
     }
     const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
+    const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
+    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
-        "The prepared navigation no longer matches a current Browser runtime tab",
+        "The prepared navigation no longer matches a current Browser runtime tab or Browser family",
         ["Call codex.browser_tabs and prepare the navigation again from current page state."]
       );
     }
 
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const targetUrlLiteral = JSON.stringify(prepared.targetUrl);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -1354,8 +2822,326 @@ nodeRepl.write(JSON.stringify(__twPayload));
     };
   }
 
-  async prepareClick({ tabRef, role, name, text, scopeUrl, cwd = this.#defaultCwd }) {
+  async discoverElements({ tabRef, cwd = this.#defaultCwd, maxNodes = 256 }) {
     const effectiveCwd = path.resolve(cwd);
+    if (typeof tabRef !== "string" || !tabRef) {
+      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
+    }
+    if (!Number.isInteger(maxNodes) || maxNodes < 1 || maxNodes > 2_000) {
+      throw new BrowserPreviewError("BROWSER_ELEMENT_MAX_NODES_INVALID", "maxNodes must be an integer between 1 and 2000");
+    }
+    const state = this.#tabs.get(tabRef);
+    if (!state) {
+      throw new BrowserPreviewError(
+        "BROWSER_TAB_REF_UNKNOWN",
+        `unknown or expired browser tabRef: ${tabRef}`,
+        ["Call codex.browser_tabs again and use a fresh tabRef from the current browser family."]
+      );
+    }
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
+    const familyLiteral = JSON.stringify(browserFamily);
+    const providerLiteral = JSON.stringify(state.providerTabId);
+    const result = await this.#runJson(effectiveCwd, `
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+const __twOpenTabs = await __twBrowser.user.openTabs();
+const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
+if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
+let __twTab = null;
+let __twPayload = null;
+let __twCleanup = null;
+try {
+  __twTab = await __twBrowser.user.claimTab(__twInfo);
+  const __twUrl = (await __twTab.url()) ?? __twInfo.url ?? null;
+  const __twTitle = (await __twTab.title()) ?? __twInfo.title ?? null;
+  const __twVisibleDom = await __twTab.dom_cua.get_visible_dom();
+  if (typeof __twVisibleDom !== "string") throw new Error("TOOLWIRE_BROWSER_ELEMENT_VISIBLE_DOM_INVALID");
+  __twPayload = { title: __twTitle, url: __twUrl, visibleDom: __twVisibleDom };
+} finally {
+  if (__twTab) __twCleanup = await cleanupBrowserClaim(__twBrowser, __twTab);
+}
+if (__twPayload && __twCleanup) Object.assign(__twPayload, __twCleanup);
+nodeRepl.write(JSON.stringify(__twPayload));
+`, "Discover opaque Browser elements", { expectedGeneration: state.workbenchGeneration });
+
+    const visibleDom = typeof result?.visibleDom === "string" ? result.visibleDom : null;
+    if (visibleDom === null) {
+      throw new BrowserPreviewError("BROWSER_ELEMENT_VISIBLE_DOM_INVALID", "The stock Browser visible-DOM primitive returned no string snapshot");
+    }
+    const current = {
+      ...state,
+      title: stringOrNull(result?.title) ?? state.title,
+      url: stringOrNull(result?.url) ?? state.url,
+      seenAt: Date.now(),
+    };
+    if (!current.url) {
+      throw new BrowserPreviewError("BROWSER_ELEMENT_URL_UNAVAILABLE", "The current tab did not expose a stable URL for opaque element binding");
+    }
+    this.#tabs.set(tabRef, current);
+    const nodes = browserElementNodesFromVisibleDom(visibleDom, { maxNodes });
+    const observed = this.#elementRefs.observe({
+      tabRef,
+      family: browserFamily,
+      providerTabId: state.providerTabId,
+      url: current.url,
+      workbenchGeneration: state.workbenchGeneration,
+      nodes,
+    });
+    return {
+      status: "ok",
+      browser: browserFamily,
+      tab: publicTab(current),
+      observedAt: observed.observedAt,
+      expiresAt: observed.expiresAt,
+      count: observed.elements.length,
+      elements: observed.elements,
+      ...browserCleanupReceipt(result),
+      note: "Fresh stock visible DOM was projected into short-lived Codexless opaque elementRef values. Raw stock node ids, selectors, coordinates, indexes, JavaScript, and provider ids are not returned and are not accepted as later target input.",
+    };
+  }
+
+  async prepareElementAction({ tabRef, elementRef, action, cwd = this.#defaultCwd }) {
+    const effectiveCwd = path.resolve(cwd);
+    if (typeof tabRef !== "string" || !tabRef) {
+      throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
+    }
+    if (typeof elementRef !== "string" || !elementRef.startsWith("browser_element_")) {
+      throw new BrowserPreviewError("BROWSER_ELEMENT_REF_REQUIRED", "elementRef must be an opaque ref returned by the fresh element discovery path");
+    }
+    const normalizedAction = typeof action === "string" ? action.trim().toLowerCase() : "";
+    if (!new Set(["click", "double_click"]).has(normalizedAction)) {
+      throw new BrowserPreviewError("BROWSER_ELEMENT_ACTION_UNSUPPORTED", "Opaque element actions currently support only click or double_click");
+    }
+    const state = this.#tabs.get(tabRef);
+    if (!state) {
+      throw new BrowserPreviewError(
+        "BROWSER_TAB_REF_UNKNOWN",
+        `unknown or expired browser tabRef: ${tabRef}`,
+        ["Call codex.browser_tabs and the opaque element discovery path again."]
+      );
+    }
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
+    const familyLiteral = JSON.stringify(browserFamily);
+    const providerLiteral = JSON.stringify(state.providerTabId);
+    const result = await this.#runJson(effectiveCwd, `
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+const __twOpenTabs = await __twBrowser.user.openTabs();
+const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
+if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
+let __twTab = null;
+let __twPayload = null;
+let __twCleanup = null;
+try {
+  __twTab = await __twBrowser.user.claimTab(__twInfo);
+  const __twUrl = (await __twTab.url()) ?? __twInfo.url ?? null;
+  const __twTitle = (await __twTab.title()) ?? __twInfo.title ?? null;
+  const __twVisibleDom = await __twTab.dom_cua.get_visible_dom();
+  if (typeof __twVisibleDom !== "string") throw new Error("TOOLWIRE_BROWSER_ELEMENT_VISIBLE_DOM_INVALID");
+  __twPayload = { title: __twTitle, url: __twUrl, visibleDom: __twVisibleDom };
+} finally {
+  if (__twTab) __twCleanup = await cleanupBrowserClaim(__twBrowser, __twTab);
+}
+if (__twPayload && __twCleanup) Object.assign(__twPayload, __twCleanup);
+nodeRepl.write(JSON.stringify(__twPayload));
+`, "Prepare opaque Browser element action", { expectedGeneration: state.workbenchGeneration });
+
+    const currentUrl = stringOrNull(result?.url) ?? state.url;
+    if (!currentUrl || typeof result?.visibleDom !== "string") {
+      throw new BrowserPreviewError("BROWSER_ELEMENT_VISIBLE_DOM_INVALID", "Opaque element preparation could not obtain a stable current URL and visible DOM");
+    }
+    const nodes = browserElementNodesFromVisibleDom(result.visibleDom);
+    let bound;
+    try {
+      bound = this.#elementRefs.bindAction({
+        elementRef,
+        action: normalizedAction,
+        current: {
+          tabRef,
+          family: browserFamily,
+          providerTabId: state.providerTabId,
+          url: currentUrl,
+          workbenchGeneration: state.workbenchGeneration,
+          nodes,
+        },
+      });
+    } catch (error) {
+      throw browserElementBindingError(error);
+    }
+    const current = {
+      ...state,
+      title: stringOrNull(result?.title) ?? state.title,
+      url: currentUrl,
+      seenAt: Date.now(),
+    };
+    this.#tabs.set(tabRef, current);
+    this.#cleanupActionApprovals();
+    const actionApprovalRef = `browser_action_${randomUUID()}`;
+    const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
+    this.#actionApprovals.set(actionApprovalRef, {
+      actionApprovalRef,
+      kind: "element_action",
+      action: normalizedAction,
+      elementRef,
+      descriptor: bound.descriptor,
+      rawNodeId: bound.rawNodeId,
+      fingerprint: bound.fingerprint,
+      tabRef,
+      family: browserFamily,
+      providerTabId: state.providerTabId,
+      expectedUrl: currentUrl,
+      cwd: effectiveCwd,
+      workbenchGeneration: state.workbenchGeneration,
+      expiresAt,
+    });
+    return {
+      status: "prepared",
+      actionApprovalRef,
+      expiresAt,
+      ...browserCleanupReceipt(result),
+      action: {
+        kind: normalizedAction,
+        tab: publicTab(current),
+        elementRef,
+        descriptor: bound.descriptor,
+      },
+      nextAction: "Apply codex.browser_confirmation_policy and current user-authored task context. The opaque ref binds only the exact fresh target and is not permission evidence. Dispatch only if the task still requires this action; do not supply or reconstruct a raw node id, selector, coordinate, index, or JavaScript target.",
+    };
+  }
+
+  async elementAction({ actionApprovalRef }) {
+    this.#cleanupActionApprovals();
+    if (typeof actionApprovalRef !== "string" || !actionApprovalRef.startsWith("browser_action_")) {
+      throw new BrowserPreviewError("BROWSER_ACTION_REF_INVALID", "actionApprovalRef must be the opaque single-use ref returned by opaque element action preparation");
+    }
+    const prepared = this.#actionApprovals.get(actionApprovalRef);
+    if (!prepared || prepared.kind !== "element_action") {
+      throw new BrowserPreviewError(
+        "BROWSER_ACTION_REF_EXPIRED",
+        "Opaque element action ref is invalid, expired, or already consumed",
+        ["Refresh browser_tabs, rediscover opaque elements, and prepare a fresh exact action only if it is still needed."]
+      );
+    }
+    const effectiveCwd = await this.#readyPreparedAction(actionApprovalRef, prepared);
+    const state = this.#tabs.get(prepared.tabRef);
+    const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
+    if (
+      !state
+      || state.providerTabId !== prepared.providerTabId
+      || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily
+      || prepared.workbenchGeneration !== this.#workbenchGeneration
+    ) {
+      throw new BrowserPreviewError(
+        "BROWSER_ACTION_TAB_STALE",
+        "The opaque element action no longer matches a current Browser runtime tab/family/generation",
+        ["Refresh browser_tabs and rediscover the target instead of replaying the old action."]
+      );
+    }
+    const familyLiteral = JSON.stringify(browserFamily);
+    const providerLiteral = JSON.stringify(prepared.providerTabId);
+    const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
+    const rawNodeIdLiteral = JSON.stringify(prepared.rawNodeId);
+    const fingerprintLiteral = JSON.stringify(prepared.fingerprint);
+    const actionLiteral = JSON.stringify(prepared.action);
+    const result = await this.#runJson(effectiveCwd, `
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+const __twOpenTabs = await __twBrowser.user.openTabs();
+const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
+if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
+let __twTab = null;
+let __twPayload = null;
+let __twDispatchAttempted = false;
+let __twActionError = null;
+let __twCleanupError = null;
+let __twCleanup = null;
+try {
+  __twTab = await __twBrowser.user.claimTab(__twInfo);
+  const __twBeforeUrl = (await __twTab.url()) ?? __twInfo.url ?? null;
+  if (__twBeforeUrl !== ${expectedUrlLiteral}) throw new Error("TOOLWIRE_BROWSER_ELEMENT_TARGET_CHANGED");
+  const __twVisibleDom = await __twTab.dom_cua.get_visible_dom();
+  if (typeof __twVisibleDom !== "string") throw new Error("TOOLWIRE_BROWSER_ELEMENT_VISIBLE_DOM_INVALID");
+  const __twExpectedNodeId = ${rawNodeIdLiteral};
+  let __twMatchedLine = null;
+  for (const __twRawLine of __twVisibleDom.split(/\\r?\\n/)) {
+    const __twNodeMatch = __twRawLine.match(/\\bnode_id=(?:\"([^\"]+)\"|'([^']+)'|([^\\s>]+))/i);
+    if (!__twNodeMatch) continue;
+    const __twNodeId = (__twNodeMatch[1] ?? __twNodeMatch[2] ?? __twNodeMatch[3] ?? "").trim();
+    if (__twNodeId !== __twExpectedNodeId) continue;
+    if (__twMatchedLine !== null) throw new Error("TOOLWIRE_BROWSER_ELEMENT_TARGET_CHANGED");
+    __twMatchedLine = __twRawLine;
+  }
+  if (__twMatchedLine === null) throw new Error("TOOLWIRE_BROWSER_ELEMENT_STALE");
+  const __twCanonical = __twMatchedLine
+    .replace(/\\bnode_id=(?:\"[^\"]+\"|'[^']+'|[^\\s>]+)/i, "node_id=<server-bound>")
+    .replace(/\\s+/g, " ")
+    .trim();
+  const { createHash: __twCreateHash } = await import("node:crypto");
+  const __twFingerprint = __twCreateHash("sha256").update(__twCanonical, "utf8").digest("hex");
+  if (__twFingerprint !== ${fingerprintLiteral}) throw new Error("TOOLWIRE_BROWSER_ELEMENT_TARGET_CHANGED");
+  __twDispatchAttempted = true;
+  if (${actionLiteral} === "click") {
+    await __twTab.dom_cua.click({ node_id: __twExpectedNodeId });
+  } else if (${actionLiteral} === "double_click") {
+    await __twTab.dom_cua.double_click({ node_id: __twExpectedNodeId });
+  } else {
+    throw new Error("TOOLWIRE_BROWSER_ELEMENT_ACTION_UNSUPPORTED");
+  }
+  await __twTab.playwright.waitForTimeout(250);
+  const __twAfterUrl = (await __twTab.url()) ?? null;
+  const __twAfterTitle = (await __twTab.title()) ?? null;
+  __twPayload = { beforeUrl: __twBeforeUrl, afterUrl: __twAfterUrl, afterTitle: __twAfterTitle, action: ${actionLiteral} };
+} catch (__twError) {
+  __twActionError = __twError;
+} finally {
+  if (__twTab) {
+    try { __twCleanup = await cleanupBrowserClaim(__twBrowser, __twTab); }
+    catch (__twError) { __twCleanupError = __twError; }
+  }
+}
+if (__twDispatchAttempted && (__twActionError || __twCleanupError)) {
+  const __twPrimary = __twActionError ?? __twCleanupError;
+  const __twPrimaryMessage = __twPrimary instanceof Error ? __twPrimary.message : String(__twPrimary);
+  const __twCleanupSuffix = __twCleanupError && __twActionError
+    ? "; cleanup also failed: " + (__twCleanupError instanceof Error ? __twCleanupError.message : String(__twCleanupError))
+    : "";
+  if (/TOOLWIRE_BROWSER_CLICK_RESULT_UNCERTAIN/i.test(__twPrimaryMessage)) throw __twPrimary;
+  throw new Error("TOOLWIRE_BROWSER_CLICK_RESULT_UNCERTAIN:" + __twPrimaryMessage + __twCleanupSuffix);
+}
+if (__twActionError) throw __twActionError;
+if (__twCleanupError) throw __twCleanupError;
+if (__twPayload && __twCleanup) Object.assign(__twPayload, __twCleanup);
+nodeRepl.write(JSON.stringify(__twPayload));
+`, "Execute opaque Browser element action", { mutationKind: "click", expectedGeneration: prepared.workbenchGeneration });
+
+    const current = {
+      ...state,
+      title: stringOrNull(result?.afterTitle) ?? state.title,
+      url: stringOrNull(result?.afterUrl) ?? state.url,
+      seenAt: Date.now(),
+    };
+    this.#tabs.set(prepared.tabRef, current);
+    if (current.url !== prepared.expectedUrl) this.#elementRefs.invalidateTab(prepared.tabRef);
+    return {
+      status: prepared.action === "double_click" ? "double_clicked" : "clicked",
+      action: {
+        kind: prepared.action,
+        elementRef: prepared.elementRef,
+        descriptor: prepared.descriptor,
+      },
+      tab: publicTab(current),
+      beforeUrl: stringOrNull(result?.beforeUrl) ?? prepared.expectedUrl,
+      afterUrl: current.url,
+      ...browserCleanupReceipt(result),
+      note: "Exactly one prepared opaque-element action was dispatched through the maintained stock DOM-CUA node primitive after fresh URL/node/fingerprint revalidation. Raw stock node ids remain server-side, and uncertain dispatch is never replayed automatically.",
+    };
+  }
+
+  async prepareClick({ tabRef, role, name, text, scopeUrl, button = "left", cwd = this.#defaultCwd }, { allowStableElementId = true } = {}) {
+    const effectiveCwd = path.resolve(cwd);
+    const normalizedButton = typeof button === "string" ? button.trim().toLowerCase() : "";
+    if (!new Set(["left", "right"]).has(normalizedButton)) {
+      throw new BrowserPreviewError("BROWSER_CLICK_BUTTON_UNSUPPORTED", "button must be exactly left or right");
+    }
     if (typeof tabRef !== "string" || !tabRef) {
       throw new BrowserPreviewError("BROWSER_TAB_REF_REQUIRED", "tabRef is required; call codex.browser_tabs first");
     }
@@ -1394,20 +3180,21 @@ nodeRepl.write(JSON.stringify(__twPayload));
           name: normalizedName,
           ...(normalizedScopeUrl ? { scopeUrl: normalizedScopeUrl } : {}),
         };
-    await this.#requireReady(effectiveCwd);
     const state = this.#tabs.get(tabRef);
     if (!state) {
       throw new BrowserPreviewError(
         "BROWSER_TAB_REF_UNKNOWN",
         `unknown or expired browser tabRef: ${tabRef}`,
-        ["Call codex.browser_tabs again and use a fresh tabRef from the current Chrome session."]
+        ["Call codex.browser_tabs again and use a fresh tabRef from the current browser family."]
       );
     }
-
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(state.providerTabId);
-    const clickLocatorSetupSource = browserClickLocatorSetupSource(clickTarget);
+    const clickLocatorSetupSource = browserClickLocatorSetupSource(clickTarget, { allowStableElementId });
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -1448,10 +3235,12 @@ nodeRepl.write(JSON.stringify(__twPayload));
       actionApprovalRef,
       kind: "click",
       tabRef,
+      family: browserFamily,
       providerTabId: state.providerTabId,
       expectedUrl: stringOrNull(result?.url) ?? state.url,
       cwd: effectiveCwd,
       target: clickTarget,
+      button: normalizedButton,
       textBinding: clickTarget.kind === "text"
         ? browserTextBindingFromPrepareResult(result)
         : null,
@@ -1479,6 +3268,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
               name: prepared.target.name,
               ...(prepared.target.scopeUrl ? { scopeUrl: prepared.target.scopeUrl } : {}),
             }),
+        button: normalizedButton,
         exact: true,
       },
       nextAction: "Apply codex.browser_confirmation_policy and current user-authored task context to the prepared target. If this click is ordinary navigation/expansion or the bounded task's required verbal confirmation is already satisfied, call codex.browser_click immediately with this actionApprovalRef. Ask only when the policy/task actually requires it; do not ask merely because this is a click or because the legacy ref name contains Approval. Preparing did not click or mutate the page.",
@@ -1501,9 +3291,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ["Call codex.browser_tabs and codex.browser_prepare_click again to prepare a fresh exact click."]
       );
     }
-    this.#actionApprovals.delete(actionApprovalRef);
-    const effectiveCwd = prepared.cwd;
-    await this.#requireReady(effectiveCwd);
+    const effectiveCwd = await this.#readyPreparedAction(actionApprovalRef, prepared);
     if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_RUNTIME_RESTARTED",
@@ -1512,20 +3300,22 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
+    const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
+    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
-        "The prepared click no longer matches a current Browser runtime tab",
+        "The prepared click no longer matches a current Browser runtime tab or Browser family",
         ["Call codex.browser_tabs and prepare the click again from current page state."]
       );
     }
 
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const clickLocatorSetupSource = browserClickLocatorSetupSource(prepared.target, {
       binding: prepared.textBinding,
     });
-    const localRadioBinding = prepared.textBinding?.kind === "local-radio" ? prepared.textBinding : null;
+    const localRadioBinding = prepared.button === "left" && prepared.textBinding?.kind === "local-radio" ? prepared.textBinding : null;
     const localRadioDispatchSource = localRadioBinding
       ? `
   let __twRadioAncestor = __twTextLocator;
@@ -1538,8 +3328,10 @@ nodeRepl.write(JSON.stringify(__twPayload));
       : `const __twDispatchLocator = __twLocator;`;
     const clickDispatchSource = localRadioBinding
       ? `await __twDispatchLocator.check({ timeoutMs: 5000 });\n  if (!(await __twDispatchLocator.isChecked())) throw new Error("TOOLWIRE_BROWSER_CLICK_RESULT_UNCERTAIN:radio not checked after dispatch");`
-      : `await __twDispatchLocator.click({ timeoutMs: 5000 });`;
-    const flairTemplateBinding = prepared.textBinding?.kind === "flair-template-option" ? prepared.textBinding : null;
+      : prepared.button === "right"
+        ? `await __twDispatchLocator.click({ button: "right", timeoutMs: 5000 });`
+        : `await __twDispatchLocator.click({ timeoutMs: 5000 });`;
+    const flairTemplateBinding = prepared.button === "left" && prepared.textBinding?.kind === "flair-template-option" ? prepared.textBinding : null;
     const postClickVerificationSource = flairTemplateBinding
       ? `
   const __twFlairSelectorDepth = await __twLocator.evaluate((element, maxDepth) => {
@@ -1563,7 +3355,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
   if (__twFlairValue !== ${JSON.stringify(flairTemplateBinding.templateId)}) throw new Error("TOOLWIRE_BROWSER_CLICK_RESULT_UNCERTAIN:flair template selection not reflected after dispatch");`
       : "";
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -1644,6 +3436,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
               name: prepared.target.name,
               ...(prepared.target.scopeUrl ? { scopeUrl: prepared.target.scopeUrl } : {}),
             }),
+        button: prepared.button ?? "left",
         exact: true,
       },
       tab: publicTab(current),
@@ -1653,12 +3446,12 @@ nodeRepl.write(JSON.stringify(__twPayload));
       postSnapshot: snapshotTruncated ? snapshot.slice(0, BROWSER_POST_ACTION_MAX_CHARS) : snapshot,
       postSnapshotChars: snapshot.length,
       postSnapshotTruncated: snapshotTruncated,
-      note: "Exactly one previously prepared click was dispatched after the caller applied the current Browser confirmation policy and task context. The legacy actionApprovalRef is only an exact-action binding, not proof of user approval. The Browser runtime revalidated the tab URL and the same unique visible enabled exact target immediately before dispatch, then read back current page state. Existing-tab cleanup is reported separately and is never called released on finalize-absent runtimes without proof.",
+      note: `Exactly one previously prepared ${prepared.button === "right" ? "right-click" : "left-click"} was dispatched after the caller applied the current Browser confirmation policy and task context. The legacy actionApprovalRef is only an exact-action binding, not proof of user approval. The Browser runtime revalidated the tab URL and the same unique visible enabled exact target immediately before dispatch, then read back current page state. Existing-tab cleanup is reported separately and is never called released on finalize-absent runtimes without proof.`,
     };
   }
 
   async prepareDownload({ tabRef, role, name, text, cwd = this.#defaultCwd }) {
-    const preparedClick = await this.prepareClick({ tabRef, role, name, text, cwd });
+    const preparedClick = await this.prepareClick({ tabRef, role, name, text, cwd }, { allowStableElementId: false });
     const prepared = this.#actionApprovals.get(preparedClick.actionApprovalRef);
     if (!prepared || prepared.kind !== "click") {
       throw new BrowserPreviewError(
@@ -1693,9 +3486,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ["Call codex.browser_tabs and codex.browser_prepare_download again to prepare a fresh exact download."]
       );
     }
-    this.#actionApprovals.delete(actionApprovalRef);
-    const effectiveCwd = prepared.cwd;
-    await this.#requireReady(effectiveCwd);
+    const effectiveCwd = await this.#readyPreparedAction(actionApprovalRef, prepared);
     if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_RUNTIME_RESTARTED",
@@ -1704,21 +3495,24 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
+    const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
+    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
-        "The prepared download no longer matches a current Browser runtime tab",
+        "The prepared download no longer matches a current Browser runtime tab or Browser family",
         ["Call codex.browser_tabs and prepare the download again from current page state."]
       );
     }
 
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const clickLocatorSetupSource = browserClickLocatorSetupSource(prepared.target, {
       binding: prepared.textBinding,
+      allowStableElementId: false,
     });
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -1877,7 +3671,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       name,
       text,
       cwd: authorizedFile.cwd,
-    });
+    }, { allowStableElementId: false });
     const prepared = this.#actionApprovals.get(preparedClick.actionApprovalRef);
     if (!prepared || prepared.kind !== "click") {
       throw new BrowserPreviewError(
@@ -1922,8 +3716,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ["Call codex.browser_tabs and codex.browser_prepare_upload again to prepare a fresh exact upload."]
       );
     }
-    this.#actionApprovals.delete(actionApprovalRef);
-    const effectiveCwd = prepared.cwd;
+    const effectiveCwd = await this.#readyPreparedAction(actionApprovalRef, prepared);
     let currentUploadFile;
     try {
       currentUploadFile = await resolveAuthorizedExistingFile({
@@ -1951,7 +3744,6 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ["Do not upload this prepared ref. Inspect the current file and prepare a fresh upload only if the current content is still intended for this destination."]
       );
     }
-    await this.#requireReady(effectiveCwd);
     if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_RUNTIME_RESTARTED",
@@ -1960,22 +3752,25 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
+    const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
+    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
-        "The prepared upload no longer matches a current Browser runtime tab",
+        "The prepared upload no longer matches a current Browser runtime tab or Browser family",
         ["Call codex.browser_tabs and prepare the upload again from current page state."]
       );
     }
 
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const uploadPathLiteral = JSON.stringify(prepared.uploadFile.path);
     const clickLocatorSetupSource = browserClickLocatorSetupSource(prepared.target, {
       binding: prepared.textBinding,
+      allowStableElementId: false,
     });
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2172,7 +3967,6 @@ nodeRepl.write(JSON.stringify(__twPayload));
       : normalizedPlaceholder
         ? { kind: "placeholder", role: normalizedRole, placeholder: normalizedPlaceholder }
         : { kind: "scope-role", role: normalizedRole, scopeUrl: normalizedScopeUrl };
-    await this.#requireReady(effectiveCwd);
     const state = this.#tabs.get(tabRef);
     if (!state) {
       throw new BrowserPreviewError(
@@ -2182,10 +3976,13 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
 
+    const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
+    await this.#requireReady(effectiveCwd, browserFamily);
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const fillLocatorSetupSource = browserFillLocatorSetupSource(fillTarget);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2203,7 +4000,8 @@ try {
   if (!__twVisible) throw new Error("TOOLWIRE_BROWSER_LOCATOR_NOT_VISIBLE");
   const __twEnabled = await __twLocator.isEnabled();
   if (!__twEnabled) throw new Error("TOOLWIRE_BROWSER_LOCATOR_NOT_ENABLED");
-  const __twTargetStructure = await __twLocator.evaluate((element) => {
+  const __twNativePasswordTarget = __twTargetMeta?.tag === "input" && __twTargetMeta?.inputType === "password";
+  const __twTargetStructure = __twNativePasswordTarget ? null : await __twLocator.evaluate((element) => {
     const attr = (node, name) => typeof node?.getAttribute === "function" ? node.getAttribute(name) : null;
     const tag = (node) => typeof node?.tagName === "string" ? node.tagName.toLowerCase() : null;
     const childSignature = (node) => ({
@@ -2245,22 +4043,25 @@ try {
       outerHtmlByteLength,
     };
   });
-  let __twCurrentDirectValue = null;
-  let __twCurrentRenderedInnerText = null;
-  let __twCurrentRenderedTextContent = null;
-  try {
-    __twCurrentDirectValue = await __twLocator.evaluate((element) => {
-      if (typeof element?.value === "string") return element.value;
-      if (element?.isContentEditable) return typeof element.innerText === "string" ? element.innerText : (element.textContent ?? "");
-      return null;
-    });
-  } catch {}
-  try { __twCurrentRenderedInnerText = await __twLocator.innerText({ timeoutMs: 1000 }); } catch {}
-  try { __twCurrentRenderedTextContent = await __twLocator.textContent({ timeoutMs: 1000 }); } catch {}
-  const __twCurrentCandidates = [__twCurrentDirectValue, __twCurrentRenderedInnerText, __twCurrentRenderedTextContent]
-    .filter((candidate) => typeof candidate === "string");
-  if (__twCurrentCandidates.length === 0) throw new Error("TOOLWIRE_BROWSER_FILL_VALUE_UNREADABLE");
-  const __twCurrentValue = __twCurrentCandidates.find((candidate) => !/^\\s*$/.test(candidate)) ?? __twCurrentCandidates[0];
+  let __twCurrentValue = null;
+  if (!__twNativePasswordTarget) {
+    let __twCurrentDirectValue = null;
+    let __twCurrentRenderedInnerText = null;
+    let __twCurrentRenderedTextContent = null;
+    try {
+      __twCurrentDirectValue = await __twLocator.evaluate((element) => {
+        if (typeof element?.value === "string") return element.value;
+        if (element?.isContentEditable) return typeof element.innerText === "string" ? element.innerText : (element.textContent ?? "");
+        return null;
+      });
+    } catch {}
+    try { __twCurrentRenderedInnerText = await __twLocator.innerText({ timeoutMs: 1000 }); } catch {}
+    try { __twCurrentRenderedTextContent = await __twLocator.textContent({ timeoutMs: 1000 }); } catch {}
+    const __twCurrentCandidates = [__twCurrentDirectValue, __twCurrentRenderedInnerText, __twCurrentRenderedTextContent]
+      .filter((candidate) => typeof candidate === "string");
+    if (__twCurrentCandidates.length === 0) throw new Error("TOOLWIRE_BROWSER_FILL_VALUE_UNREADABLE");
+    __twCurrentValue = __twCurrentCandidates.find((candidate) => !/^\\s*$/.test(candidate)) ?? __twCurrentCandidates[0];
+  }
   __twPayload = {
     title: __twTitle,
     url: __twUrl,
@@ -2279,6 +4080,22 @@ if (__twPayload && __twCleanup) Object.assign(__twPayload, __twCleanup);
 nodeRepl.write(JSON.stringify(__twPayload));
 `, "Prepare exact Chrome fill", { expectedGeneration: state.workbenchGeneration });
 
+    const editableSource = stringOrNull(result?.targetMeta?.editableSource);
+    const editableKind = stringOrNull(result?.targetMeta?.editableKind);
+    if (!new Set(["direct", "unique-visible-descendant", "semantic-shell"]).has(editableSource)
+      || !new Set(["input", "textarea", "contenteditable", "semantic-shell"]).has(editableKind)) {
+      throw new BrowserPreviewError(
+        "BROWSER_FILL_TARGET_INVALID",
+        "The prepared Browser textbox resolved without one bounded editable target classification"
+      );
+    }
+    const nativePasswordBinding = fillTarget.kind === "placeholder"
+      && fillTarget.role === "textbox"
+      && stringOrNull(result?.targetMeta?.tag) === "input"
+      && stringOrNull(result?.targetMeta?.inputType) === "password"
+      && stringOrNull(result?.targetMeta?.placeholder) === fillTarget.placeholder
+      ? { tag: "input", type: "password", placeholder: fillTarget.placeholder }
+      : null;
     this.#cleanupActionApprovals();
     const actionApprovalRef = `browser_action_${randomUUID()}`;
     const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
@@ -2286,12 +4103,15 @@ nodeRepl.write(JSON.stringify(__twPayload));
       actionApprovalRef,
       kind: "fill",
       tabRef,
+      family: browserFamily,
       providerTabId: state.providerTabId,
       expectedUrl: stringOrNull(result?.url) ?? state.url,
       cwd: effectiveCwd,
       target: fillTarget,
       text,
       fillStrategy: result?.fillStrategy === "type" ? "type" : "fill",
+      editableBinding: { source: editableSource, kind: editableKind },
+      nativePasswordBinding,
       targetMeta: result?.targetMeta ?? null,
       workbenchGeneration: state.workbenchGeneration,
       expiresAt,
@@ -2317,10 +4137,17 @@ nodeRepl.write(JSON.stringify(__twPayload));
             ? { placeholder: prepared.target.placeholder }
             : { scopeUrl: prepared.target.scopeUrl }),
         exact: true,
-        text: prepared.text,
-        currentValue: stringOrNull(result?.currentValue) ?? "",
+        ...(nativePasswordBinding
+          ? {
+              textLength: prepared.text.length,
+              targetBinding: nativePasswordBinding,
+            }
+          : {
+              text: prepared.text,
+              currentValue: stringOrNull(result?.currentValue) ?? "",
+              targetStructure: result?.targetStructure ?? null,
+            }),
         fillStrategy: prepared.fillStrategy,
-        targetStructure: result?.targetStructure ?? null,
       },
       nextAction: "Apply codex.browser_confirmation_policy and current user-authored task context to this exact fill. If the text is ordinary non-sensitive task content and no policy-covered transmission confirmation is needed, or the bounded task's required verbal confirmation is already satisfied, call codex.browser_fill immediately with this actionApprovalRef. Ask only when the policy/task actually requires it; do not ask merely because this is Fill or because the legacy ref name contains Approval. Preparing did not modify the field, click, press Enter, or submit the page.",
     };
@@ -2342,9 +4169,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ["Call codex.browser_tabs and codex.browser_prepare_fill again to prepare a fresh exact fill."]
       );
     }
-    this.#actionApprovals.delete(actionApprovalRef);
-    const effectiveCwd = prepared.cwd;
-    await this.#requireReady(effectiveCwd);
+    const effectiveCwd = await this.#readyPreparedAction(actionApprovalRef, prepared);
     if (prepared.workbenchGeneration !== this.#workbenchGeneration) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_RUNTIME_RESTARTED",
@@ -2353,21 +4178,25 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const state = this.#tabs.get(prepared.tabRef);
-    if (!state || state.providerTabId !== prepared.providerTabId) {
+    const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
+    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
-        "The prepared fill no longer matches a current Browser runtime tab",
+        "The prepared fill no longer matches a current Browser runtime tab or Browser family",
         ["Call codex.browser_tabs and prepare the fill again from current page state."]
       );
     }
 
+    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const fillLocatorSetupSource = browserFillLocatorSetupSource(prepared.target);
     const textLiteral = JSON.stringify(prepared.text);
     const canonicalRichTextLiteral = JSON.stringify(prepared.text.replace(/\r\n?/g, "\n"));
+    const nativePasswordBindingLiteral = JSON.stringify(prepared.nativePasswordBinding ?? null);
+    const nativePasswordFillLiteral = JSON.stringify(Boolean(prepared.nativePasswordBinding));
     let result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2388,7 +4217,22 @@ try {
   if (!__twVisible) throw new Error("TOOLWIRE_BROWSER_LOCATOR_NOT_VISIBLE");
   const __twEnabled = await __twLocator.isEnabled();
   if (!__twEnabled) throw new Error("TOOLWIRE_BROWSER_LOCATOR_NOT_ENABLED");
-  if (__twFillStrategy !== ${JSON.stringify(prepared.fillStrategy)}) throw new Error("TOOLWIRE_BROWSER_FILL_STRATEGY_CHANGED");
+  if (__twTargetMeta?.editableSource !== ${JSON.stringify(prepared.editableBinding.source)}
+    || __twTargetMeta?.editableKind !== ${JSON.stringify(prepared.editableBinding.kind)}
+    || __twFillStrategy !== ${JSON.stringify(prepared.fillStrategy)}) {
+    throw new Error("TOOLWIRE_BROWSER_FILL_TARGET_CHANGED");
+  }
+  const __twPreparedNativePasswordBinding = ${nativePasswordBindingLiteral};
+  const __twNativePasswordFill = ${nativePasswordFillLiteral};
+  const __twAssertNativePasswordBinding = (meta) => {
+    if (!__twNativePasswordFill) return;
+    if (meta?.tag !== __twPreparedNativePasswordBinding?.tag
+      || meta?.inputType !== __twPreparedNativePasswordBinding?.type
+      || meta?.placeholder !== __twPreparedNativePasswordBinding?.placeholder) {
+      throw new Error("TOOLWIRE_BROWSER_FILL_TARGET_CHANGED");
+    }
+  };
+  __twAssertNativePasswordBinding(__twTargetMeta);
   const __twClearRequested = ${JSON.stringify(prepared.text === "")};
   const __twResolveFreshTarget = async () => {
     const __twFresh = await (async () => {
@@ -2399,6 +4243,7 @@ try {
       if (!(await __twLocator.isEnabled())) throw new Error("TOOLWIRE_BROWSER_LOCATOR_NOT_ENABLED");
       return { locator: __twLocator, fillStrategy: __twFillStrategy, targetMeta: __twTargetMeta };
     })();
+    __twAssertNativePasswordBinding(__twFresh.targetMeta);
     return __twFresh;
   };
   const __twReadLocatorText = async (locator) => {
@@ -2456,10 +4301,17 @@ try {
     if (candidates.length === 0) return null;
     return candidates.find((candidate) => !/^\\s*$/.test(candidate)) ?? candidates[0];
   };
-  const __twBeforeObserved = await __twReadLocatorText(__twLocator);
-  const __twBeforeValue = __twSelectObservedText(__twBeforeObserved);
-  if (typeof __twBeforeValue !== "string") throw new Error("TOOLWIRE_BROWSER_FILL_VALUE_UNREADABLE");
+  let __twBeforeValue = null;
+  if (!__twNativePasswordFill) {
+    const __twBeforeObserved = await __twReadLocatorText(__twLocator);
+    __twBeforeValue = __twSelectObservedText(__twBeforeObserved);
+    if (typeof __twBeforeValue !== "string") throw new Error("TOOLWIRE_BROWSER_FILL_VALUE_UNREADABLE");
+  }
   const __twVerifyFreshTarget = async (fresh) => {
+    if (__twNativePasswordFill) {
+      __twAssertNativePasswordBinding(fresh.targetMeta);
+      return { exact: true, afterValue: null, source: "fresh-native-password-binding", observed: null };
+    }
     const observed = await __twReadLocatorText(fresh.locator);
     if (__twClearRequested) {
       if (observed.blank === true) return { exact: true, afterValue: "", source: "fresh-target-cleared", observed };
@@ -2472,61 +4324,6 @@ try {
     if (observed.boundRichTextSource !== null && observed.canonicalRichText === ${canonicalRichTextLiteral}) {
       return { exact: true, afterValue: ${textLiteral}, source: "fresh-target-rich-paragraphs:" + observed.boundRichTextSource, observed };
     }
-    if (${JSON.stringify(prepared.target.kind !== "scope-role")}) {
-      const __twVisibleRoleTargets = __twTab.playwright.getByRole(${JSON.stringify(prepared.target.role)}).filter({ visible: true });
-      const __twRoleValues = await __twVisibleRoleTargets.evaluateAll((elements) => elements.map((element) => {
-        const __twCanonicalizeContentEditableParagraphText = ${CONTENTEDITABLE_PARAGRAPH_CANONICALIZER_SOURCE};
-        const isContentEditable = Boolean(element?.isContentEditable);
-        const value = typeof element?.value === "string"
-          ? element.value
-          : isContentEditable
-            ? (typeof element.innerText === "string" ? element.innerText : (element.textContent ?? ""))
-            : typeof element?.innerText === "string"
-              ? element.innerText
-              : (element?.textContent ?? null);
-        return {
-          value,
-          contentEditable: isContentEditable,
-          canonicalRichText: isContentEditable ? __twCanonicalizeContentEditableParagraphText(element) : null,
-        };
-      }));
-      const __twExactRoleMatches = __twRoleValues.filter((entry) => entry?.value === ${textLiteral}
-        || (entry?.contentEditable === true && entry?.canonicalRichText === ${canonicalRichTextLiteral})).length;
-      if (__twExactRoleMatches > 1) throw new Error("TOOLWIRE_BROWSER_FILL_VERIFY_MISMATCH");
-      if (__twExactRoleMatches === 1) return { exact: true, afterValue: ${textLiteral}, source: "same-role-visible-target", observed };
-    }
-    const __twLocalEditor = await fresh.locator.evaluate((element, expected) => {
-      const __twCanonicalizeContentEditableParagraphText = ${CONTENTEDITABLE_PARAGRAPH_CANONICALIZER_SOURCE};
-      const matchesExpected = (candidate) => {
-        if (!candidate) return false;
-        if (typeof candidate.value === "string") return candidate.value === expected.raw;
-        if (candidate.isContentEditable) {
-          const raw = typeof candidate.innerText === "string" ? candidate.innerText : (candidate.textContent ?? "");
-          const canonical = __twCanonicalizeContentEditableParagraphText(candidate);
-          return raw === expected.raw || (typeof canonical === "string" && canonical === expected.canonical);
-        }
-        return false;
-      };
-      const isVisible = (candidate) => {
-        if (!(candidate instanceof Element)) return false;
-        const style = window.getComputedStyle(candidate);
-        if (style.display === "none" || style.visibility !== "visible" || Number(style.opacity) <= 0.01) return false;
-        return Array.from(candidate.getClientRects()).some((rect) => rect.width > 0 && rect.height > 0);
-      };
-      let scope = element?.parentElement ?? null;
-      for (let depth = 1; depth <= 3 && scope; depth += 1, scope = scope.parentElement) {
-        const matches = [];
-        const candidates = scope.querySelectorAll('input, textarea, [contenteditable]:not([contenteditable="false"])');
-        for (const candidate of candidates) {
-          if (!isVisible(candidate)) continue;
-          if (matchesExpected(candidate)) matches.push(candidate);
-        }
-        if (matches.length > 0) return { depth, exactMatches: matches.length };
-      }
-      return { depth: null, exactMatches: 0 };
-    }, { raw: ${textLiteral}, canonical: ${canonicalRichTextLiteral} });
-    if (__twLocalEditor?.exactMatches > 1) throw new Error("TOOLWIRE_BROWSER_FILL_VERIFY_MISMATCH");
-    if (__twLocalEditor?.exactMatches === 1) return { exact: true, afterValue: ${textLiteral}, source: "local-editor-exact", observed };
     return { exact: false, afterValue: typeof observed.value === "string" ? observed.value : "", source: null, observed };
   };
   __twDispatchAttempted = true;
@@ -2586,15 +4383,16 @@ try {
       ? "editor-settle:" + __twVerification.source
       : __twVerification.source;
   const __twAfterUrl = (await __twTab.url()) ?? null;
+  if (__twAfterUrl !== ${expectedUrlLiteral}) throw new Error("TOOLWIRE_BROWSER_ACTION_URL_CHANGED");
   const __twAfterTitle = (await __twTab.title()) ?? null;
-  const __twSnapshot = await __twTab.playwright.domSnapshot();
+  const __twSnapshot = __twNativePasswordFill ? null : await __twTab.playwright.domSnapshot();
   __twPayload = {
     phaseStatus: __twActivationOnly ? "activation_only" : "filled",
     beforeUrl: __twBeforeUrl,
     afterUrl: __twAfterUrl,
     afterTitle: __twAfterTitle,
-    beforeValue: __twBeforeValue,
-    afterValue: __twAfterValue,
+    beforeValue: __twNativePasswordFill ? null : __twBeforeValue,
+    afterValue: __twNativePasswordFill ? null : __twAfterValue,
     verificationSource: __twVerificationSource,
     dispatchAttempts: 1,
     settleRecheck: __twSettleRecheck,
@@ -2636,7 +4434,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     if (result?.phaseStatus === "activation_only") {
       const activation = result;
       const repair = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get("chrome");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2714,61 +4512,6 @@ try {
     if (observed.boundRichTextSource !== null && observed.canonicalRichText === ${canonicalRichTextLiteral}) {
       return { exact: true, afterValue: ${textLiteral}, source: "fresh-target-rich-paragraphs:" + observed.boundRichTextSource, observed };
     }
-    if (${JSON.stringify(prepared.target.kind !== "scope-role")}) {
-      const __twVisibleRoleTargets = __twTab.playwright.getByRole(${JSON.stringify(prepared.target.role)}).filter({ visible: true });
-      const __twRoleValues = await __twVisibleRoleTargets.evaluateAll((elements) => elements.map((element) => {
-        const __twCanonicalizeContentEditableParagraphText = ${CONTENTEDITABLE_PARAGRAPH_CANONICALIZER_SOURCE};
-        const isContentEditable = Boolean(element?.isContentEditable);
-        const value = typeof element?.value === "string"
-          ? element.value
-          : isContentEditable
-            ? (typeof element.innerText === "string" ? element.innerText : (element.textContent ?? ""))
-            : typeof element?.innerText === "string"
-              ? element.innerText
-              : (element?.textContent ?? null);
-        return {
-          value,
-          contentEditable: isContentEditable,
-          canonicalRichText: isContentEditable ? __twCanonicalizeContentEditableParagraphText(element) : null,
-        };
-      }));
-      const __twExactRoleMatches = __twRoleValues.filter((entry) => entry?.value === ${textLiteral}
-        || (entry?.contentEditable === true && entry?.canonicalRichText === ${canonicalRichTextLiteral})).length;
-      if (__twExactRoleMatches > 1) throw new Error("TOOLWIRE_BROWSER_FILL_VERIFY_MISMATCH");
-      if (__twExactRoleMatches === 1) return { exact: true, afterValue: ${textLiteral}, source: "same-role-visible-target", observed };
-    }
-    const __twLocalEditor = await fresh.locator.evaluate((element, expected) => {
-      const __twCanonicalizeContentEditableParagraphText = ${CONTENTEDITABLE_PARAGRAPH_CANONICALIZER_SOURCE};
-      const matchesExpected = (candidate) => {
-        if (!candidate) return false;
-        if (typeof candidate.value === "string") return candidate.value === expected.raw;
-        if (candidate.isContentEditable) {
-          const raw = typeof candidate.innerText === "string" ? candidate.innerText : (candidate.textContent ?? "");
-          const canonical = __twCanonicalizeContentEditableParagraphText(candidate);
-          return raw === expected.raw || (typeof canonical === "string" && canonical === expected.canonical);
-        }
-        return false;
-      };
-      const isVisible = (candidate) => {
-        if (!(candidate instanceof Element)) return false;
-        const style = window.getComputedStyle(candidate);
-        if (style.display === "none" || style.visibility !== "visible" || Number(style.opacity) <= 0.01) return false;
-        return Array.from(candidate.getClientRects()).some((rect) => rect.width > 0 && rect.height > 0);
-      };
-      let scope = element?.parentElement ?? null;
-      for (let depth = 1; depth <= 3 && scope; depth += 1, scope = scope.parentElement) {
-        const matches = [];
-        const candidates = scope.querySelectorAll('input, textarea, [contenteditable]:not([contenteditable="false"])');
-        for (const candidate of candidates) {
-          if (!isVisible(candidate)) continue;
-          if (matchesExpected(candidate)) matches.push(candidate);
-        }
-        if (matches.length > 0) return { depth, exactMatches: matches.length };
-      }
-      return { depth: null, exactMatches: 0 };
-    }, { raw: ${textLiteral}, canonical: ${canonicalRichTextLiteral} });
-    if (__twLocalEditor?.exactMatches > 1) throw new Error("TOOLWIRE_BROWSER_FILL_VERIFY_MISMATCH");
-    if (__twLocalEditor?.exactMatches === 1) return { exact: true, afterValue: ${textLiteral}, source: "local-editor-exact", observed };
     return { exact: false, afterValue: typeof observed.value === "string" ? observed.value : "", source: null, observed };
   };
   let __twFresh = await __twResolveTarget();
@@ -2804,6 +4547,7 @@ try {
     throw new Error("TOOLWIRE_BROWSER_FILL_VERIFY_MISMATCH");
   }
   const __twAfterUrl = (await __twTab.url()) ?? null;
+  if (__twAfterUrl !== ${expectedUrlLiteral}) throw new Error("TOOLWIRE_BROWSER_ACTION_URL_CHANGED");
   const __twAfterTitle = (await __twTab.title()) ?? null;
   const __twSnapshot = await __twTab.playwright.domSnapshot();
   __twPayload = {
@@ -2860,7 +4604,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
       };
     }
 
-    const snapshot = typeof result?.snapshot === "string" ? result.snapshot : "";
+    const nativePasswordFill = Boolean(prepared.nativePasswordBinding);
+    const snapshot = !nativePasswordFill && typeof result?.snapshot === "string" ? result.snapshot : "";
     const snapshotTruncated = snapshot.length > BROWSER_POST_ACTION_MAX_CHARS;
     const current = {
       ...state,
@@ -2883,12 +4628,17 @@ nodeRepl.write(JSON.stringify(__twPayload));
             : { scopeUrl: prepared.target.scopeUrl }),
         exact: true,
         textLength: prepared.text.length,
+        ...(nativePasswordFill ? { targetBinding: prepared.nativePasswordBinding } : {}),
       },
       tab: publicTab(current),
       beforeUrl: stringOrNull(result?.beforeUrl) ?? prepared.expectedUrl,
       afterUrl: current.url,
-      beforeValue: stringOrNull(result?.beforeValue) ?? "",
-      afterValue: stringOrNull(result?.afterValue) ?? "",
+      ...(nativePasswordFill
+        ? {}
+        : {
+            beforeValue: stringOrNull(result?.beforeValue) ?? "",
+            afterValue: stringOrNull(result?.afterValue) ?? "",
+          }),
       verificationSource: stringOrNull(result?.verificationSource) ?? "fresh-target",
       dispatchAttempts: Number.isInteger(result?.dispatchAttempts) ? result.dispatchAttempts : 1,
       settleRecheck: result?.settleRecheck === true,
@@ -2897,19 +4647,25 @@ nodeRepl.write(JSON.stringify(__twPayload));
       reclaimStatus: stringOrNull(result?.reclaimStatus),
       repairAttempted: result?.repairAttempted === true,
       repairReason: stringOrNull(result?.repairReason),
-      postSnapshot: snapshotTruncated ? snapshot.slice(0, BROWSER_POST_ACTION_MAX_CHARS) : snapshot,
-      postSnapshotChars: snapshot.length,
-      postSnapshotTruncated: snapshotTruncated,
-      note: "Exactly one previously prepared fill was dispatched after the caller applied the current Browser confirmation policy and task context. The legacy actionApprovalRef is only an exact-action binding, not proof of user approval. The Browser runtime revalidated the same tab URL and unique visible enabled exact role/name or role+placeholder target, verified the resulting field value equals the bound text, and read back current page state. Existing-tab cleanup is reported separately and finalize-absent runtimes are not claimed released without proof. It did not click, press Enter, navigate, or submit the page.",
+      ...(nativePasswordFill
+        ? {}
+        : {
+            postSnapshot: snapshotTruncated ? snapshot.slice(0, BROWSER_POST_ACTION_MAX_CHARS) : snapshot,
+            postSnapshotChars: snapshot.length,
+            postSnapshotTruncated: snapshotTruncated,
+          }),
+      note: nativePasswordFill
+        ? "Exactly one prepared native password fill was dispatched through the official fill API after revalidating the same tab URL and exact placeholder-bound input tag/type/placeholder plus visibility/enabled state. The Browser runtime does not read or return the password value, does not return the prepared text body, and does not enter the activation-repair path; receipts retain only the prepared text length and bounded target identity."
+        : "Exactly one previously prepared fill was dispatched after the caller applied the current Browser confirmation policy and task context. The legacy actionApprovalRef is only an exact-action binding, not proof of user approval. The Browser runtime revalidated the same tab URL and original exact semantic target, resolved only that target or its unique visible supported editable descendant, verified exact bound text on a freshly re-resolved target, and read back current page state. Existing-tab cleanup is reported separately and finalize-absent runtimes are not claimed released without proof. It did not click, press Enter, navigate, or submit the page, and it did not implement website persistence/Save behavior.",
     };
   }
 
-  async #boundRuntimeCompatibilityStatus(cwd, skillPath) {
+  async #boundRuntimeCompatibilityStatus(cwd, { skillPath = null, pluginBuild = null } = {}) {
     if (!this.#runtimeCompatibility) return null;
     let current;
     try {
       current = normalizeRuntimeCompatibilityBinding(
-        await this.#runtimeCompatibilityResolver({ cwd, chromeSkillPath: skillPath })
+        await this.#runtimeCompatibilityResolver({ cwd, chromeSkillPath: skillPath, chromePluginBuild: pluginBuild })
       );
     } catch {
       current = null;
@@ -2932,37 +4688,47 @@ nodeRepl.write(JSON.stringify(__twPayload));
 
   async #dependencyStatus(cwd) {
     let skills;
+    let chromePlugin = null;
     try {
-      skills = await this.#workbench.catalog({ kind: "skills", cwd, query: CHROME_SKILL_NAME });
+      [skills, chromePlugin] = await Promise.all([
+        this.#workbench.catalog({ kind: "skills", cwd, query: CHROME_SKILL_NAME }),
+        typeof this.#workbench.currentChromePlugin === "function"
+          ? this.#workbench.currentChromePlugin({ cwd })
+          : Promise.resolve(null),
+      ]);
       this.#syncWorkbenchGeneration();
     } catch (error) {
       this.#syncWorkbenchGeneration();
       return browserUnavailable(new BrowserPreviewError(
-        "BROWSER_SKILL_DISCOVERY_FAILED",
-        `Could not read Codex Skills catalog: ${error instanceof Error ? error.message : String(error)}`
+        "BROWSER_CHROME_DISCOVERY_FAILED",
+        `Could not read current Codex Chrome plugin/Skill state: ${error instanceof Error ? error.message : String(error)}`
       ));
     }
     const skill = (skills?.skills ?? []).find((entry) => entry?.name === CHROME_SKILL_NAME && entry?.enabled !== false);
-    if (!skill?.path) {
+    const skillPath = skill?.path ?? null;
+    const pluginBuild = typeof chromePlugin?.localVersion === "string" && chromePlugin.localVersion.trim()
+      ? chromePlugin.localVersion.trim()
+      : null;
+    if (!skillPath && !pluginBuild) {
       return {
         status: "unavailable",
         reason: "chrome_skill_unavailable",
         chromeSkill: "missing",
         nodeRepl: "unknown",
         nextActions: [
-          "Install/enable the current Codex Chrome Skill/plugin, then retry codex.browser_status.",
-          "Do not use CUA as an automatic fallback for a missing Browser Skill.",
+          "Install/enable the current bundled Codex Chrome plugin, then retry codex.browser_status.",
+          "Do not use CUA as an automatic fallback for a missing Browser plugin.",
         ],
       };
     }
     if (this.#runtimeCompatibilityFailure) {
       return runtimeCompatibilityUnavailable(this.#runtimeCompatibilityFailure);
     }
-    const compatibilityStatus = await this.#boundRuntimeCompatibilityStatus(cwd, skill.path);
+    const compatibilityStatus = await this.#boundRuntimeCompatibilityStatus(cwd, { skillPath, pluginBuild });
     if (compatibilityStatus) return compatibilityStatus;
 
     try {
-      const mcp = await this.#workbench.catalog({ kind: "mcp", cwd, query: NODE_REPL_TOOL });
+      const mcp = await this.#workbench.catalog({ kind: "mcp", cwd: this.#runtimeCwd, query: NODE_REPL_TOOL });
       this.#syncWorkbenchGeneration();
       const nodeRepl = (mcp?.servers ?? []).find((server) => server?.name === NODE_REPL_SERVER);
       const js = nodeRepl?.tools?.find((tool) => tool?.name === NODE_REPL_TOOL);
@@ -2988,12 +4754,24 @@ nodeRepl.write(JSON.stringify(__twPayload));
     }
 
     if (!this.#runtimeCompatibility) {
-      this.#browserClientUrl = this.#browserClientUrl ?? deriveBrowserClientUrl(skill.path);
+      if (!skillPath) {
+        return {
+          status: "unavailable",
+          reason: "BROWSER_RUNTIME_COMPATIBILITY_UNAVAILABLE",
+          chromeSkill: "not_required",
+          nodeRepl: "ok",
+          nextActions: [
+            "Use a Codexless runtime that binds the current skill-less Chrome plugin build to its browser client/service pair before Browser dispatch.",
+          ],
+        };
+      }
+      this.#browserClientUrl = this.#browserClientUrl ?? deriveBrowserClientUrl(skillPath);
     }
-    return { status: "ok", skillPathResolved: true, browserClientResolved: true };
+    return { status: "ok", skillPathResolved: Boolean(skillPath), chromePluginResolved: Boolean(pluginBuild), browserClientResolved: true };
   }
 
-  async #requireReady(cwd) {
+  async #requireReady(cwd, family = "chrome") {
+    const browserFamily = normalizeBrowserFamily(family);
     const dependency = await this.#dependencyStatus(cwd);
     if (dependency.status !== "ok") {
       throw new BrowserPreviewError(
@@ -3003,22 +4781,30 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const backends = await this.#listBackends(cwd);
-    const chromeBackends = backends.filter((backend) => backend.family === "chrome");
-    if (chromeBackends.length === 0) {
+    const familyBackends = backends.filter((backend) => backend.family === browserFamily);
+    if (familyBackends.length === 0) {
       throw new BrowserPreviewError(
-        "BROWSER_CHROME_NOT_CONNECTED",
-        "The Codex Browser runtime is available but no connected Chrome extension/backend is visible",
+        "BROWSER_FAMILY_NOT_CONNECTED",
+        `The Codex Browser runtime is available but no connected ${browserFamily} extension/backend is visible`,
         [
-          "Open Chrome with the supported Codex Chrome extension/runtime enabled, then retry.",
+          `Open ${browserFamily} with the supported Codex Browser extension/runtime enabled, then retry.`,
           "Call codex.browser_status to distinguish Browser setup from site login state.",
         ]
       );
     }
-    if (chromeBackends.length > 1) {
-      const ambiguous = chromeBackendAmbiguous(backends, chromeBackends);
-      throw new BrowserPreviewError(ambiguous.reason, ambiguous.error, ambiguous.nextActions, {
-        connectedBrowsers: ambiguous.connectedBrowsers,
-      });
+    if (familyBackends.length > 1) {
+      if (browserFamily === "chrome") {
+        const ambiguous = chromeBackendAmbiguous(backends, familyBackends);
+        throw new BrowserPreviewError(ambiguous.reason, ambiguous.error, ambiguous.nextActions, {
+          connectedBrowsers: ambiguous.connectedBrowsers,
+        });
+      }
+      throw new BrowserPreviewError(
+        "BROWSER_FAMILY_BACKEND_AMBIGUOUS",
+        `Multiple connected ${browserFamily} Browser backends are visible and Codexless has no profile/backend selector`,
+        ["Do not guess a backend/profile. Leave only one backend for the requested family connected, then retry."],
+        { connectedBrowsers: backends.map(sanitizeBackend), family: browserFamily }
+      );
     }
   }
 
@@ -3035,7 +4821,24 @@ nodeRepl.write(JSON.stringify(__twBackends.map((backend) => ({
   }
 
   async #runJson(cwd, body, title, { mutationKind = null, expectedGeneration = null } = {}) {
-    const clientUrl = await this.#resolveBrowserClientUrl(cwd);
+    let mutationToken = null;
+    if (mutationKind) {
+      if (this.#emergencyResetInProgress) {
+        throw new BrowserPreviewError(
+          "BROWSER_EMERGENCY_RESET_IN_PROGRESS",
+          "Browser mutation was refused because an emergency control-state reset is in progress",
+          ["Wait for the reset receipt, refresh browser_tabs, and prepare a fresh action. Do not replay the prior mutation automatically."]
+        );
+      }
+      mutationToken = `browser_mutation_${randomUUID()}`;
+      this.#activeMutations.set(mutationToken, {
+        kind: mutationKind,
+        startedAt: Date.now(),
+        generation: expectedGeneration ?? this.#workbenchGeneration,
+      });
+    }
+    try {
+      const clientUrl = await this.#resolveBrowserClientUrl(cwd);
     const dispatchGeneration = expectedGeneration ?? this.#workbenchGeneration;
     const bootstrap = `
 if (globalThis.__toolwireBrowserAgent?.browsers == null) {
@@ -3046,13 +4849,19 @@ if (globalThis.__toolwireBrowserAgent?.browsers == null) {
     const lifecycleAdapterSource = body.includes("markBrowserDeliverable(") || body.includes("cleanupBrowserClaim(")
       ? `${BROWSER_LIFECYCLE_ADAPTER_SOURCE}\n`
       : "";
+    const snapshotAwareBody = body.includes("await __twTab.playwright.domSnapshot()")
+      ? body.replaceAll("await __twTab.playwright.domSnapshot()", "await sanitizeBrowserDomSnapshot(__twTab)")
+      : body;
+    const snapshotSanitizerSource = snapshotAwareBody !== body
+      ? `${BROWSER_PASSWORD_SNAPSHOT_SANITIZER_SOURCE}\n`
+      : "";
     let response;
     try {
       response = await this.#workbench.mcpCall({
         server: NODE_REPL_SERVER,
         tool: NODE_REPL_TOOL,
-        cwd,
-        arguments: { code: `${bootstrap}\n{\n${lifecycleAdapterSource}${body}\n}`, title },
+        cwd: this.#runtimeCwd,
+        arguments: { code: `${bootstrap}\n{\n${lifecycleAdapterSource}${snapshotSanitizerSource}${snapshotAwareBody}\n}`, title },
         meta: this.#nextTurnMeta(),
         expectedGeneration: dispatchGeneration,
       });
@@ -3126,6 +4935,9 @@ if (globalThis.__toolwireBrowserAgent?.browsers == null) {
         ["Use codex.browser_status to confirm the current Browser plugin/runtime contract."]
       );
     }
+    } finally {
+      if (mutationToken) this.#activeMutations.delete(mutationToken);
+    }
   }
 
   async #resolveBrowserClientUrl(cwd) {
@@ -3164,17 +4976,29 @@ function normalizeRuntimeCompatibilityBinding(value) {
   if (value?.status !== "ok") {
     throw new Error("Browser runtime compatibility binding must have status=ok");
   }
-  for (const field of ["build", "chromeSkillPath", "browserClientPath", "browserServicePath", "browserClientSha256"]) {
+  for (const field of ["build", "browserClientPath", "browserServicePath", "browserClientSha256"]) {
     if (typeof value?.[field] !== "string" || !value[field]) {
       throw new Error(`Browser runtime compatibility binding is missing ${field}`);
     }
+  }
+  const chromeSkillPath = typeof value?.chromeSkillPath === "string" && value.chromeSkillPath
+    ? path.resolve(value.chromeSkillPath)
+    : null;
+  const chromePluginRoot = typeof value?.chromePluginRoot === "string" && value.chromePluginRoot
+    ? path.resolve(value.chromePluginRoot)
+    : chromeSkillPath
+      ? path.resolve(path.dirname(chromeSkillPath), "..", "..")
+      : null;
+  if (!chromePluginRoot) {
+    throw new Error("Browser runtime compatibility binding is missing chromePluginRoot/chromeSkillPath");
   }
   if (!/^[a-f0-9]{64}$/i.test(value.browserClientSha256)) {
     throw new Error("Browser runtime compatibility binding has an invalid browserClientSha256");
   }
   return {
     build: value.build,
-    chromeSkillPath: path.resolve(value.chromeSkillPath),
+    chromeSkillPath,
+    chromePluginRoot,
     browserClientPath: path.resolve(value.browserClientPath),
     browserServicePath: path.resolve(value.browserServicePath),
     browserClientSha256: value.browserClientSha256.toLowerCase(),
@@ -3222,7 +5046,7 @@ function runtimeCompatibilityPathMatches(left, right) {
 function runtimeCompatibilityBindingsMatch(bound, current) {
   return bound.build === current.build
     && bound.browserClientSha256 === current.browserClientSha256
-    && runtimeCompatibilityPathMatches(bound.chromeSkillPath, current.chromeSkillPath)
+    && runtimeCompatibilityPathMatches(bound.chromePluginRoot, current.chromePluginRoot)
     && runtimeCompatibilityPathMatches(bound.browserClientPath, current.browserClientPath)
     && runtimeCompatibilityPathMatches(bound.browserServicePath, current.browserServicePath);
 }
@@ -3242,19 +5066,29 @@ function sanitizeBackend(backend) {
   };
 }
 
+function normalizeBrowserFamily(value) {
+  if (value === "chrome" || value === "edge") return value;
+  throw new BrowserPreviewError(
+    "BROWSER_FAMILY_INVALID",
+    "Browser family must be exactly chrome or edge",
+    ["Use codex.browser_status to inspect currently connected stock Browser families."]
+  );
+}
+
 function publicTab(state) {
   return {
     tabRef: state.tabRef,
+    family: state.family ?? "chrome",
     title: state.title,
     url: state.url,
     lastOpened: state.lastOpened,
   };
 }
 
-function browserClickLocatorSetupSource(target, { binding = null } = {}) {
+function browserClickLocatorSetupSource(target, { binding = null, allowStableElementId = true } = {}) {
   if (target?.kind === "text" && typeof target.text === "string" && target.text) {
     const textLiteral = JSON.stringify(target.text);
-    const bindingKind = binding?.kind === "role" || binding?.kind === "onclick-property" || binding?.kind === "label-control" || binding?.kind === "local-radio" || binding?.kind === "flair-template-option" || binding?.kind === "thread-card-data" ? binding.kind : null;
+    const bindingKind = binding?.kind === "role" || binding?.kind === "onclick-property" || binding?.kind === "label-control" || binding?.kind === "local-radio" || binding?.kind === "flair-template-option" || binding?.kind === "thread-card-data" || binding?.kind === "stable-element-id" ? binding.kind : null;
     const fixedRole = bindingKind === "role" && typeof binding.role === "string" ? binding.role : null;
     const expectedClickBinding = bindingKind === "onclick-property" ? JSON.stringify(binding) : null;
     const expectedLabelBinding = bindingKind === "label-control" ? JSON.stringify(binding) : null;
@@ -3265,12 +5099,14 @@ function browserClickLocatorSetupSource(target, { binding = null } = {}) {
     const expectedThreadIdLiteral = bindingKind === "thread-card-data" && typeof binding?.threadId === "string"
       ? JSON.stringify(binding.threadId)
       : null;
-    const rolesLiteral = JSON.stringify(fixedRole ? [fixedRole] : bindingKind === "onclick-property" || bindingKind === "label-control" || bindingKind === "local-radio" || bindingKind === "flair-template-option" || bindingKind === "thread-card-data" ? [] : ["link", "button"]);
+    const expectedStableIdBinding = bindingKind === "stable-element-id" ? JSON.stringify(binding) : null;
+    const rolesLiteral = JSON.stringify(fixedRole ? [fixedRole] : bindingKind === "onclick-property" || bindingKind === "label-control" || bindingKind === "local-radio" || bindingKind === "flair-template-option" || bindingKind === "thread-card-data" || bindingKind === "stable-element-id" ? [] : ["link", "button", "menuitem"]);
     const allowOnclickProperty = bindingKind === null || bindingKind === "onclick-property";
     const allowLabelControl = bindingKind === null || bindingKind === "label-control";
     const allowLocalRadio = bindingKind === null || bindingKind === "local-radio";
     const allowFlairTemplateOption = bindingKind === null || bindingKind === "flair-template-option";
     const allowThreadCardData = bindingKind === null || bindingKind === "thread-card-data";
+    const allowStableElementIdFallback = allowStableElementId && (bindingKind === null || bindingKind === "stable-element-id");
     return `
 let __twRawTextCandidates = [];
 try {
@@ -3489,6 +5325,62 @@ if (__twSemanticCount === 0 && ${allowThreadCardData ? "true" : "false"}) {
     __twSemanticCount = 1;
   }
 }
+if (__twSemanticCount === 0 && ${allowStableElementIdFallback ? "true" : "false"}) {
+  const __twStableIdBinding = await __twTextLocator.evaluate((element, maxDepth) => {
+    const stableIdPattern = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/;
+    let current = element;
+    for (let depth = 0; current && depth <= maxDepth; depth += 1) {
+      const tagName = typeof current.tagName === "string" ? current.tagName.toLowerCase() : null;
+      const stableId = typeof current.id === "string" ? current.id.trim() : "";
+      const role = typeof current.getAttribute === "function" ? current.getAttribute("role") : null;
+      const href = typeof current.getAttribute === "function" ? current.getAttribute("href") : null;
+      const rawAriaDisabled = typeof current.getAttribute === "function" ? current.getAttribute("aria-disabled") : null;
+      const ariaDisabled = rawAriaDisabled === null ? null : String(rawAriaDisabled).trim().toLowerCase();
+      if (
+        tagName === "a"
+        && stableIdPattern.test(stableId)
+        && (role === null || role === "")
+        && href === null
+        && ariaDisabled !== "true"
+      ) {
+        const duplicateIds = Array.from(document.querySelectorAll("[id]")).filter((candidate) => candidate?.id === stableId);
+        if (duplicateIds.length === 1 && duplicateIds[0] === current) {
+          return {
+            kind: "stable-element-id",
+            depth,
+            tagName,
+            id: stableId,
+            role: role || null,
+            href,
+            ariaDisabled: ariaDisabled || null,
+          };
+        }
+      }
+      current = current.parentElement;
+    }
+    return null;
+  }, 6);
+  if (__twStableIdBinding) {
+    ${expectedStableIdBinding === null ? "" : `if (
+      __twStableIdBinding.kind !== ${JSON.stringify(binding?.kind ?? null)}
+      || __twStableIdBinding.tagName !== ${JSON.stringify(binding?.tagName ?? null)}
+      || __twStableIdBinding.id !== ${JSON.stringify(binding?.id ?? null)}
+      || __twStableIdBinding.role !== ${JSON.stringify(binding?.role ?? null)}
+      || __twStableIdBinding.href !== ${JSON.stringify(binding?.href ?? null)}
+      || __twStableIdBinding.ariaDisabled !== ${JSON.stringify(binding?.ariaDisabled ?? null)}
+    ) throw new Error("TOOLWIRE_BROWSER_TEXT_BINDING_CHANGED");`}
+    let __twStableIdAncestor = __twTextLocator;
+    for (let __twDepth = 0; __twDepth < __twStableIdBinding.depth; __twDepth += 1) {
+      __twStableIdAncestor = __twStableIdAncestor.locator("..");
+    }
+    const __twStableIdAncestorCount = await __twStableIdAncestor.count();
+    if (__twStableIdAncestorCount !== 1) throw new Error("TOOLWIRE_BROWSER_TEXT_SEMANTIC_COUNT:" + __twStableIdAncestorCount);
+    __twLocator = __twStableIdAncestor;
+    __twResolvedKind = "stable-element-id";
+    __twResolvedClickBinding = __twStableIdBinding;
+    __twSemanticCount = 1;
+  }
+}
 if (__twSemanticCount !== 1 || !__twLocator) {
   if (__twSemanticCount === 0) {
     const __twNoBindingDiagnostics = await __twTextLocator.evaluate((element, maxDepth) => {
@@ -3580,7 +5472,64 @@ const __twCount = await __twLocator.count();`;
 
 function browserFillLocatorSetupSource(target) {
   const strategyProbe = `
-const __twTargetMeta = await __twLocator.evaluate((element) => {
+const __twSemanticCount = await __twSemanticLocator.count();
+if (__twSemanticCount !== 1) throw new Error("TOOLWIRE_BROWSER_LOCATOR_COUNT:" + __twSemanticCount);
+if (!(await __twSemanticLocator.isVisible())) throw new Error("TOOLWIRE_BROWSER_LOCATOR_NOT_VISIBLE");
+if (!(await __twSemanticLocator.isEnabled())) throw new Error("TOOLWIRE_BROWSER_LOCATOR_NOT_ENABLED");
+const __twDirectEditableProfile = await __twSemanticLocator.evaluate((element) => {
+  const browserFillEditableElementProfile = ${BROWSER_FILL_EDITABLE_ELEMENT_PROFILE_SOURCE};
+  return browserFillEditableElementProfile(element);
+});
+const __twResolveBoundEditableLocator = async (__twBoundSemanticLocator) => {
+  const __twRawEditableDescendants = __twBoundSemanticLocator.locator('input, textarea, [contenteditable]');
+  const __twEditableDescendantLocators = await __twRawEditableDescendants.all();
+  const __twVisibleEditableCandidates = [];
+  let __twVisibleKnownEditableDescendants = 0;
+  for (const __twCandidate of __twEditableDescendantLocators) {
+    if (!(await __twCandidate.isVisible())) continue;
+    __twVisibleKnownEditableDescendants += 1;
+    const __twCandidateProfile = await __twCandidate.evaluate((element) => {
+      const browserFillEditableElementProfile = ${BROWSER_FILL_EDITABLE_ELEMENT_PROFILE_SOURCE};
+      return browserFillEditableElementProfile(element);
+    });
+    if (__twCandidateProfile?.supported !== true) continue;
+    if (!(await __twCandidate.isEnabled())) throw new Error("TOOLWIRE_BROWSER_FILL_EDITABLE_NOT_ENABLED");
+    __twVisibleEditableCandidates.push({ locator: __twCandidate, profile: __twCandidateProfile });
+  }
+  if (__twDirectEditableProfile?.supported === true) {
+    if (__twVisibleEditableCandidates.length > 0) {
+      throw new Error("TOOLWIRE_BROWSER_FILL_EDITABLE_COUNT:" + (1 + __twVisibleEditableCandidates.length));
+    }
+    return {
+      locator: __twBoundSemanticLocator,
+      source: "direct",
+      kind: __twDirectEditableProfile.kind,
+    };
+  }
+  if (__twVisibleEditableCandidates.length > 1) {
+    throw new Error("TOOLWIRE_BROWSER_FILL_EDITABLE_COUNT:" + __twVisibleEditableCandidates.length);
+  }
+  if (__twVisibleEditableCandidates.length === 1) {
+    return {
+      locator: __twVisibleEditableCandidates[0].locator,
+      source: "unique-visible-descendant",
+      kind: __twVisibleEditableCandidates[0].profile.kind,
+    };
+  }
+  if (__twDirectEditableProfile?.blocksSemanticShell === true || __twVisibleKnownEditableDescendants > 0) {
+    throw new Error("TOOLWIRE_BROWSER_FILL_EDITABLE_COUNT:0");
+  }
+  return {
+    locator: __twBoundSemanticLocator,
+    source: "semantic-shell",
+    kind: "semantic-shell",
+  };
+};
+const __twResolvedEditable = await __twResolveBoundEditableLocator(__twSemanticLocator);
+const __twLocator = __twResolvedEditable.locator;
+if (!(await __twLocator.isVisible())) throw new Error("TOOLWIRE_BROWSER_LOCATOR_NOT_VISIBLE");
+if (!(await __twLocator.isEnabled())) throw new Error("TOOLWIRE_BROWSER_FILL_EDITABLE_NOT_ENABLED");
+const __twRuntimeTargetMeta = await __twLocator.evaluate((element) => {
   const tag = String(element?.tagName || "").toLowerCase();
   let customHost = null;
   let current = element?.parentElement ?? null;
@@ -3594,10 +5543,21 @@ const __twTargetMeta = await __twLocator.evaluate((element) => {
   }
   return {
     tag,
+    inputType: tag === "input"
+      ? String(element?.type ?? (typeof element?.getAttribute === "function" ? element.getAttribute("type") : null) ?? "text").trim().toLowerCase() || "text"
+      : null,
+    placeholder: typeof element?.getAttribute === "function" ? element.getAttribute("placeholder") : null,
     contentEditable: Boolean(element?.isContentEditable),
     customHost,
   };
 });
+const __twTargetMeta = {
+  ...__twRuntimeTargetMeta,
+  editableSource: __twResolvedEditable.source,
+  editableKind: __twResolvedEditable.kind,
+  semanticTag: __twDirectEditableProfile?.tag ?? null,
+  semanticContentEditable: __twDirectEditableProfile?.effectiveContentEditable === true,
+};
 const __twFillStrategy = (__twTargetMeta.contentEditable || (__twTargetMeta.tag === "textarea" && __twTargetMeta.customHost))
   ? "type"
   : "fill";`;
@@ -3623,23 +5583,23 @@ for (let __twIndex = 0; __twIndex < __twScopeHrefs.length; __twIndex += 1) {
 }
 if (__twScopeIndexes.length !== 1) throw new Error("TOOLWIRE_BROWSER_SCOPE_LINK_COUNT:" + __twScopeIndexes.length);
 let __twScope = __twScopeLinks.nth(__twScopeIndexes[0]);
-let __twLocator = null;
+let __twSemanticLocator = null;
 for (let __twDepth = 0; __twDepth <= 8; __twDepth += 1) {
   const __twCandidate = __twScope.getByRole(${JSON.stringify(target.role)}).filter({ visible: true });
   const __twCandidateCount = await __twCandidate.count();
   if (__twCandidateCount > 1) throw new Error("TOOLWIRE_BROWSER_SCOPE_TARGET_COUNT:" + __twDepth + ":" + __twCandidateCount);
   if (__twCandidateCount === 1) {
-    __twLocator = __twCandidate;
+    __twSemanticLocator = __twCandidate;
     break;
   }
   __twScope = __twScope.locator("..");
 }
-if (!__twLocator) throw new Error("TOOLWIRE_BROWSER_SCOPE_TARGET_COUNT:-1:0");
+if (!__twSemanticLocator) throw new Error("TOOLWIRE_BROWSER_SCOPE_TARGET_COUNT:-1:0");
 ${strategyProbe}`;
   }
   if (target?.kind === "role" && typeof target.role === "string" && typeof target.name === "string") {
     return `
-const __twLocator = __twTab.playwright.getByRole(${JSON.stringify(target.role)}, { name: ${JSON.stringify(target.name)}, exact: true });
+const __twSemanticLocator = __twTab.playwright.getByRole(${JSON.stringify(target.role)}, { name: ${JSON.stringify(target.name)}, exact: true });
 ${strategyProbe}`;
   }
   if (
@@ -3649,102 +5609,67 @@ ${strategyProbe}`;
     && target.placeholder
   ) {
     return `
-const __twPlaceholderLocator = __twTab.playwright.getByPlaceholder(${JSON.stringify(target.placeholder)}, { exact: true }).filter({ visible: true });
-const __twPlaceholderCount = await __twPlaceholderLocator.count();
-let __twLocator = __twPlaceholderLocator;
-if (__twPlaceholderCount !== 1) {
-  const __twSemanticRoleLocator = __twTab.playwright.getByRole(${JSON.stringify(target.role)}).filter({ visible: true });
-  const __twSemanticPlaceholderIndexes = [];
-  for (let __twIndex = 0; __twIndex < __twPlaceholderCount; __twIndex += 1) {
-    const __twCandidate = __twPlaceholderLocator.nth(__twIndex);
-    const __twSemanticIntersectionCount = await __twCandidate.and(__twSemanticRoleLocator).count();
-    if (__twSemanticIntersectionCount === 1) __twSemanticPlaceholderIndexes.push(__twIndex);
-  }
-  if (__twSemanticPlaceholderIndexes.length === 1) {
-    const __twSemanticShell = __twPlaceholderLocator.nth(__twSemanticPlaceholderIndexes[0]);
-    const __twNestedSemanticTextbox = __twSemanticShell.getByRole(${JSON.stringify(target.role)}).filter({ visible: true });
-    const __twNestedSemanticTextboxCount = await __twNestedSemanticTextbox.count();
-    if (__twNestedSemanticTextboxCount === 1) {
-      __twLocator = __twNestedSemanticTextbox;
-    } else if (__twNestedSemanticTextboxCount === 0) {
-      __twLocator = __twSemanticShell;
-    } else {
-      throw new Error("TOOLWIRE_BROWSER_FILL_CANDIDATES:" + JSON.stringify({
-        count: __twPlaceholderCount,
-        semanticPlaceholderIndexes: __twSemanticPlaceholderIndexes,
-        nestedSemanticTextboxCount: __twNestedSemanticTextboxCount,
-      }));
-    }
-  } else {
-  const __twCandidateState = await __twPlaceholderLocator.evaluateAll((elements) => {
-    const nativeIndexes = [];
-    const focusDistances = [];
-    const candidates = [];
-    const active = document.activeElement;
-    elements.forEach((element, index) => {
-      const rect = element.getBoundingClientRect();
-      const tag = String(element.tagName || "").toLowerCase();
-      const disabled = Boolean(element.disabled);
-      const inert = Boolean(element.inert);
-      if ((tag === "input" || tag === "textarea") && !disabled && !inert) nativeIndexes.push(index);
-      let focusDistance = null;
-      if (active) {
-        let current = active;
-        for (let depth = 0; depth <= 8 && current; depth += 1) {
-          if (current === element) {
-            focusDistance = depth;
-            break;
-          }
-          current = current.parentElement;
-        }
+const __twPlaceholderRoleLocator = __twTab.playwright.getByRole(${JSON.stringify(target.role)}).filter({ visible: true });
+const __twPlaceholderRoleCandidates = await __twPlaceholderRoleLocator.all();
+const __twPlaceholderSemanticMatches = [];
+for (const __twCandidate of __twPlaceholderRoleCandidates) {
+  const __twPlaceholderBinding = await __twCandidate.evaluate((element, expectedPlaceholder) => {
+    const directPlaceholder = typeof element?.getAttribute === "function" ? element.getAttribute("placeholder") : null;
+    const directAriaPlaceholder = typeof element?.getAttribute === "function" ? element.getAttribute("aria-placeholder") : null;
+    const isVisible = (candidate) => {
+      if (!(candidate instanceof Element)) return false;
+      const style = window.getComputedStyle(candidate);
+      if (style.display === "none" || style.visibility !== "visible" || Number(style.opacity) <= 0.01) return false;
+      return Array.from(candidate.getClientRects()).some((rect) => rect.width > 0 && rect.height > 0);
+    };
+    let descendantPlaceholderMatches = 0;
+    if (typeof element?.querySelectorAll === "function") {
+      const descendants = element.querySelectorAll('input, textarea, [contenteditable]');
+      for (const descendant of descendants) {
+        if (!isVisible(descendant)) continue;
+        if (descendant.getAttribute("placeholder") === expectedPlaceholder
+          || descendant.getAttribute("aria-placeholder") === expectedPlaceholder) descendantPlaceholderMatches += 1;
       }
-      focusDistances.push(focusDistance);
-      if (index < 8) {
-        candidates.push({
-          tag,
-          type: element.getAttribute("type"),
-          role: element.getAttribute("role"),
-          ariaHidden: element.getAttribute("aria-hidden"),
-          tabIndex: typeof element.tabIndex === "number" ? element.tabIndex : null,
-          disabled,
-          inert,
-          focusDistance,
-          rect: {
-            x: Math.round(rect.x),
-            y: Math.round(rect.y),
-            width: Math.round(rect.width),
-            height: Math.round(rect.height),
-          },
-        });
-      }
-    });
-    return { count: elements.length, nativeIndexes, focusDistances, candidates };
-  });
-  if (__twCandidateState.nativeIndexes.length === 1) {
-    __twLocator = __twPlaceholderLocator.nth(__twCandidateState.nativeIndexes[0]);
-  } else {
-    const __twFocused = __twCandidateState.focusDistances
-      .map((distance, index) => ({ distance, index }))
-      .filter((entry) => Number.isInteger(entry.distance));
-    const __twMinDistance = __twFocused.length ? Math.min(...__twFocused.map((entry) => entry.distance)) : null;
-    const __twClosest = __twFocused.filter((entry) => entry.distance === __twMinDistance);
-    if (__twClosest.length !== 1) {
-      throw new Error("TOOLWIRE_BROWSER_FILL_CANDIDATES:" + JSON.stringify(__twCandidateState));
     }
-    const __twFocusedShell = __twPlaceholderLocator.nth(__twClosest[0].index);
-    const __twFocusedTextbox = __twFocusedShell.getByRole(${JSON.stringify(target.role)}).filter({ visible: true });
-    const __twFocusedTextboxCount = await __twFocusedTextbox.count();
-    if (__twFocusedTextboxCount !== 1) {
-      throw new Error("TOOLWIRE_BROWSER_FILL_CANDIDATES:" + JSON.stringify(__twCandidateState));
-    }
-    __twLocator = __twFocusedTextbox;
+    return {
+      direct: directPlaceholder === expectedPlaceholder || directAriaPlaceholder === expectedPlaceholder,
+      descendantPlaceholderMatches,
+    };
+  }, ${JSON.stringify(target.placeholder)});
+  if (__twPlaceholderBinding?.descendantPlaceholderMatches > 1) {
+    throw new Error("TOOLWIRE_BROWSER_FILL_PLACEHOLDER_DESCENDANT_COUNT:" + __twPlaceholderBinding.descendantPlaceholderMatches);
   }
+  if (__twPlaceholderBinding?.direct === true || __twPlaceholderBinding?.descendantPlaceholderMatches === 1) {
+    __twPlaceholderSemanticMatches.push(__twCandidate);
   }
 }
-const __twRoleLocator = __twTab.playwright.getByRole(${JSON.stringify(target.role)}).filter({ visible: true });
-const __twRoleBoundLocator = __twLocator.and(__twRoleLocator);
-const __twRoleBoundCount = await __twRoleBoundLocator.count();
-if (__twRoleBoundCount !== 1) throw new Error("TOOLWIRE_BROWSER_LOCATOR_COUNT:" + __twRoleBoundCount);
+if (__twPlaceholderSemanticMatches.length === 0 && ${JSON.stringify(target.role)} === "textbox") {
+  const __twNativePasswordInputs = __twTab.playwright.locator('input');
+  const __twNativePasswordLocators = await __twNativePasswordInputs.all();
+  const __twNativePasswordCandidates = [];
+  for (const __twCandidate of __twNativePasswordLocators) {
+    if (!(await __twCandidate.isVisible())) continue;
+    if (!(await __twCandidate.isEnabled())) continue;
+    const __twPasswordBinding = await __twCandidate.evaluate((element, expectedPlaceholder) => ({
+      tag: String(element?.tagName || "").toLowerCase(),
+      type: String(element?.type ?? (typeof element?.getAttribute === "function" ? element.getAttribute("type") : null) ?? "text").trim().toLowerCase(),
+      placeholder: typeof element?.getAttribute === "function" ? element.getAttribute("placeholder") : null,
+      expectedPlaceholder,
+    }), ${JSON.stringify(target.placeholder)});
+    if (__twPasswordBinding?.tag === "input"
+      && __twPasswordBinding?.type === "password"
+      && __twPasswordBinding?.placeholder === __twPasswordBinding?.expectedPlaceholder) {
+      __twNativePasswordCandidates.push(__twCandidate);
+    }
+  }
+  if (__twNativePasswordCandidates.length > 0) {
+    __twPlaceholderSemanticMatches.push(...__twNativePasswordCandidates);
+  }
+}
+if (__twPlaceholderSemanticMatches.length !== 1) {
+  throw new Error("TOOLWIRE_BROWSER_LOCATOR_COUNT:" + __twPlaceholderSemanticMatches.length);
+}
+const __twSemanticLocator = __twPlaceholderSemanticMatches[0];
 ${strategyProbe}`;
   }
   throw new BrowserPreviewError(
@@ -3874,10 +5799,32 @@ function browserTextBindingFromPrepareResult(result) {
       threadId: clickBinding.threadId,
     };
   }
+  if (
+    result?.resolvedKind === "stable-element-id"
+    && clickBinding?.kind === "stable-element-id"
+    && Number.isInteger(clickBinding.depth)
+    && clickBinding.depth >= 0
+    && clickBinding.depth <= 6
+    && clickBinding.tagName === "a"
+    && typeof clickBinding.id === "string"
+    && /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/.test(clickBinding.id)
+    && clickBinding.role === null
+    && clickBinding.href === null
+    && (clickBinding.ariaDisabled === null || clickBinding.ariaDisabled === "false")
+  ) {
+    return {
+      kind: "stable-element-id",
+      tagName: "a",
+      id: clickBinding.id,
+      role: null,
+      href: null,
+      ariaDisabled: clickBinding.ariaDisabled,
+    };
+  }
   throw new BrowserPreviewError(
     "BROWSER_TEXT_TARGET_NOT_SEMANTICALLY_CLICKABLE",
     "The exact visible text did not resolve to one stable semantic click target",
-    ["Use an exact role/name target, or handle this action manually until the page exposes one stable link, button, bounded onclick-property ancestor, or server-recognized data-thread-id card binding."]
+    ["Use an exact role/name target, or handle this action manually until the page exposes one stable link/button/menuitem, bounded onclick-property ancestor, server-recognized data binding, or a unique server-observed stable-id custom anchor that can be fingerprinted and revalidated before execution."]
   );
 }
 
@@ -3888,9 +5835,11 @@ function stringOrNull(value) {
 function browserCleanupReceipt(value) {
   const cleanupStatus = value?.cleanupStatus === "released"
     ? "released"
-    : value?.cleanupStatus === "unavailable"
-      ? "unavailable"
-      : "uncertain";
+    : value?.cleanupStatus === "deferred"
+      ? "deferred"
+      : value?.cleanupStatus === "unavailable"
+        ? "unavailable"
+        : "uncertain";
   return {
     cleanupStatus,
     cleanupReason: stringOrNull(value?.cleanupReason) ?? (cleanupStatus === "uncertain" ? "cleanup-receipt-missing" : null),
@@ -3939,6 +5888,35 @@ function readJpegDimensions(bytes) {
   return null;
 }
 
+function browserElementBindingError(error) {
+  if (error instanceof BrowserPreviewError) return error;
+  const code = error instanceof Error ? error.message : String(error);
+  if (code === "BROWSER_ELEMENT_REF_UNKNOWN" || code === "BROWSER_ELEMENT_REF_EXPIRED") {
+    return new BrowserPreviewError(
+      code,
+      "The opaque Browser element reference is unknown or expired.",
+      ["Run fresh opaque element discovery on the current tab and prepare a new action; do not substitute a raw node id/selector/index/coordinate."]
+    );
+  }
+  if (code === "BROWSER_ELEMENT_STALE" || code === "BROWSER_ELEMENT_TARGET_CHANGED") {
+    return new BrowserPreviewError(
+      code,
+      code === "BROWSER_ELEMENT_STALE"
+        ? "The opaque Browser element is no longer present in the fresh stock visible DOM."
+        : "The opaque Browser element no longer matches the exact tab/page/generation/fingerprint binding.",
+      ["Rediscover elements from the current tab and prepare a fresh action only if the intended target is still needed."]
+    );
+  }
+  if (code === "BROWSER_ELEMENT_ACTION_UNSUPPORTED") {
+    return new BrowserPreviewError(
+      code,
+      "This user-semantic action is not in the current opaque-element allowlist.",
+      ["Use only the currently reviewed click/double_click slice; do not widen to raw selectors, node ids, coordinates, indexes, JavaScript, or CDP."]
+    );
+  }
+  return new BrowserPreviewError("BROWSER_ELEMENT_BINDING_INVALID", `Opaque Browser element binding failed: ${code}`);
+}
+
 function browserUnavailable(error) {
   const classified = classifyBrowserError(error);
   return {
@@ -3965,8 +5943,10 @@ function chromeBackendAmbiguous(backends, chromeBackends) {
 }
 
 function browserMutationResultUncertain(kind, message) {
-  const normalizedKind = ["fill", "navigate", "open_tab", "close_tab", "scroll", "keypress", "download", "upload"].includes(kind) ? kind : "click";
-  const errorCode = normalizedKind === "fill"
+  const normalizedKind = ["fill", "navigate", "open_tab", "close_tab", "bulk_close_tab", "scroll", "keypress", "download", "upload", "model_route_probe", "webmcp_call"].includes(kind) ? kind : "click";
+  const errorCode = normalizedKind === "model_route_probe"
+    ? "BROWSER_MODEL_ROUTE_PROBE_RESULT_UNCERTAIN"
+    : normalizedKind === "fill"
     ? "BROWSER_FILL_RESULT_UNCERTAIN"
     : normalizedKind === "navigate"
       ? "BROWSER_NAVIGATE_RESULT_UNCERTAIN"
@@ -3974,7 +5954,9 @@ function browserMutationResultUncertain(kind, message) {
         ? "BROWSER_OPEN_TAB_RESULT_UNCERTAIN"
         : normalizedKind === "close_tab"
           ? "BROWSER_CLOSE_RESULT_UNCERTAIN"
-          : normalizedKind === "scroll"
+          : normalizedKind === "bulk_close_tab"
+            ? "BROWSER_BULK_CLOSE_RESULT_UNCERTAIN"
+            : normalizedKind === "scroll"
             ? "BROWSER_SCROLL_RESULT_UNCERTAIN"
             : normalizedKind === "keypress"
               ? "BROWSER_KEYPRESS_RESULT_UNCERTAIN"
@@ -3982,7 +5964,9 @@ function browserMutationResultUncertain(kind, message) {
                 ? "BROWSER_DOWNLOAD_RESULT_UNCERTAIN"
                 : normalizedKind === "upload"
                   ? "BROWSER_UPLOAD_RESULT_UNCERTAIN"
-                  : "BROWSER_CLICK_RESULT_UNCERTAIN";
+                  : normalizedKind === "webmcp_call"
+                    ? "BROWSER_WEBMCP_CALL_RESULT_UNCERTAIN"
+                    : "BROWSER_CLICK_RESULT_UNCERTAIN";
   return new BrowserPreviewError(
     errorCode,
     message,
@@ -3990,7 +5974,9 @@ function browserMutationResultUncertain(kind, message) {
       `Do not retry this ${normalizedKind} automatically. The remote action may already have happened even though its MCP response was lost or unreadable.`,
       normalizedKind === "close_tab"
         ? "Call codex.browser_tabs to inspect current tab state. Do not close again automatically; prepare a fresh close only if the exact intended tab is still present and still needs closing."
-        : normalizedKind === "scroll"
+        : normalizedKind === "bulk_close_tab"
+          ? "Call codex.browser_tabs to inspect the exact prepared set. Treat the stopped target as possibly closed, do not retry it automatically, and prepare a new exact set only after current state is known."
+          : normalizedKind === "scroll"
           ? "Re-read current tab/page state first, then scroll again only if more loaded content is still needed."
           : normalizedKind === "keypress"
             ? "Re-read current tab/page state first. Press the key again only if the intended effect is clearly still needed; never blindly repeat Enter/Tab/Escape."
@@ -3998,7 +5984,11 @@ function browserMutationResultUncertain(kind, message) {
               ? "Do not start another download automatically. Inspect the browser's download location or current task state first because the file may already have been created."
               : normalizedKind === "upload"
                 ? "Do not re-select the file automatically. The webpage may already have received the file selection/change event or started an upload; inspect page state first."
-                : `Re-read current tab/page state first, then prepare a fresh ${normalizedKind} only if the intended action is still needed.`,
+                : normalizedKind === "model_route_probe"
+                  ? "Do not submit another probe message automatically. Inspect the selected Web chat and start a fresh independent probe only if another sample is still needed."
+                  : normalizedKind === "webmcp_call"
+                    ? "Do not call the page-defined tool again automatically. Read the bound tab/page and task state first because the WebMCP tool may already have completed its side effect."
+                    : `Re-read current tab/page state first, then prepare a fresh ${normalizedKind} only if the intended action is still needed.`,
 
     ]
   );
@@ -4070,15 +6060,127 @@ function classifyBrowserError(error) {
       ["Refresh/reload the Browser surface so it injects x-codex-turn-metadata automatically."]
     );
   }
+  if (/TOOLWIRE_BROWSER_ELEMENT_VISIBLE_DOM_INVALID/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_ELEMENT_VISIBLE_DOM_INVALID",
+      "The maintained stock Browser visible-DOM primitive returned an unexpected shape before opaque-element dispatch.",
+      ["Treat this as Browser runtime compatibility drift; do not expose or substitute raw node ids/selectors/coordinates."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_ELEMENT_STALE/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_ELEMENT_STALE",
+      "The prepared opaque Browser element is stale or missing in the fresh visible DOM.",
+      ["Rediscover opaque elements and prepare a new exact action only if the target is still needed."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_ELEMENT_TARGET_CHANGED/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_ELEMENT_TARGET_CHANGED",
+      "The prepared opaque Browser element changed page identity or semantic fingerprint before dispatch.",
+      ["Rediscover opaque elements from current page state; do not replay the old action or substitute raw internals."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_ELEMENT_ACTION_UNSUPPORTED/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_ELEMENT_ACTION_UNSUPPORTED",
+      "The prepared opaque Browser action is outside the reviewed click/double_click slice.",
+      ["Do not widen the caller surface to raw node ids, selectors, coordinates, indexes, JavaScript, or CDP."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_WEBMCP_CALL_RESULT_UNCERTAIN/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_WEBMCP_CALL_RESULT_UNCERTAIN",
+      message.replace(/^.*TOOLWIRE_BROWSER_WEBMCP_CALL_RESULT_UNCERTAIN:/, "WebMCP tool-call result is uncertain: "),
+      ["Do not call the page-defined tool again automatically. Read the bound tab/page and task state first because the WebMCP tool may already have completed its side effect."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_WEBMCP_HANDLE_STALE/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_WEBMCP_REF_STALE",
+      "The stock WebMCP tool handle is stale or no longer bound to this document",
+      ["Rediscover WebMCP tools from the current tab, then call a currently listed tool only if the task still needs it. Do not replay the prior call automatically."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_WEBMCP_PAGE_CHANGED/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_WEBMCP_PAGE_CHANGED",
+      "The bound Browser tab changed page before the WebMCP tool call could be dispatched",
+      ["Read the current tab, rediscover WebMCP tools for the current page if appropriate, and do not replay the old handle automatically."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_WEBMCP_TOOL_NOT_LISTED/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_WEBMCP_TOOL_NOT_LISTED",
+      "The requested tool name is not listed by this fetched stock WebMCP handle",
+      ["Use exactly one tool name shown in the existing WebMCP description. Do not refetch merely to guess another name."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_WEBMCP_DESCRIPTOR_TOO_LARGE/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_WEBMCP_DESCRIPTOR_TOO_LARGE",
+      "The stock WebMCP tool description is too large for the bounded remote projection",
+      ["Use the existing DOM Browser path for this page instead of widening the WebMCP projection limit automatically."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_WEBMCP_URL_UNAVAILABLE/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_WEBMCP_URL_UNAVAILABLE",
+      "The current tab did not expose a stable URL, so Codexless refused to bind a reusable WebMCP handle",
+      ["Refresh browser_tabs after the page has a stable URL, or use the existing DOM Browser path."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_WEBMCP_PROTOCOL_ERROR/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_WEBMCP_PROTOCOL_ERROR",
+      "The stock Browser WebMCP capability returned an unexpected shape",
+      ["Treat this as Browser runtime compatibility drift; do not implement a second WebMCP protocol stack."]
+    );
+  }
   if (/TOOLWIRE_BROWSER_EXISTING_TAB_RELEASE_UNAVAILABLE/i.test(message)) {
     return new BrowserPreviewError(
       "BROWSER_EXISTING_TAB_RELEASE_UNAVAILABLE",
       "The current Browser API shape does not expose an existing-tab release operation that Codexless can prove it can complete safely; existing-tab actions remain available, but cleanup cannot be reported as released without proof.",
       [
-        "Use the cleanup receipt from the action: finalize-absent turn cleanup is reported as unavailable/turn-cleanup-unproven, not released.",
+        "Use the cleanup receipt from the action: finalize-absent turn cleanup is deferred to the maintained turn boundary (turn-boundary-auto-release), not released in the same turn.",
         "If a later claim reports that the tab is already part of a Browser session, refresh tab state once and do not automatically replay any mutation; use a fresh tab when that safely fits the task.",
       ],
       { lifecycleShape: message.split(":").at(-1) ?? null }
+    );
+  }
+  if (/TOOLWIRE_BROWSER_BULK_CLOSE_TAB_STALE/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_BULK_CLOSE_TAB_STALE",
+      "One tab in the prepared bulk-close set is no longer present under the same server-bound provider identity",
+      ["Stop the consumed bulk-close action. Refresh browser_tabs and prepare a new exact set only for tabs that still need closing."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_BULK_CLOSE_URL_UNAVAILABLE/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_BULK_CLOSE_URL_UNAVAILABLE",
+      "One tab in the bulk-close set did not expose a current URL, so Codexless refused to bind or close it",
+      ["Refresh browser_tabs after the tab has a stable URL and prepare a new exact set; do not substitute a title/index/provider id."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_BULK_CLOSE_URL_CHANGED/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_BULK_CLOSE_TARGET_CHANGED",
+      "One tab in the prepared bulk-close set changed URL before its close dispatch, so the exact-set action stopped before closing that target",
+      ["Refresh browser_tabs and prepare a new exact set from current URLs. Do not continue the consumed bulk-close action."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_BULK_CLOSE_PREDISPATCH_RELEASE_UNPROVEN/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_BULK_CLOSE_PREDISPATCH_RELEASE_UNPROVEN",
+      "Bulk close stopped before dispatch because a claimed target could not be proven released after a pre-dispatch failure",
+      ["Use the explicit Browser emergency control-state reset if this runtime now needs claim recovery, then refresh browser_tabs. Do not retry the consumed bulk-close action automatically."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_BULK_CLOSE_RESULT_UNCERTAIN/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_BULK_CLOSE_RESULT_UNCERTAIN",
+      message.replace(/^.*TOOLWIRE_BROWSER_BULK_CLOSE_RESULT_UNCERTAIN:/, "Bulk tab-close result is uncertain: "),
+      ["Stop immediately. Treat the current target as possibly closed, refresh browser_tabs, and never auto-retry the consumed exact-set action."]
     );
   }
   const tabBusy = /\bTab\s+.+?\s+is already part of browser session\s+\S+/i.test(message)
@@ -4136,6 +6238,65 @@ function classifyBrowserError(error) {
       message,
       ["Use a destination allowed by the managed browser/network policy, or ask the administrator to change that policy. Reinstalling the extension is not an appropriate fix."],
       { source: "managed-browser-network-policy" }
+    );
+  }
+  if (/TOOLWIRE_BROWSER_MODEL_ROUTE_HOST_DENIED/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_MODEL_ROUTE_HOST_DENIED",
+      "Model-route probing is restricted to https://chatgpt.com.",
+      ["Use a user-selected ChatGPT Web chat tab; this probe never widens Full CDP to another origin."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_MODEL_ROUTE_LOGIN_OR_PAGE_NOT_READY/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_MODEL_ROUTE_LOGIN_OR_PAGE_NOT_READY",
+      "The selected ChatGPT Web chat did not expose a usable chat editor. A missing ChatGPT login state or an unready/redirected page is the usual prerequisite blocker.",
+      [
+        "Read the current tab once. If ChatGPT shows Sign in / Log in, sign in once in this Chrome profile, then retry with a user-selected Web chat.",
+        "If already signed in, wait for or reopen the selected Web chat after the page is fully ready; do not broaden the probe to arbitrary selectors or coordinates.",
+      ]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_MODEL_ROUTE_CHAT_SURFACE_REQUIRED/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_MODEL_ROUTE_CHAT_SURFACE_REQUIRED",
+      "Model-route probing requires a user-selected ChatGPT Web chat surface.",
+      ["Use the current/opened ChatGPT Web conversation, or open a new chat in the user-chosen Temporary/normal and project/non-project context, refresh codex.browser_tabs, then retry with that tabRef."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_MODEL_ROUTE_CDP_UNAVAILABLE/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_MODEL_ROUTE_CDP_UNAVAILABLE",
+      "The current claimed ChatGPT tab does not expose the bounded CDP capability required by the model-route probe.",
+      ["Refresh the current Browser runtime/configuration and confirm Full CDP is enabled only for https://chatgpt.com, then retry on a user-selected ChatGPT Web chat tab."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_MODEL_ROUTE_EDITOR_NOT_UNIQUE/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_MODEL_ROUTE_EDITOR_NOT_UNIQUE",
+      "The selected ChatGPT Web chat did not expose exactly one visible enabled chat textbox, so the probe refused to guess a target.",
+      ["Use a clean, fully loaded ChatGPT Web chat and retry; do not broaden the probe to arbitrary selectors or coordinates."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_MODEL_ROUTE_EDITOR_NOT_EMPTY/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_MODEL_ROUTE_EDITOR_NOT_EMPTY",
+      "The selected ChatGPT Web chat editor already contained text, so the probe refused to overwrite it.",
+      ["Clear or send the user's existing draft first, or choose another empty Web chat before probing; do not overwrite user text."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_MODEL_ROUTE_EDITOR_FILL_FAILED/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_MODEL_ROUTE_EDITOR_FILL_FAILED",
+      "The fixed non-sensitive route-probe text could not be verified in the selected Web chat editor before submission.",
+      ["Refresh Browser compatibility and retry only on a clean empty user-selected Web chat; do not submit blindly."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_MODEL_ROUTE_PROBE_RESULT_UNCERTAIN/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_MODEL_ROUTE_PROBE_RESULT_UNCERTAIN",
+      message.replace(/^.*TOOLWIRE_BROWSER_MODEL_ROUTE_PROBE_RESULT_UNCERTAIN:/, "Model-route probe result is uncertain after the fixed message may have been submitted: "),
+      ["Do not automatically retry on the same logical probe. Re-read/close the probe tab and start a fresh explicit probe only if another sample is still needed."]
     );
   }
   if (/TOOLWIRE_BROWSER_NAVIGATE_RESULT_UNCERTAIN/i.test(message)) {
@@ -4239,6 +6400,13 @@ function classifyBrowserError(error) {
       ["Re-read the tab and prepare a fresh action from the current page state."]
     );
   }
+  if (/TOOLWIRE_BROWSER_FILL_TARGET_CHANGED/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_ACTION_TARGET_CHANGED",
+      "The prepared Browser fill target still had to satisfy the original semantic binding, but its bounded editable resolution changed before dispatch",
+      ["Re-read the current page and prepare a fresh fill from the current exact role/name or role/placeholder target."]
+    );
+  }
   if (/TOOLWIRE_BROWSER_TEXT_BINDING_CHANGED/i.test(message)) {
     return new BrowserPreviewError(
       "BROWSER_ACTION_TARGET_CHANGED",
@@ -4267,7 +6435,7 @@ function classifyBrowserError(error) {
     const match = message.match(/TOOLWIRE_BROWSER_TEXT_SEMANTIC_COUNT:(\d+)/i);
     return new BrowserPreviewError(
       "BROWSER_TEXT_TARGET_NOT_SEMANTICALLY_CLICKABLE",
-      `The exact visible text resolved to ${match?.[1] ?? "an unexpected number of"} stable semantic click targets; the Browser runtime requires exactly one link, button, bounded onclick-property ancestor, or server-recognized data-thread-id card binding`,
+      `The exact visible text resolved to ${match?.[1] ?? "an unexpected number of"} stable semantic click targets; the Browser runtime requires exactly one link, button, menuitem, bounded onclick-property ancestor, or server-recognized data binding`,
       ["Use exact role/name when the page exposes a semantic control, or handle this target manually until the page provides one stable bounded click binding."]
     );
   }
@@ -4292,6 +6460,32 @@ function classifyBrowserError(error) {
         ? "The exact role/name target was not found within the bounded ancestor scope of the visible scopeUrl link"
         : `The scoped Browser target matched ${count} controls at ancestor depth ${depth}; the Browser runtime refuses to guess among repeated local actions`,
       ["Re-read the current item and prepare again only when one exact role/name control is locally identifiable from that scopeUrl."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_FILL_EDITABLE_NOT_ENABLED/i.test(message)) {
+    return new BrowserPreviewError(
+      "BROWSER_ACTION_TARGET_NOT_ENABLED",
+      "The exact Browser textbox/searchbox resolved to an editable node that is not currently enabled",
+      ["Read current page state and prepare again only when the same semantic target exposes one enabled editable node."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_FILL_PLACEHOLDER_DESCENDANT_COUNT:(\d+)/i.test(message)) {
+    const match = message.match(/TOOLWIRE_BROWSER_FILL_PLACEHOLDER_DESCENDANT_COUNT:(\d+)/i);
+    return new BrowserPreviewError(
+      "BROWSER_ACTION_TARGET_AMBIGUOUS",
+      `The exact role/placeholder Browser target contained ${match?.[1] ?? "multiple"} visible placeholder-matching editable descendants; the Browser runtime refuses to guess`,
+      ["Re-read the current page and use the target only when the exact role/placeholder binding resolves to one semantic textbox with one editable node."]
+    );
+  }
+  if (/TOOLWIRE_BROWSER_FILL_EDITABLE_COUNT:(\d+)/i.test(message)) {
+    const match = message.match(/TOOLWIRE_BROWSER_FILL_EDITABLE_COUNT:(\d+)/i);
+    const count = Number(match?.[1] ?? 0);
+    return new BrowserPreviewError(
+      count === 0 ? "BROWSER_FILL_TARGET_NOT_EDITABLE" : "BROWSER_ACTION_TARGET_AMBIGUOUS",
+      count === 0
+        ? "The exact Browser textbox/searchbox did not expose a supported writable input, textarea, contenteditable, or the existing direct semantic-shell fill path"
+        : `The exact Browser textbox/searchbox contained ${count} visible supported editable descendants; the Browser runtime refuses to guess`,
+      ["Re-read the current page and prepare again only when the same exact semantic target resolves to one bounded editable node."]
     );
   }
   if (/TOOLWIRE_BROWSER_FILL_CANDIDATES:/i.test(message)) {

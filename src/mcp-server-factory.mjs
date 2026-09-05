@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { registerAgentPreviewTools } from "./agent-tools.mjs";
 import { registerBrowserPreviewTools } from "./browser-tools.mjs";
 import { registerConstructionTools } from "./construction-tools.mjs";
+import { registerExcelTools } from "./excel-tools.mjs";
 import { registerPublicTools } from "./public-tools.mjs";
 import { wrapToolHandlerWithRecentCallReceipt } from "./recent-call-receipts.mjs";
 import { registerWorkbenchPreviewTools } from "./workbench-tools.mjs";
@@ -43,6 +44,7 @@ export function createCodexToolboxServerFactory({
   meteredQuotaProvider = null,
   agentPreviewState = null,
   agentPortableCard = false,
+  legacyAgentCardInternals = false,
   agentReasoningEffort = false,
   codexCallProfile = false,
   codexCallProfileFile = null,
@@ -51,6 +53,7 @@ export function createCodexToolboxServerFactory({
   publicPreview = false,
   guardDirectFormalCodex = false,
   recentCallStore = null,
+  excelSessionRefs = null,
 }) {
   if (!executor) throw new Error("MCP server factory requires an executor");
   if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1 || maxConcurrent > 4) {
@@ -135,7 +138,9 @@ export function createCodexToolboxServerFactory({
         },
       },
       async ({ command, access, timeoutMs, cwd }) => {
-        const directCodexGuard = guardDirectFormalCodex ? classifyFormalCodexInvocation(command) : null;
+        const directCodexGuard = guardDirectFormalCodex
+          ? (publicPreview ? classifyAnyCodexInvocation(command) : classifyFormalCodexInvocation(command))
+          : null;
         if (directCodexGuard) {
           return toolError(directCodexGuard.message, {
             errorCode: "FORMAL_CODEX_AGENT_REQUIRED",
@@ -201,10 +206,11 @@ export function createCodexToolboxServerFactory({
       registerWorkbenchPreviewTools(registrationServer, workbench, {
         directFormalCodexGuard: guardDirectFormalCodex ? classifyFormalCodexInvocation : null,
         processDescriptionSuffix: guardDirectFormalCodex
-          ? " Direct Codex model/control invocation is not a supported fallback on this model-callable process lane: household formal Codex work must use codex.agent_start/codex.agent_send and the Portable Card exact short-ID decision flow. Rich Card v13 remains an app compatibility path. This is an accidental-routing guard, not a claim that a generic process/PTY is an inescapable sandbox against arbitrarily wrapped executables."
+          ? " Direct Codex model/control invocation is not a supported fallback on this model-callable process lane: household formal Codex work must use codex.agent_start/codex.agent_send. Required Call Approval returns fixed compact text bound to one exact Task ID; map literal Yes/No only through codex.agent_commit/codex.agent_decline. Running has no mechanical presentation and terminal Result is fixed text. This is an accidental-routing guard, not a claim that a generic process/PTY is an inescapable sandbox against arbitrarily wrapped executables."
           : "",
       });
       registerConstructionTools(registrationServer, { authorityExecutor });
+      registerExcelTools(registrationServer, { workbench, sessionRefs: excelSessionRefs });
       if (publicPreview) registerPublicTools(registrationServer, { workbench });
     }
     if (browserPreview) registerBrowserPreviewTools(registrationServer, browserPreview, {
@@ -218,6 +224,7 @@ export function createCodexToolboxServerFactory({
       meteredQuotaProvider,
       agentPreviewState,
       agentPortableCard,
+      legacyAgentCardInternals,
       agentReasoningEffort,
       codexCallProfile,
       codexCallProfileFile,
@@ -237,9 +244,20 @@ export function createCodexToolboxServerFactory({
 }
 
 const WRAPPED_CODEX_COMMAND_TOKEN_RE = /(?:^|[\s\"'`;&|(),])(?:[^\s\"'`;&|(),]*[\\/])?codex(?:\.(?:exe|com|cmd|bat|ps1))?(?=$|[\s\"'`;&|(),])/i;
+const SHELL_CODEX_COMMAND_HEAD_RE = /(?:^|(?:&&|\|\||[;|])\s*|(?:^|\s)&\s*)[\"']?(?:[^\s\"'`;&|(),]*[\\/])?codex(?:\.(?:exe|com|cmd|bat|ps1))?[\"']?(?=$|[\s\"'`;&|(),])/i;
 const COMMAND_STRING_CODEX_WRAPPERS = new Set(["cmd", "powershell", "pwsh", "sh", "bash", "zsh", "fish"]);
 const INLINE_CODEX_WRAPPERS = new Set(["node", "nodejs", "python", "python3", "py", "ruby", "perl", "deno", "bun"]);
 const EXECUTABLE_CODEX_WRAPPERS = new Set(["env", "sudo", "wsl", "nohup", "timeout", "nice", "stdbuf", "xargs", "npx", "npm", "pnpm", "yarn"]);
+
+function classifyAnyCodexInvocation(command) {
+  if (!Array.isArray(command) || command.length < 1) return null;
+  const executable = commandExecutableStem(command[0]);
+  if (["codex", "codex.exe", "codex.cmd", "codex.bat"].includes(commandExecutableBasename(command[0]))) {
+    return directFormalCodexRejection("direct-codex-executable");
+  }
+  if (!wrapperCarriesCodexInvocation(command, executable)) return null;
+  return directFormalCodexRejection(`wrapped-${executable}`);
+}
 
 function classifyFormalCodexInvocation(command) {
   if (!Array.isArray(command) || command.length < 1) return null;
@@ -254,7 +272,8 @@ function classifyFormalCodexInvocation(command) {
 function wrapperCarriesCodexInvocation(command, wrapper) {
   const args = command.slice(1).map((value) => String(value));
   if (COMMAND_STRING_CODEX_WRAPPERS.has(wrapper)) {
-    return args.some((arg) => WRAPPED_CODEX_COMMAND_TOKEN_RE.test(arg));
+    const commandText = shellWrapperCommandText(args, wrapper);
+    return commandText ? SHELL_CODEX_COMMAND_HEAD_RE.test(commandText) : false;
   }
   if (INLINE_CODEX_WRAPPERS.has(wrapper)) {
     for (let index = 0; index < args.length; index += 1) {
@@ -272,6 +291,19 @@ function wrapperCarriesCodexInvocation(command, wrapper) {
     return args.some((arg) => commandExecutableStem(arg) === "codex" || WRAPPED_CODEX_COMMAND_TOKEN_RE.test(arg));
   }
   return false;
+}
+
+function shellWrapperCommandText(args, wrapper) {
+  if (wrapper === "cmd") {
+    const commandIndex = args.findIndex((arg) => ["/c", "/k"].includes(arg.toLowerCase()));
+    return commandIndex >= 0 ? args.slice(commandIndex + 1).join(" ").trim() : null;
+  }
+  if (["powershell", "pwsh"].includes(wrapper)) {
+    const commandIndex = args.findIndex((arg) => ["-command", "-c"].includes(arg.toLowerCase()));
+    return commandIndex >= 0 ? args.slice(commandIndex + 1).join(" ").trim() : null;
+  }
+  const commandIndex = args.findIndex((arg) => ["-c", "-lc"].includes(arg.toLowerCase()));
+  return commandIndex >= 0 ? String(args[commandIndex + 1] ?? "").trim() : null;
 }
 
 function commandExecutableBasename(value) {
@@ -329,10 +361,10 @@ function directFormalCodexRejection(kind) {
   return {
     kind,
     message:
-      "Direct Codex model/control invocation is blocked on this model-free Codexless lane because it can bypass the visible household Codex decision flow. Formal Codex work must use codex.agent_start/codex.agent_send and the Portable Card exact short-ID decision path instead; Rich Card v13 remains an app compatibility path.",
+      "Direct Codex model/control invocation is blocked on this model-free Codexless lane because it can bypass the visible household Codex decision flow. Formal Codex work must use codex.agent_start/codex.agent_send and the fixed-text exact-Task-ID approval/result lifecycle.",
     nextActions: [
       "Use codex.agent_start for a new formal Codex task, or codex.agent_send for an existing Codexless-owned agent.",
-      "If the Agent call returns consent_required, present its standalone Portable Card text and use the exact short Task ID with codex.agent_portable_commit or codex.agent_portable_decline; codex.agent_card_render remains Rich Card compatibility. Do not retry through command_exec or codex.process.",
+      "If the Agent call returns consent_required, present its fixed compact approval text and bind literal Yes/No only to that exact Task ID through codex.agent_commit or codex.agent_decline. Do not retry through command_exec or codex.process.",
       "This guard prevents obvious accidental/automatic direct Codex routing; generic process/PTY is not claimed to be an inescapable security sandbox against arbitrarily wrapped executables.",
     ],
   };

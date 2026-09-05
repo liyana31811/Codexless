@@ -1,6 +1,7 @@
 import http from "node:http";
 import { createRequire } from "node:module";
 import { createCodexlessRuntime } from "./codexless-runtime.mjs";
+import { createMcpHttpSessionRouter } from "./mcp-http-session-router.mjs";
 
 const require = createRequire(import.meta.url);
 const { createMcpHandler } = require("@modelcontextprotocol/server");
@@ -24,6 +25,11 @@ const mcpHandler = createMcpHandler(runtime.createServer, {
 });
 const nodeMcpHandler = toNodeHandler(mcpHandler, {
   onerror: (error) => console.error("[codexless-public-node]", error),
+});
+const sessionRouter = createMcpHttpSessionRouter({
+  createServer: runtime.createServer,
+  modernNodeHandler: nodeMcpHandler,
+  onerror: (error) => console.error("[codexless-public-session]", error),
 });
 const validateHost = localhostHostValidation();
 const validateOrigin = localhostOriginValidation();
@@ -54,7 +60,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: "not_found" }));
       return;
     }
-    await nodeMcpHandler(req, res);
+    await sessionRouter.handle(req, res);
   } catch (error) {
     console.error("[codexless-public-http]", error);
     if (!res.headersSent) {
@@ -80,6 +86,7 @@ async function shutdown(signal) {
   if (closing) return;
   closing = true;
   try {
+    await sessionRouter.close();
     await mcpHandler.close();
     await new Promise((resolve) => server.close(() => resolve()));
   } finally {

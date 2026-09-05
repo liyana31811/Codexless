@@ -103,9 +103,9 @@ const AGENT_TASK_CARD_HTML = String.raw`
   let locale = (window.openai && window.openai.locale) || navigator.language || "en";
 
   const I18N = {
-    en: { call: "Call Codex?", task: "Task", why: "Why Codex", quota: "Codex quota", before: "Before call", after: "After observed", unavailable: "not provided", left: "left", reset: "reset", approve: "Codex approval", request: "Request", starting: "Starting Codex…", submitting: "Submitting…", running: "Codex running", done: "Codex completed", failed: "Codex failed", stopped: "Codex stopped", uncertain: "Codex state uncertain", result: "Result", usage: "Usage", turn: "This turn", tokens: "tokens", stop: "Stop", rejected: "Declined", model: "Model", reasoning: "Reasoning effort", requested: "requested", elapsed: "Elapsed", duration: "Duration", ended: "Ended" },
-    zh: { call: "调用 Codex？", task: "任务", why: "调用理由", quota: "Codex 额度", before: "调用前", after: "调用后观测", unavailable: "当前未提供", left: "剩余", reset: "重置", approve: "Codex 请求审批", request: "请求", starting: "正在启动 Codex…", submitting: "正在提交…", running: "Codex 运行中", done: "Codex 施工完成", failed: "Codex 执行失败", stopped: "Codex 已停止", uncertain: "Codex 状态不确定", result: "结果", usage: "用量", turn: "本次", tokens: "tokens", stop: "停止", rejected: "已拒绝", model: "模型", reasoning: "推理强度", requested: "请求", elapsed: "已运行", duration: "耗时", ended: "结束" },
-    ja: { call: "Codexを呼び出しますか？", task: "タスク", why: "Codexを使う理由", quota: "Codex 利用枠", before: "呼び出し前", after: "呼び出し後の観測", unavailable: "現在は提供なし", left: "残り", reset: "リセット", approve: "Codex 承認リクエスト", request: "内容", starting: "Codexを起動しています…", submitting: "送信しています…", running: "Codex 実行中", done: "Codex 完了", failed: "Codex 失敗", stopped: "Codex 停止", uncertain: "Codex 状態不明", result: "結果", usage: "使用量", turn: "今回", tokens: "tokens", stop: "停止", rejected: "拒否済み", model: "モデル", reasoning: "推論強度", requested: "指定", elapsed: "実行時間", duration: "所要時間", ended: "終了" }
+    en: { call: "Call Codex?", taskId: "Task ID", task: "Task", why: "Why Codex", quota: "Codex quota", before: "Before call", after: "After observed", unavailable: "not provided", left: "left", reset: "reset", approve: "Codex approval", request: "Request", starting: "Starting Codex…", submitting: "Submitting…", running: "Codex running", done: "Codex completed", failed: "Codex failed", stopped: "Codex stopped", uncertain: "Codex state uncertain", result: "Result", usage: "Usage", turn: "This turn", tokens: "tokens", stop: "Stop", rejected: "Declined", model: "Model", reasoning: "Reasoning effort", requested: "requested", elapsed: "Elapsed", duration: "Duration", ended: "Ended" },
+    zh: { call: "调用 Codex？", taskId: "Task ID", task: "任务", why: "调用理由", quota: "Codex 额度", before: "调用前", after: "调用后观测", unavailable: "当前未提供", left: "剩余", reset: "重置", approve: "Codex 请求审批", request: "请求", starting: "正在启动 Codex…", submitting: "正在提交…", running: "Codex 运行中", done: "Codex 施工完成", failed: "Codex 执行失败", stopped: "Codex 已停止", uncertain: "Codex 状态不确定", result: "结果", usage: "用量", turn: "本次", tokens: "tokens", stop: "停止", rejected: "已拒绝", model: "模型", reasoning: "推理强度", requested: "请求", elapsed: "已运行", duration: "耗时", ended: "结束" },
+    ja: { call: "Codexを呼び出しますか？", taskId: "Task ID", task: "タスク", why: "Codexを使う理由", quota: "Codex 利用枠", before: "呼び出し前", after: "呼び出し後の観測", unavailable: "現在は提供なし", left: "残り", reset: "リセット", approve: "Codex 承認リクエスト", request: "内容", starting: "Codexを起動しています…", submitting: "送信しています…", running: "Codex 実行中", done: "Codex 完了", failed: "Codex 失敗", stopped: "Codex 停止", uncertain: "Codex 状態不明", result: "結果", usage: "使用量", turn: "今回", tokens: "tokens", stop: "停止", rejected: "拒否済み", model: "モデル", reasoning: "推論強度", requested: "指定", elapsed: "実行時間", duration: "所要時間", ended: "終了" }
   };
 
   function langKey() {
@@ -204,6 +204,8 @@ const AGENT_TASK_CARD_HTML = String.raw`
     const execution = state.execution || {};
     const timing = state.timing || {};
     const lines = [];
+    const visibleTaskId = state.shortTaskId || (state.taskCard && state.taskCard.shortTaskId) || state.taskId || (state.taskCard && state.taskCard.taskId) || state.taskRef || null;
+    if (visibleTaskId) lines.push(t("taskId") + "：" + String(visibleTaskId));
     const invocationRationale = state.taskCard && typeof state.taskCard.invocationRationale === "string"
       ? state.taskCard.invocationRationale
       : null;
@@ -405,6 +407,11 @@ const AGENT_TASK_CARD_HTML = String.raw`
       stopBtn.style.display = refreshBtn.style.display = "inline-block";
     } else if (status === "completed" || status === "idle") {
       statusEl.textContent = t("done");
+      const result = state.resultSummary || state.finalResult;
+      if (result) {
+        resultEl.textContent = t("result") + "：" + String(result);
+        resultEl.style.display = "block";
+      }
     } else if (status === "interrupted") {
       statusEl.textContent = t("stopped");
       if (state.resultSummary) {
@@ -500,11 +507,12 @@ const AGENT_TASK_CARD_HTML = String.raw`
 
   yesBtn.onclick = async () => {
     if (yesBtn.disabled || noBtn.disabled) return;
-    if (!(state && state.status === "consent_required" && state.meteredConsent && state.meteredConsent.consentRef)) return;
+    const decisionTaskId = state && (state.taskId || state.shortTaskId);
+    if (!(state && state.status === "consent_required" && decisionTaskId)) return;
     yesBtn.disabled = noBtn.disabled = true;
     try {
       statusEl.textContent = t("starting");
-      await tool("codex.agent_commit", { consentRef: state.meteredConsent.consentRef });
+      await tool("codex.agent_commit", { taskId: decisionTaskId });
     } catch (e) {
       render(state);
       showError(e);
@@ -515,10 +523,11 @@ const AGENT_TASK_CARD_HTML = String.raw`
 
   noBtn.onclick = async () => {
     if (yesBtn.disabled || noBtn.disabled) return;
-    if (!(state && state.status === "consent_required" && state.meteredConsent && state.meteredConsent.consentRef)) return;
+    const decisionTaskId = state && (state.taskId || state.shortTaskId);
+    if (!(state && state.status === "consent_required" && decisionTaskId)) return;
     yesBtn.disabled = noBtn.disabled = true;
     try {
-      await tool("codex.agent_decline", { consentRef: state.meteredConsent.consentRef });
+      await tool("codex.agent_decline", { taskId: decisionTaskId });
     } catch (e) { showError(e); }
     finally { yesBtn.disabled = noBtn.disabled = false; }
   };
