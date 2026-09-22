@@ -109,7 +109,7 @@ The underlying task binding remains single-use and replay-safe: a stale or alrea
 - **Recommended dual runtime:** Recommended setup can also prepare a pinned official Codex runtime as an independent path for supported file/command work. It does not replace your existing local Codex and uses an isolated login.
 - **Browser:** Chrome or Edge plus the ChatGPT browser extension, connected in the profile you want to use.
 - **Excel:** the workbook must already be connected through the supported Document Control / Excel Add-in path. Codexless does not use CUA as the normal public Excel path.
-- **ChatGPT-side availability (as of this release):** OpenAI currently documents full write/modify custom MCP support for Business, Enterprise and Edu on ChatGPT web; Pro developer mode can connect read/fetch MCPs, and MCP apps are not currently available on mobile. Codexless is not currently a Plugin Directory listing. Check current OpenAI availability before installing because this surface changes independently of Codexless.
+- **Personal ChatGPT plans tested:** Plus and Pro have both been verified working.
 - **How local access works:** ChatGPT does not connect directly to `localhost`. A typical path is **local Codexless → authenticated Tunnel / remote MCP endpoint → a ChatGPT custom app / developer-mode MCP connection**.
 - **Independent project:** Codexless is not an OpenAI product and does not imply OpenAI endorsement.
 

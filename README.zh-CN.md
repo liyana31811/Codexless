@@ -109,7 +109,7 @@ Browser 使用你选择的本地浏览器 profile 和其中已有的网站登录
 - **Recommended 双路径：** 可以额外准备一套固定版本的官方 Codex runtime，用于已经支持的文件 / 命令工作；它不会替换本机 Codex，登录状态也相互隔离。
 - **Browser：** 本机需要 Chrome 或 Edge，以及已连接的 ChatGPT 浏览器扩展。
 - **Excel：** 工作簿需要先通过受支持的 Document Control / Excel Add-in 路径连接。公开 Excel 正常路径不依赖 CUA。
-- **ChatGPT 侧可用性（以本版本发布时为准）：** OpenAI 当前文档将具备写入 / 修改能力的完整自定义 MCP 支持列在 ChatGPT 网页版的 Business、Enterprise 和 Edu；Pro 的 developer mode 自定义 MCP 目前仅支持 read/fetch，MCP apps 当前也不支持移动端。Codexless 目前不是 Plugin Directory 中的公开条目。安装前请再确认 OpenAI 当时的套餐与界面支持，因为这一层会独立于 Codexless 变化。
+- **个人套餐实测：** Plus 和 Pro 均已证实可用。
 - **本地怎么连：** ChatGPT 不直接访问 `localhost`。典型链路是 **本机 Codexless → 已认证 Tunnel / remote MCP endpoint → ChatGPT custom app / developer-mode MCP 接入**。
 - **身份：** Codexless 是独立项目，不是 OpenAI 产品，也不代表 OpenAI 背书。
 
