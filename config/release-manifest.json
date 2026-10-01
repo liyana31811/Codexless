@@ -17,7 +17,7 @@
       }
     }
   },
-  "buildId": "61ccaee4b4083e6e25c2bb38eb221913d746ba87e6c60f46624240016efdc8a9",
+  "buildId": "9e0d4a445f0206d5d7b938b41fe8a0fe5c149de1619f73857503efeb57cdecd2",
   "files": [
     { "path": "EXPORT_SYNC.md", "sha256": "2016ca37f280451a76cdb95f7223e0aa60f4a4743a41df0e11d6b4157231a839" },
     { "path": "LICENSE", "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4" },
@@ -71,12 +71,12 @@
     { "path": "src/browser-elicitation-bridge.mjs", "sha256": "2cc060b019fe38b9a990876992365aa0c32e94ac4b190c98bd61b5da04b4fee2" },
     { "path": "src/browser-model-route-probe.mjs", "sha256": "2b0cc93ad064543b09a276cb2be8d031b926cc62c6cfe11bd916a8e2a592f07b" },
     { "path": "src/browser-runtime-compat.mjs", "sha256": "97dc1da61d45a7a8b5d4f9e5ed9ae82ba981c01c99e41a038957b3e85631e77a" },
-    { "path": "src/browser-tools.mjs", "sha256": "5db635f7f1057da69b8192e83fe1bc18083ded2e8e385dcf9dfe3f0af72b46a3" },
+    { "path": "src/browser-tools.mjs", "sha256": "b776eff737dfec1bf72805a07c4803e4364e78a8c5fc8b9619b60ee279abacf8" },
     { "path": "src/codex-agent-executor.mjs", "sha256": "5b73559d89f163ed7c3ba2b7b69f98792a1d7a3b0f983e46f8c20b39c9d7d60c" },
     { "path": "src/codex-app-server-client.mjs", "sha256": "641ec966f3a9e18857e0b0551de0298bc120ae18f30a73d2ec50d3d9cfc5d84c" },
     { "path": "src/codex-authority-executor.mjs", "sha256": "d73d839119982a0afb8bdcc0e23c656b40112eb396f8af78caee900a645f00e0" },
     { "path": "src/codex-bin.mjs", "sha256": "979c26ca4cd52c40a43a93bdc4c30e962b8eb9c374dbee7f1bdff0b67a24094e" },
-    { "path": "src/codex-browser-executor.mjs", "sha256": "70d4e35036505012a5fee9250f3b50281bd4998a9e9eaa8e4aea775817b6ff71" },
+    { "path": "src/codex-browser-executor.mjs", "sha256": "e6bc22882b0f0db2b2c550144f74646781030dabd3ecd30caf9f0b99b2306005" },
     { "path": "src/codex-call-profile.mjs", "sha256": "87b136e5cb0e3af7e90a9d7c808ad098a1c5649f94d2490e1c07d3897d180906" },
     { "path": "src/codex-computer-use-executor.mjs", "sha256": "caf6acbae38396f46a47f13abc282117c5f5f296bece15aff56d009120256489" },
     { "path": "src/codex-model-catalog.mjs", "sha256": "17a6aaad0f05b7c7260616c40beb75d07eade1981f5396d8db660490a085c7de" },

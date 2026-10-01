@@ -2122,12 +2122,19 @@ try {
   const __twBeforeUrl = (await __twTab.url()) ?? __twInfo.url ?? null;
   if (__twBeforeUrl !== ${expectedUrlLiteral}) throw new Error("TOOLWIRE_BROWSER_ACTION_URL_CHANGED");
   __twDispatchAttempted = true;
-  await __twTab.dom_cua.keypress({ keys: [${keyLiteral}] });
+  let __twInputMethod = null;
+  if (typeof __twTab.dom_cua?.keypress === "function") {
+    await __twTab.dom_cua.keypress({ keys: [${keyLiteral}] });
+    __twInputMethod = "dom-cua-focused-keypress";
+  } else {
+    await __twTab.playwright.locator(":focus").press(${keyLiteral}, { timeoutMs: 3000 });
+    __twInputMethod = "playwright-focused-keypress";
+  }
   __twKeypressReturned = true;
   __twPayload = {
     beforeUrl: __twBeforeUrl,
     keypressReturned: true,
-    inputMethod: "focused-keypress",
+    inputMethod: __twInputMethod,
     key: ${keyLiteral},
     settleCompleted: false,
   };
@@ -2205,8 +2212,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
       snapshotChars: Number.isInteger(readback?.snapshotChars) ? readback.snapshotChars : snapshot.length,
       snapshotTruncated: readback?.snapshotTruncated === true,
       note: readback
-        ? "Exactly one fixed Enter/Tab/Escape keypress returned successfully through the official Chrome DOM CUA keypress API at the page's currently focused element, then the Browser runtime performed a separate read-only DOM readback. Callers cannot supply arbitrary keys, modifiers, text, selectors, coordinates, repeats, or JavaScript. Enter may submit or activate the focused control, so apply the current Codex Browser confirmation policy and task context before calling when that representational/external side effect is possible. A later readback failure cannot turn a confirmed keypress uncertain and the Browser runtime never repeats it automatically."
-        : "Exactly one fixed Enter/Tab/Escape keypress returned successfully through the official Chrome DOM CUA keypress API at the page's currently focused element. The separate read-only DOM readback failed, but the Browser runtime does not mark the confirmed keypress uncertain and does not repeat it automatically; re-read the tab if page content is still needed.",
+        ? "Exactly one fixed Enter/Tab/Escape keypress returned successfully at the page's currently focused element through the available official Browser keypress primitive, then the Browser runtime performed a separate read-only DOM readback. inputMethod reports whether DOM CUA or the Playwright :focus compatibility path was used. Callers cannot supply arbitrary keys, modifiers, text, selectors, coordinates, repeats, or JavaScript. Enter may submit or activate the focused control, so apply the current Codex Browser confirmation policy and task context before calling when that representational/external side effect is possible. A later readback failure cannot turn a confirmed keypress uncertain and the Browser runtime never repeats it automatically."
+        : "Exactly one fixed Enter/Tab/Escape keypress returned successfully at the page's currently focused element through the available official Browser keypress primitive. inputMethod reports whether DOM CUA or the Playwright :focus compatibility path was used. The separate read-only DOM readback failed, but the Browser runtime does not mark the confirmed keypress uncertain and does not repeat it automatically; re-read the tab if page content is still needed.",
     };
   }
 

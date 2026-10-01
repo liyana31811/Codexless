@@ -453,6 +453,7 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
     screenshots: 0,
     screenshotReportedByteLengthDelta: 0,
     keypresses: [],
+    keypressDomCuaAvailable: true,
     keypressUncertain: false,
     scrolls: 0,
     lastScrollDelta: null,
@@ -845,12 +846,13 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
         };
       }
       if (title === "Dispatch fixed Chrome keypress") {
+        assert.match(code, /typeof __twTab\.dom_cua\?\.keypress === "function"/);
         assert.match(code, /dom_cua\.keypress\(\{ keys: \[/);
+        assert.match(code, /playwright\.locator\(":focus"\)\.press\([^,]+, \{ timeoutMs: 3000 \}\)/);
         assert.match(code, /TOOLWIRE_BROWSER_ACTION_URL_CHANGED/);
         assert.match(code, /TOOLWIRE_BROWSER_KEYPRESS_RESULT_UNCERTAIN/);
         assert.match(code, /cleanupBrowserClaim\(__twBrowser, __twTab\)/);
-        assert.doesNotMatch(code, /playwright\.locator\(/);
-        assert.doesNotMatch(code, /__twTab\.cua\.keypress\(/, "P1b should use DOM CUA current-focus keypress, not coordinate CUA");
+        assert.doesNotMatch(code, /__twTab\.cua\.keypress\(/, "keypress compatibility must not widen to coordinate CUA");
         assert.doesNotMatch(code, /domSnapshot\(/, "keypress dispatch receipt must not depend on DOM readback");
         const keyMatch = code.match(/key: ("(?:Enter|Tab|Escape)")/);
         assert.ok(keyMatch, "keypress body must bind one fixed supported key");
@@ -866,7 +868,7 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
             afterUrl: state.tabs[0].url,
             afterTitle: state.tabs[0].title,
             keypressReturned: true,
-            inputMethod: "focused-keypress",
+            inputMethod: state.keypressDomCuaAvailable ? "dom-cua-focused-keypress" : "playwright-focused-keypress",
             key,
             settleCompleted: true,
             settleError: null,
@@ -3198,7 +3200,7 @@ test("Browser confirmed scroll stays successful when only post-scroll readback f
   assert.equal(uncertainWorkbench.state.scrolls, 1);
 });
 
-test("Browser fixed keypress exposes only Enter/Tab/Escape at current focus and returns confirmed readback", async () => {
+test("Browser fixed keypress prefers DOM CUA when available and exposes only Enter/Tab/Escape at current focus", async () => {
   const workbench = makeWorkbench();
   const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
   const listed = await browser.listTabs({});
@@ -3206,12 +3208,13 @@ test("Browser fixed keypress exposes only Enter/Tab/Escape at current focus and 
     const pressed = await browser.keypressTab({ tabRef: listed.tabs[0].tabRef, key, maxChars: 1000 });
     assert.equal(pressed.status, "pressed");
     assert.equal(pressed.key, key);
-    assert.equal(pressed.inputMethod, "focused-keypress");
+    assert.equal(pressed.inputMethod, "dom-cua-focused-keypress");
     assert.equal(pressed.dispatchStatus, "confirmed");
     assert.equal(pressed.keypressReturned, true);
     assert.equal(pressed.cleanupStatus, "released");
     assert.equal(pressed.readbackStatus, "ok");
     assert.equal(pressed.urlChanged, false);
+    assert.match(pressed.note, /inputMethod reports whether DOM CUA or the Playwright :focus compatibility path was used/i);
     assert.match(pressed.note, /arbitrary keys, modifiers, text, selectors, coordinates, repeats, or JavaScript/i);
   }
   assert.deepEqual(workbench.state.keypresses, ["Tab", "Escape", "Enter"]);
@@ -3227,10 +3230,28 @@ test("Browser fixed keypress exposes only Enter/Tab/Escape at current focus and 
   );
 });
 
-test("Browser fixed keypress fails closed on dispatch uncertainty and never implies blind replay", async () => {
+test("Browser fixed keypress falls back to Playwright :focus when DOM CUA keypress is unavailable", async () => {
+  const workbench = makeWorkbench();
+  workbench.state.keypressDomCuaAvailable = false;
+  const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
+  const listed = await browser.listTabs({});
+  const pressed = await browser.keypressTab({ tabRef: listed.tabs[0].tabRef, key: "Tab", maxChars: 1000 });
+  assert.equal(pressed.status, "pressed");
+  assert.equal(pressed.key, "Tab");
+  assert.equal(pressed.inputMethod, "playwright-focused-keypress");
+  assert.equal(pressed.dispatchStatus, "confirmed");
+  assert.equal(pressed.keypressReturned, true);
+  assert.equal(pressed.cleanupStatus, "released");
+  assert.equal(pressed.readbackStatus, "ok");
+  assert.equal(pressed.urlChanged, false);
+  assert.deepEqual(workbench.state.keypresses, ["Tab"]);
+});
+
+test("Browser fixed keypress fails closed on fallback dispatch uncertainty and never implies blind replay", async () => {
   const workbench = makeWorkbench();
   const browser = new CodexBrowserExecutor({ workbench, defaultCwd: "C:\\workspace" });
   const listed = await browser.listTabs({});
+  workbench.state.keypressDomCuaAvailable = false;
   workbench.state.keypressUncertain = true;
   await assert.rejects(
     () => browser.keypressTab({ tabRef: listed.tabs[0].tabRef, key: "Enter", maxChars: 1000 }),
