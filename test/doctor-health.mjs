@@ -17,7 +17,7 @@ assert.equal(disconnected.prerequisites.nodeRepl, "ok");
 assert.equal(disconnected.backend.status, "disconnected");
 assert.equal(disconnected.connection.verified, false);
 
-const connectedReader = publicBrowser(fakeContext({ backends: [{ name: "Chrome", family: "chrome", type: "extension" }] }));
+const connectedReader = publicBrowser(fakeContext({ backends: [{ id: "fixture-chrome-0", name: "Chrome", family: "chrome", type: "extension", capabilities: { listTabs: true, claimTabs: true, openTab: true, explicitRelease: true } }] }));
 const connected = normalizeBrowserReaderHealth(await connectedReader.status({ cwd }));
 assert.equal(connected.status, "available", "Browser Reader must report green only after real backend connectivity succeeds");
 assert.equal(connected.connection.status, "connected");

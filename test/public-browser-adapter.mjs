@@ -14,7 +14,7 @@ class FakePublicContext {
     this.calls.push(structuredClone(request));
     const title = request?.arguments?.title ?? "";
     const code = request?.arguments?.code ?? "";
-    if (title === "Check connected browser backends") return ok([{ name: "Chrome", family: "chrome", type: "extension" }]);
+    if (title === "Check connected browser backends") return ok([{ id: "fixture-chrome-0", name: "Chrome", family: "chrome", type: "extension", capabilities: { listTabs: true, claimTabs: true, openTab: true, explicitRelease: true } }]);
     if (title === "List current Chrome tabs") return ok([{ providerTabId: "provider-a", title: "A", url: "https://example.com/a", lastOpened: "2026-08-19T00:00:00Z" }]);
     if (title === "Read existing Chrome tab DOM") return ok({ title: "A", url: "https://example.com/a", lastOpened: "2026-08-19T00:00:00Z", snapshot: "A snapshot", lifecycleMode: "session-resume" });
     if (title === "Adapter passthrough probe") return { isError: true, text: "generic downstream error" };

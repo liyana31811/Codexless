@@ -73,7 +73,7 @@ ChatGPT 可以看项目、读写文件、运行受控命令、使用 Git 和本�
 - 有界滚动，以及 `Enter` / `Tab` / `Escape`；
 - prepared 上传和下载。
 
-Browser 使用你选择的本地浏览器 profile 和其中已有的网站登录状态。上传本地文件还需要在 ChatGPT 浏览器扩展中打开 **“允许访问文件网址”**。
+Browser 使用你选择的本地浏览器 profile 和其中已有的网站登录状态。`codex.browser_status` 通过官方 runtime 动态返回 `connectedBrowsers`，包含安全的 profile 名称、类型、检测到的 backend 能力和临时 opaque `backendRef`。`codex.browser_tabs` 和 `codex.browser_prepare_open_tab` 可用 `backendRef` 精确选择 Chrome/Edge 扩展 profile；只有一个兼容 backend 时可省略，多个时返回 `BROWSER_FAMILY_BACKEND_AMBIGUOUS` 和可选 refs。tab/action 绑定到同一精确 backend 与 runtime generation；重启或 backend 身份变化后旧 refs 失效，不可作为永久配置保存。profile 名称仅用于显示，重名不会被猜测选择；provider/metadata IDs 不作为公开 selectors。其他官方类型仅列出，不增加无扩展或 raw CDP 控制。原有确认、安全及生命周期限制仍有效。详见 [backend 选择说明](docs/browser-backend-selector.md)。上传本地文件还需要在 ChatGPT 浏览器扩展中打开 **“允许访问文件网址”**。
 
 公开面不提供任意 JavaScript、raw selector、任意坐标、任意键盘、generic CDP，也不会自动用 Computer Use 兜底。
 

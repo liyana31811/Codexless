@@ -1,7 +1,9 @@
 export function normalizeBrowserReaderHealth(raw = {}) {
   const chromeSkill = normalizePrerequisite(raw.chromeSkill);
   const nodeRepl = normalizePrerequisite(raw.nodeRepl);
-  const connectedChrome = raw.status === "ok" && raw.chrome?.family === "chrome";
+  const chromeBackends = (Array.isArray(raw.connectedBrowsers) ? raw.connectedBrowsers : [])
+    .filter((backend) => backend.family === "chrome" && backend.supported === true && backend.capabilities?.listTabs === true);
+  const connectedChrome = raw.status === "ok" && (raw.chrome?.family === "chrome" || chromeBackends.length > 0);
   const connectionStatus = connectedChrome
     ? "connected"
     : raw.reason === "chrome_not_connected"
@@ -21,6 +23,7 @@ export function normalizeBrowserReaderHealth(raw = {}) {
       status: connectionStatus,
       family: connectedChrome ? "chrome" : null,
       type: connectedChrome && typeof raw.chrome?.type === "string" ? raw.chrome.type : null,
+      selectionRequired: raw.selectionRequired === true,
       name: connectedChrome && typeof raw.chrome?.name === "string" ? raw.chrome.name : null,
     },
     connection: {

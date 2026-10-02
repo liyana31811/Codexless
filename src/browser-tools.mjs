@@ -53,7 +53,7 @@ export function registerBrowserPreviewTools(server, browser, { elicitationBridge
     {
       title: "Check Existing-Login Chrome Browser",
       description:
-        "Read-only Browser status probe. Check whether the current Codex Chrome Skill, node_repl body, and connected Chrome extension/backend are available for existing-login browser work. This starts no Codex model turn and inspects no page content. Website authentication is site-specific and is not inferred merely from extension connectivity.",
+        "Read-only Browser status probe. Check whether the current Codex Chrome Skill, node_repl body, and connected Chrome extension/backend are available for existing-login browser work. Returns a bounded connectedBrowsers inventory with safe profile names, opaque session-scoped backendRef values and method-detected backend capabilities. Multiple profiles are healthy; selectionRequired means entry-point calls must supply backendRef. This starts no Codex model turn and inspects no page content. Website authentication is site-specific and is not inferred merely from extension connectivity.",
       inputSchema: z.object({
         cwd: z.string().min(1).max(32_768).optional()
           .describe("Optional project cwd used only to resolve the current Codex Skill/MCP context; it is not browser navigation or a permission selector."),
@@ -98,10 +98,12 @@ export function registerBrowserPreviewTools(server, browser, { elicitationBridge
     {
       title: "List Existing Browser Tabs",
       description:
-        "Read-only Browser tab-list tool. List tabs already open in one connected stock Codex Browser family (`chrome` by default, or `edge`) and return family-bound opaque tabRef values plus visible title/url/lastOpened. The Browser runtime automatically supplies the Codex Browser turn metadata required by the current runtime. This tool does not open, navigate, click, submit, or modify any tab, and a tabRef minted for one family cannot be used against another family.",
+        "Read-only Browser tab-list tool. List tabs already open in one connected stock Codex Browser family (`chrome` by default, or `edge`) and return exact-backend-bound opaque tabRef values plus visible title/url/lastOpened. The Browser runtime automatically supplies the Codex Browser turn metadata required by the current runtime. This tool does not open, navigate, click, submit, or modify any tab, and a tabRef minted for one family cannot be used against another family.",
       inputSchema: z.object({
+        backendRef: z.string().regex(/^browser_backend_[a-f0-9-]{36}$/).optional()
+          .describe("Optional exact backendRef from codex.browser_status. Required when multiple compatible profiles are connected; ephemeral and not permission evidence."),
         family: z.enum(["chrome", "edge"]).default("chrome")
-          .describe("Connected stock Codex Browser family to list. This selects only `chrome` or `edge`; it is not a profile/backend id or authority selector."),
+          .describe("Connected stock Codex Browser family to list. This selects only `chrome` or `edge`; use optional backendRef to select one exact connected profile; neither field widens authority."),
         cwd: z.string().min(1).max(32_768).optional()
           .describe("Optional project cwd used to resolve the current Codex Browser runtime; it does not choose a browser profile or widen authority."),
       }).strict(),
@@ -308,8 +310,10 @@ export function registerBrowserPreviewTools(server, browser, { elicitationBridge
     {
       title: "Prepare Exact Browser-Family New Tab",
       description:
-        "Browser Operate Preview. Prepare opening exactly one new Chrome or Edge tab to one explicit http(s) URL without creating or navigating any tab. The caller must explicitly choose family=chrome|edge so the creation target is never decided by a hidden default. When the user goal is simply to reach/read a page and the exact destination is already reliably available from Browser-derived evidence, this direct route is preferred over simulating an intermediate click; do not guess route patterns. The exact normalized destination plus browser family are stored in a legacy-named single-use actionApprovalRef. That ref is only an exact-action binding and is not evidence of user approval. Apply codex.browser_confirmation_policy plus current user-authored task context; do not ask for confirmation merely because a prepared ref exists. No existing tab, selector, JavaScript, click, fill, or scroll target is accepted.",
+        "Browser Operate Preview. Prepare opening exactly one new Chrome or Edge tab to one explicit http(s) URL without creating or navigating any tab. The caller must explicitly choose family=chrome|edge so the creation target is never decided by a hidden default. When the user goal is simply to reach/read a page and the exact destination is already reliably available from Browser-derived evidence, this direct route is preferred over simulating an intermediate click; do not guess route patterns. Use backendRef from browser_status when multiple compatible profiles exist. The exact normalized destination plus browser family and exact backend are stored in a legacy-named single-use actionApprovalRef. That ref is only an exact-action binding and is not evidence of user approval. Apply codex.browser_confirmation_policy plus current user-authored task context; do not ask for confirmation merely because a prepared ref exists. No existing tab, selector, JavaScript, click, fill, or scroll target is accepted.",
       inputSchema: z.object({
+        backendRef: z.string().regex(/^browser_backend_[a-f0-9-]{36}$/).optional()
+          .describe("Optional exact backendRef from codex.browser_status. Required when multiple compatible profiles are connected; ephemeral and not permission evidence."),
         family: z.enum(["chrome", "edge"])
           .describe("Exact browser family to create the new tab in. Required so the prepared action cannot hide or change the creation target."),
         url: z.string().min(1).max(8192)

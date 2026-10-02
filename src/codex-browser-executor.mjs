@@ -197,6 +197,7 @@ async function sanitizeBrowserDomSnapshot(tab) {
 `;
 
 const BROWSER_MUTATION_DEFINITIVE_RESPONSE_CODES = new Set([
+  "BROWSER_BACKEND_REF_STALE",
   "BROWSER_FILL_NOT_APPLIED",
   "BROWSER_FILL_VERIFICATION_UNAVAILABLE",
   "BROWSER_FILL_VERIFY_MISMATCH",
@@ -564,6 +565,7 @@ export class CodexBrowserExecutor {
   #sessionId = `toolwire-browser-${randomUUID()}`;
   #turnSeq = 0;
   #browserClientUrl = null;
+  #backends = new Map();
   #tabs = new Map();
   #providerToRef = new Map();
   #webMcpHandles = new Map();
@@ -614,6 +616,7 @@ export class CodexBrowserExecutor {
   }
 
   #resetLocalBrowserControlBindings(nextGeneration = this.#currentWorkbenchGeneration()) {
+    this.#backends.clear();
     this.#tabs.clear();
     this.#providerToRef.clear();
     this.#webMcpHandles.clear();
@@ -645,13 +648,13 @@ export class CodexBrowserExecutor {
     };
 
     try {
-      await this.#requireReady(effectiveCwd, normalizeBrowserFamily(prepared.family ?? "chrome"));
+      await this.#requireReady(effectiveCwd, normalizeBrowserFamily(prepared.family ?? "chrome"), prepared.backendRef, prepared.kind === "open_tab" ? "openTab" : "listTabs");
     } catch (error) {
       assertPreparedGeneration();
       const classified = classifyBrowserError(error);
       if (classified.code !== "BROWSER_NODE_REPL_DISCOVERY_FAILED") throw classified;
       try {
-        await this.#requireReady(effectiveCwd, normalizeBrowserFamily(prepared.family ?? "chrome"));
+        await this.#requireReady(effectiveCwd, normalizeBrowserFamily(prepared.family ?? "chrome"), prepared.backendRef, prepared.kind === "open_tab" ? "openTab" : "listTabs");
       } catch (retryError) {
         assertPreparedGeneration();
         const retryClassified = classifyBrowserError(retryError);
@@ -683,29 +686,27 @@ export class CodexBrowserExecutor {
 
     try {
       const backends = await this.#listBackends(effectiveCwd);
-      const chromeBackends = backends.filter((backend) => backend.family === "chrome");
+      const chromeBackends = backends.filter((backend) => backend.family === "chrome" && backend.supported && backend.capabilities.listTabs);
       if (chromeBackends.length === 0) {
         return {
           status: "unavailable",
-          reason: "chrome_not_connected",
+          reason: backends.some((backend) => backend.family === "chrome") ? "BROWSER_OPERATION_UNSUPPORTED" : "chrome_not_connected",
           chromeSkill: "ok",
           nodeRepl: "ok",
-          connectedBrowsers: backends,
+          connectedBrowsers: backends.map(sanitizeBackend),
           nextActions: [
             "Open Chrome with the supported Codex Chrome extension/runtime enabled, then call codex.browser_status again.",
             "Do not fall back to Computer Use merely because Chrome is not connected.",
           ],
         };
       }
-      if (chromeBackends.length > 1) {
-        return chromeBackendAmbiguous(backends, chromeBackends);
-      }
       const [chrome] = chromeBackends;
       return {
         status: "ok",
         chromeSkill: "ok",
         nodeRepl: "ok",
-        chrome: sanitizeBackend(chrome),
+        chrome: chromeBackends.length === 1 ? sanitizeBackend(chrome) : null,
+        selectionRequired: chromeBackends.length > 1,
         connectedBrowsers: backends.map(sanitizeBackend),
         authState: "site_specific_unknown",
         note: "Browser connectivity is healthy. Website login state is site-specific and is verified by reading the actual tab URL/page; the Browser runtime does not infer authentication from extension connectivity alone.",
@@ -830,13 +831,12 @@ nodeRepl.write(JSON.stringify({ policy: __twPolicy }));
     }
   }
 
-  async listTabs({ family = "chrome", cwd = this.#defaultCwd } = {}) {
+  async listTabs({ family = "chrome", backendRef, cwd = this.#defaultCwd } = {}) {
     const effectiveCwd = path.resolve(cwd);
     const browserFamily = normalizeBrowserFamily(family);
-    await this.#requireReady(effectiveCwd, browserFamily);
-    const familyLiteral = JSON.stringify(browserFamily);
+    const backend = await this.#requireReady(effectiveCwd, browserFamily, backendRef, "listTabs");
     const rawTabs = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(backend)}
 const __twTabs = await __twBrowser.user.openTabs();
 nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
   providerTabId: tab.providerTabId,
@@ -855,7 +855,7 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
     for (const raw of rawTabs) {
       const providerTabId = typeof raw?.providerTabId === "string" ? raw.providerTabId : null;
       if (!providerTabId) continue;
-      const providerKey = `${browserFamily}:${providerTabId}`;
+      const providerKey = JSON.stringify([backend.backendRef, providerTabId]);
       currentProviders.add(providerKey);
       let tabRef = this.#providerToRef.get(providerKey);
       if (!tabRef) {
@@ -865,6 +865,7 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
       const state = {
         tabRef,
         family: browserFamily,
+        backendRef: backend.backendRef,
         providerTabId,
         workbenchGeneration: this.#workbenchGeneration,
         title: stringOrNull(raw.title),
@@ -877,7 +878,7 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
     }
 
     for (const [providerKey, tabRef] of this.#providerToRef.entries()) {
-      if (!providerKey.startsWith(`${browserFamily}:`)) continue;
+      if (this.#tabs.get(tabRef)?.backendRef !== backend.backendRef) continue;
       if (!currentProviders.has(providerKey)) {
         this.#providerToRef.delete(providerKey);
         this.#tabs.delete(tabRef);
@@ -888,9 +889,10 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
     return {
       status: "ok",
       browser: browserFamily,
+      backendRef: backend.backendRef,
       count: tabs.length,
       tabs,
-      note: `tabRef values are opaque, bound to the ${browserFamily} family, and valid only while this Workbench runtime can still match the same open tab. Call codex.browser_tabs again after a backend restart or when a tab closes/moves unexpectedly.`,
+      note: `tabRef values are opaque, bound to one exact ${browserFamily} backend and runtime generation, and valid only while this Workbench runtime can still match the same open tab. Call codex.browser_tabs again after a backend restart or when a tab closes/moves unexpectedly.`,
     };
   }
 
@@ -914,12 +916,11 @@ nodeRepl.write(JSON.stringify(__twTabs.map((tab) => ({
       );
     }
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
-    const familyLiteral = JSON.stringify(browserFamily);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -996,7 +997,7 @@ nodeRepl.write(JSON.stringify({ discarded: true }));
       );
     }
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
 
     const webMcpRef = `browser_webmcp_${randomUUID()}`;
     const refLiteral = JSON.stringify(webMcpRef);
@@ -1005,7 +1006,7 @@ nodeRepl.write(JSON.stringify({ discarded: true }));
     let result;
     try {
       result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -1041,7 +1042,7 @@ if (__twPayload && __twTools) {
     if (__twOldest === undefined) break;
     globalThis.__codexlessWebMcpHandles.delete(__twOldest);
   }
-  globalThis.__codexlessWebMcpHandles.set(${refLiteral}, { tools: __twTools, family: ${familyLiteral}, providerTabId: ${providerLiteral}, url: __twPayload.url });
+  globalThis.__codexlessWebMcpHandles.set(${refLiteral}, { tools: __twTools, backendRef: ${JSON.stringify(state.backendRef)}, family: ${familyLiteral}, providerTabId: ${providerLiteral}, url: __twPayload.url });
 }
 nodeRepl.write(JSON.stringify(__twPayload));
 `, "Discover current Browser WebMCP tools", { expectedGeneration: state.workbenchGeneration });
@@ -1080,6 +1081,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       providerTabId: state.providerTabId,
       expectedUrl: current.url,
       cwd: effectiveCwd,
+      backendRef: state.backendRef,
       workbenchGeneration: state.workbenchGeneration,
     });
     return {
@@ -1120,6 +1122,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     const browserFamily = normalizeBrowserFamily(binding.family ?? state?.family ?? "chrome");
     if (
       !state
+      || state.backendRef !== binding.backendRef
       || state.providerTabId !== binding.providerTabId
       || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily
       || state.workbenchGeneration !== binding.workbenchGeneration
@@ -1132,7 +1135,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const effectiveCwd = binding.cwd;
-    await this.#requireReady(effectiveCwd, browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
     if (binding.workbenchGeneration !== this.#workbenchGeneration) {
       await this.#discardWebMcpNodeHandle(effectiveCwd, webMcpRef, binding.workbenchGeneration);
       throw new BrowserPreviewError(
@@ -1165,8 +1168,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
     try {
       result = await this.#runJson(effectiveCwd, `
 const __twEntry = globalThis.__codexlessWebMcpHandles?.get(${refLiteral});
-if (!__twEntry || __twEntry.family !== ${familyLiteral} || __twEntry.providerTabId !== ${providerLiteral} || __twEntry.url !== ${expectedUrlLiteral}) throw new Error("TOOLWIRE_BROWSER_WEBMCP_HANDLE_STALE");
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+if (!__twEntry || __twEntry.backendRef !== ${JSON.stringify(state.backendRef)} || __twEntry.family !== ${familyLiteral} || __twEntry.providerTabId !== ${providerLiteral} || __twEntry.url !== ${expectedUrlLiteral}) throw new Error("TOOLWIRE_BROWSER_WEBMCP_HANDLE_STALE");
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) {
@@ -1268,12 +1271,11 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
 
     const providerLiteral = JSON.stringify(state.providerTabId);
-    const familyLiteral = JSON.stringify(browserFamily);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -1364,11 +1366,10 @@ nodeRepl.write(JSON.stringify(__twPayload));
     }
 
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
-    const familyLiteral = JSON.stringify(browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -1406,6 +1407,7 @@ nodeRepl.write(JSON.stringify({
       providerTabId: state.providerTabId,
       expectedUrl: currentUrl,
       cwd: effectiveCwd,
+      backendRef: state.backendRef,
       workbenchGeneration: state.workbenchGeneration,
       expiresAt,
     };
@@ -1449,7 +1451,8 @@ nodeRepl.write(JSON.stringify({
     }
     const state = this.#tabs.get(prepared.tabRef);
     const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
-    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
+    if (!state || state.backendRef !== prepared.backendRef
+      || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
         "The prepared tab close no longer matches a current Browser runtime tab or Browser family",
@@ -1457,11 +1460,10 @@ nodeRepl.write(JSON.stringify({
       );
     }
 
-    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(prepared)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -1508,7 +1510,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     this.#tabs.delete(prepared.tabRef);
-    const providerKey = `${browserFamily}:${prepared.providerTabId}`;
+    const providerKey = JSON.stringify([prepared.backendRef, prepared.providerTabId]);
     if (this.#providerToRef.get(providerKey) === prepared.tabRef) {
       this.#providerToRef.delete(providerKey);
     }
@@ -1564,12 +1566,14 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ["Prepare separate exact sets for Chrome and Edge; do not mix opaque refs across Browser families."]
       );
     }
+    if (new Set(requested.map((state) => state.backendRef)).size !== 1) {
+      throw new BrowserPreviewError("BROWSER_BULK_CLOSE_BACKEND_MIXED", "Bulk-close tabRefs must belong to one exact backend; prepare separate sets per backend");
+    }
     const browserFamily = requestedFamilies[0];
-    await this.#requireReady(effectiveCwd, browserFamily);
-    const familyLiteral = JSON.stringify(browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, requested[0].backendRef);
     const requestedLiteral = JSON.stringify(requested.map((state) => ({ providerTabId: state.providerTabId })));
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(requested[0])}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twRequested = ${requestedLiteral};
 const __twRows = [];
@@ -1631,6 +1635,7 @@ nodeRepl.write(JSON.stringify({ rows: __twRows }));
       family: browserFamily,
       targets,
       cwd: effectiveCwd,
+      backendRef: requested[0].backendRef,
       workbenchGeneration: this.#workbenchGeneration,
       expiresAt,
     };
@@ -1687,7 +1692,6 @@ nodeRepl.write(JSON.stringify({ rows: __twRows }));
         ["Refresh browser_tabs and prepare separate exact sets per Browser family."]
       );
     }
-    const familyLiteral = JSON.stringify(browserFamily);
     const confirmedClosed = [];
     const publicTarget = (target) => ({
       tabRef: target.tabRef,
@@ -1703,7 +1707,7 @@ nodeRepl.write(JSON.stringify({ rows: __twRows }));
       let result;
       try {
         result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(prepared)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_BULK_CLOSE_TAB_STALE");
@@ -1794,7 +1798,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
         };
       }
       this.#tabs.delete(target.tabRef);
-      const providerKey = `${browserFamily}:${target.providerTabId}`;
+      const providerKey = JSON.stringify([prepared.backendRef, target.providerTabId]);
       if (this.#providerToRef.get(providerKey) === target.tabRef) {
         this.#providerToRef.delete(providerKey);
       }
@@ -1816,11 +1820,11 @@ nodeRepl.write(JSON.stringify(__twPayload));
     };
   }
 
-  async prepareOpenTab({ family, url, cwd = this.#defaultCwd }) {
+  async prepareOpenTab({ family, backendRef, url, cwd = this.#defaultCwd }) {
     const effectiveCwd = path.resolve(cwd);
     const browserFamily = normalizeBrowserFamily(family);
     const targetUrl = normalizeBrowserHttpUrl(url);
-    await this.#requireReady(effectiveCwd, browserFamily);
+    const backend = await this.#requireReady(effectiveCwd, browserFamily, backendRef, "openTab");
     this.#cleanupActionApprovals();
     const actionApprovalRef = `browser_action_${randomUUID()}`;
     const expiresAt = Date.now() + BROWSER_ACTION_APPROVAL_TTL_MS;
@@ -1828,6 +1832,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       actionApprovalRef,
       kind: "open_tab",
       family: browserFamily,
+      backendRef: backend.backendRef,
       targetUrl,
       cwd: effectiveCwd,
       workbenchGeneration: this.#workbenchGeneration,
@@ -1841,6 +1846,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       action: {
         kind: "open_tab",
         family: browserFamily,
+        backendRef: backend.backendRef,
         toUrl: targetUrl,
       },
       nextAction: "Apply codex.browser_confirmation_policy and current user-authored task context. If this bounded task does not require confirmation, or its task-level verbal confirmation is already satisfied, call codex.browser_open_tab immediately with this actionApprovalRef. Do not ask merely because the legacy ref name contains Approval. Preparing did not open or navigate any tab.",
@@ -1873,10 +1879,9 @@ nodeRepl.write(JSON.stringify(__twPayload));
     }
 
     const browserFamily = normalizeBrowserFamily(prepared.family);
-    const familyLiteral = JSON.stringify(browserFamily);
     const targetUrlLiteral = JSON.stringify(prepared.targetUrl);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(prepared)}
 let __twTab = null;
 let __twPayload = null;
 let __twDispatchAttempted = false;
@@ -1970,8 +1975,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     }
 
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
-    const familyLiteral = JSON.stringify(browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const expectedUrlLiteral = JSON.stringify(state.url);
     const deltaY = (amount === "small" ? 400 : 800) * (direction === "down" ? 1 : -1);
@@ -1981,7 +1985,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     const keypresses = amount === "page" ? [keyName] : Array(6).fill(keyName);
     const keypressesLiteral = JSON.stringify(keypresses);
     const dispatch = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2100,13 +2104,12 @@ nodeRepl.write(JSON.stringify(__twPayload));
     }
 
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
-    const familyLiteral = JSON.stringify(browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const expectedUrlLiteral = JSON.stringify(state.url);
     const keyLiteral = JSON.stringify(key);
     const dispatch = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2231,7 +2234,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ["Call codex.browser_tabs for Chrome and use a fresh Chrome tabRef for the exact user-selected ChatGPT Web chat surface."]
       );
     }
-    await this.#requireReady(effectiveCwd, browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
     let initialUrl;
     try {
       initialUrl = new URL(state.url ?? "");
@@ -2266,13 +2269,12 @@ nodeRepl.write(JSON.stringify(__twPayload));
       existingConversation: initialUrl.pathname.includes("/c/"),
     };
 
-    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const expectedUrlLiteral = JSON.stringify(state.url);
     const probeTextLiteral = JSON.stringify(BROWSER_MODEL_ROUTE_PROBE_TEXT);
     const result = await this.#runJson(effectiveCwd, `
 ${BROWSER_MODEL_ROUTE_RUNTIME_PARSER_SOURCE}
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2644,11 +2646,10 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
-    const familyLiteral = JSON.stringify(browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2679,6 +2680,7 @@ nodeRepl.write(JSON.stringify({
       expectedUrl: currentUrl,
       targetUrl,
       cwd: effectiveCwd,
+      backendRef: state.backendRef,
       workbenchGeneration: state.workbenchGeneration,
       expiresAt,
     };
@@ -2728,7 +2730,8 @@ nodeRepl.write(JSON.stringify({
     }
     const state = this.#tabs.get(prepared.tabRef);
     const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
-    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
+    if (!state || state.backendRef !== prepared.backendRef
+      || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
         "The prepared navigation no longer matches a current Browser runtime tab or Browser family",
@@ -2736,12 +2739,11 @@ nodeRepl.write(JSON.stringify({
       );
     }
 
-    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const targetUrlLiteral = JSON.stringify(prepared.targetUrl);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(prepared)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2839,11 +2841,10 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
-    const familyLiteral = JSON.stringify(browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2884,6 +2885,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       family: browserFamily,
       providerTabId: state.providerTabId,
       url: current.url,
+      backendRef: state.backendRef,
       workbenchGeneration: state.workbenchGeneration,
       nodes,
     });
@@ -2921,11 +2923,10 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
-    const familyLiteral = JSON.stringify(browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -2961,6 +2962,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
           family: browserFamily,
           providerTabId: state.providerTabId,
           url: currentUrl,
+          backendRef: state.backendRef,
           workbenchGeneration: state.workbenchGeneration,
           nodes,
         },
@@ -2991,6 +2993,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       providerTabId: state.providerTabId,
       expectedUrl: currentUrl,
       cwd: effectiveCwd,
+      backendRef: state.backendRef,
       workbenchGeneration: state.workbenchGeneration,
       expiresAt,
     });
@@ -3027,6 +3030,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
     if (
       !state
+      || state.backendRef !== prepared.backendRef
       || state.providerTabId !== prepared.providerTabId
       || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily
       || prepared.workbenchGeneration !== this.#workbenchGeneration
@@ -3037,14 +3041,13 @@ nodeRepl.write(JSON.stringify(__twPayload));
         ["Refresh browser_tabs and rediscover the target instead of replaying the old action."]
       );
     }
-    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const rawNodeIdLiteral = JSON.stringify(prepared.rawNodeId);
     const fingerprintLiteral = JSON.stringify(prepared.fingerprint);
     const actionLiteral = JSON.stringify(prepared.action);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(prepared)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -3189,12 +3192,11 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
-    const familyLiteral = JSON.stringify(browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const clickLocatorSetupSource = browserClickLocatorSetupSource(clickTarget, { allowStableElementId });
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -3244,6 +3246,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       textBinding: clickTarget.kind === "text"
         ? browserTextBindingFromPrepareResult(result)
         : null,
+      backendRef: state.backendRef,
       workbenchGeneration: state.workbenchGeneration,
       expiresAt,
     };
@@ -3301,7 +3304,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
     }
     const state = this.#tabs.get(prepared.tabRef);
     const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
-    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
+    if (!state || state.backendRef !== prepared.backendRef
+      || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
         "The prepared click no longer matches a current Browser runtime tab or Browser family",
@@ -3309,7 +3313,6 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
 
-    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const clickLocatorSetupSource = browserClickLocatorSetupSource(prepared.target, {
@@ -3355,7 +3358,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
   if (__twFlairValue !== ${JSON.stringify(flairTemplateBinding.templateId)}) throw new Error("TOOLWIRE_BROWSER_CLICK_RESULT_UNCERTAIN:flair template selection not reflected after dispatch");`
       : "";
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(prepared)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -3496,7 +3499,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
     }
     const state = this.#tabs.get(prepared.tabRef);
     const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
-    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
+    if (!state || state.backendRef !== prepared.backendRef
+      || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
         "The prepared download no longer matches a current Browser runtime tab or Browser family",
@@ -3504,7 +3508,6 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
 
-    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const clickLocatorSetupSource = browserClickLocatorSetupSource(prepared.target, {
@@ -3512,7 +3515,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       allowStableElementId: false,
     });
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(prepared)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -3753,7 +3756,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
     }
     const state = this.#tabs.get(prepared.tabRef);
     const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
-    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
+    if (!state || state.backendRef !== prepared.backendRef
+      || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
         "The prepared upload no longer matches a current Browser runtime tab or Browser family",
@@ -3761,7 +3765,6 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
 
-    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const uploadPathLiteral = JSON.stringify(prepared.uploadFile.path);
@@ -3770,7 +3773,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       allowStableElementId: false,
     });
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(prepared)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -3977,12 +3980,11 @@ nodeRepl.write(JSON.stringify(__twPayload));
     }
 
     const browserFamily = normalizeBrowserFamily(state.family ?? "chrome");
-    await this.#requireReady(effectiveCwd, browserFamily);
-    const familyLiteral = JSON.stringify(browserFamily);
+    await this.#requireReady(effectiveCwd, browserFamily, state.backendRef);
     const providerLiteral = JSON.stringify(state.providerTabId);
     const fillLocatorSetupSource = browserFillLocatorSetupSource(fillTarget);
     const result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(state)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -4113,6 +4115,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
       editableBinding: { source: editableSource, kind: editableKind },
       nativePasswordBinding,
       targetMeta: result?.targetMeta ?? null,
+      backendRef: state.backendRef,
       workbenchGeneration: state.workbenchGeneration,
       expiresAt,
     };
@@ -4179,7 +4182,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
     }
     const state = this.#tabs.get(prepared.tabRef);
     const browserFamily = normalizeBrowserFamily(prepared.family ?? state?.family ?? "chrome");
-    if (!state || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
+    if (!state || state.backendRef !== prepared.backendRef
+      || state.providerTabId !== prepared.providerTabId || normalizeBrowserFamily(state.family ?? "chrome") !== browserFamily) {
       throw new BrowserPreviewError(
         "BROWSER_ACTION_TAB_STALE",
         "The prepared fill no longer matches a current Browser runtime tab or Browser family",
@@ -4187,7 +4191,6 @@ nodeRepl.write(JSON.stringify(__twPayload));
       );
     }
 
-    const familyLiteral = JSON.stringify(browserFamily);
     const providerLiteral = JSON.stringify(prepared.providerTabId);
     const expectedUrlLiteral = JSON.stringify(prepared.expectedUrl);
     const fillLocatorSetupSource = browserFillLocatorSetupSource(prepared.target);
@@ -4196,7 +4199,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     const nativePasswordBindingLiteral = JSON.stringify(prepared.nativePasswordBinding ?? null);
     const nativePasswordFillLiteral = JSON.stringify(Boolean(prepared.nativePasswordBinding));
     let result = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(prepared)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -4434,7 +4437,7 @@ nodeRepl.write(JSON.stringify(__twPayload));
     if (result?.phaseStatus === "activation_only") {
       const activation = result;
       const repair = await this.#runJson(effectiveCwd, `
-const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${familyLiteral});
+${this.#backendSource(prepared)}
 const __twOpenTabs = await __twBrowser.user.openTabs();
 const __twInfo = __twOpenTabs.find((tab) => tab.providerTabId === ${providerLiteral});
 if (!__twInfo) throw new Error("TOOLWIRE_BROWSER_TAB_STALE");
@@ -4770,54 +4773,92 @@ nodeRepl.write(JSON.stringify(__twPayload));
     return { status: "ok", skillPathResolved: Boolean(skillPath), chromePluginResolved: Boolean(pluginBuild), browserClientResolved: true };
   }
 
-  async #requireReady(cwd, family = "chrome") {
+  async #requireReady(cwd, family = "chrome", backendRef, operation = "listTabs") {
     const browserFamily = normalizeBrowserFamily(family);
     const dependency = await this.#dependencyStatus(cwd);
     if (dependency.status !== "ok") {
-      throw new BrowserPreviewError(
-        dependency.reason ?? "BROWSER_UNAVAILABLE",
-        `Browser dependencies are unavailable: ${dependency.reason ?? "unknown"}`,
-        dependency.nextActions ?? ["Call codex.browser_status for current diagnostics."]
-      );
+      throw new BrowserPreviewError(dependency.reason ?? "BROWSER_UNAVAILABLE", "Browser dependencies are unavailable", dependency.nextActions ?? []);
     }
     const backends = await this.#listBackends(cwd);
-    const familyBackends = backends.filter((backend) => backend.family === browserFamily);
-    if (familyBackends.length === 0) {
-      throw new BrowserPreviewError(
-        "BROWSER_FAMILY_NOT_CONNECTED",
-        `The Codex Browser runtime is available but no connected ${browserFamily} extension/backend is visible`,
-        [
-          `Open ${browserFamily} with the supported Codex Browser extension/runtime enabled, then retry.`,
-          "Call codex.browser_status to distinguish Browser setup from site login state.",
-        ]
-      );
-    }
-    if (familyBackends.length > 1) {
-      if (browserFamily === "chrome") {
-        const ambiguous = chromeBackendAmbiguous(backends, familyBackends);
-        throw new BrowserPreviewError(ambiguous.reason, ambiguous.error, ambiguous.nextActions, {
-          connectedBrowsers: ambiguous.connectedBrowsers,
-        });
+    if (backendRef !== undefined) {
+      if (typeof backendRef !== "string" || !backendRef.startsWith("browser_backend_")) {
+        throw new BrowserPreviewError("BROWSER_BACKEND_REF_INVALID", "Use an opaque backendRef from codex.browser_status; provider IDs and profile names are not selectors");
       }
-      throw new BrowserPreviewError(
-        "BROWSER_FAMILY_BACKEND_AMBIGUOUS",
-        `Multiple connected ${browserFamily} Browser backends are visible and Codexless has no profile/backend selector`,
-        ["Do not guess a backend/profile. Leave only one backend for the requested family connected, then retry."],
-        { connectedBrowsers: backends.map(sanitizeBackend), family: browserFamily }
-      );
+      const backend = this.#backends.get(backendRef);
+      if (!backend) throw new BrowserPreviewError("BROWSER_BACKEND_REF_STALE", "The backendRef expired or its backend disappeared; refresh codex.browser_status");
+      if (backend.family !== browserFamily) throw new BrowserPreviewError("BROWSER_BACKEND_FAMILY_MISMATCH", "backendRef does not belong to the requested browser family");
+      if (!backend.supported || !backend.capabilities[operation]) {
+        throw new BrowserPreviewError("BROWSER_OPERATION_UNSUPPORTED", "The selected backend does not support this Codexless operation", [], { backend: sanitizeBackend(backend), operation });
+      }
+      return backend;
     }
+    const candidates = backends.filter((backend) => backend.family === browserFamily && backend.supported && backend.capabilities[operation]);
+    if (!candidates.length) {
+      const visible = backends.filter((backend) => backend.family === browserFamily);
+      throw new BrowserPreviewError(visible.length ? "BROWSER_OPERATION_UNSUPPORTED" : "BROWSER_FAMILY_NOT_CONNECTED", "No compatible backend is available for this operation", [], { family: browserFamily, operation, connectedBrowsers: visible.map(sanitizeBackend) });
+    }
+    if (candidates.length > 1) {
+      throw new BrowserPreviewError("BROWSER_FAMILY_BACKEND_AMBIGUOUS", "Multiple compatible backends are connected; select one exact backendRef", ["Do not guess a profile. Use a backendRef from codex.browser_status."], { family: browserFamily, connectedBrowsers: candidates.map(sanitizeBackend) });
+    }
+    return candidates[0];
   }
 
+  // Identity stays private and session-scoped; names are display data only.
   async #listBackends(cwd) {
+    const inventoryGeneration = this.#workbenchGeneration;
     const result = await this.#runJson(cwd, `
 const __twBackends = await globalThis.__toolwireBrowserAgent.browsers.list();
-nodeRepl.write(JSON.stringify(__twBackends.map((backend) => ({
-  name: backend.name ?? null,
-  family: backend.family ?? null,
-  type: backend.type ?? null,
-}))));
+if (!Array.isArray(__twBackends) || __twBackends.length > 64) throw new Error("TOOLWIRE_BROWSER_BACKEND_INVENTORY_INVALID");
+const __twInventory = [];
+for (const backend of __twBackends) {
+  const supported = typeof backend.id === "string" && backend.id.length > 0 && backend.type === "extension" && ["chrome", "edge"].includes(backend.family);
+  let capabilities = { listTabs: false, claimTabs: false, openTab: false, explicitRelease: false };
+  if (supported) {
+    const browser = await globalThis.__toolwireBrowserAgent.browsers.get(backend.id);
+    if (browser?.browserId !== backend.id) throw new Error("TOOLWIRE_BROWSER_BACKEND_REF_STALE");
+    capabilities = {
+      listTabs: typeof browser?.user?.openTabs === "function",
+      claimTabs: typeof browser?.user?.claimTab === "function",
+      openTab: typeof browser?.tabs?.new === "function",
+      explicitRelease: typeof browser?.tabs?.finalize === "function",
+    };
+  }
+  __twInventory.push({ id: backend.id ?? null, name: backend.name ?? null, family: backend.family ?? null, profileName: backend.profileName ?? null, type: backend.type ?? null, metadata: { extensionInstanceId: backend.metadata?.extensionInstanceId ?? null, codexSessionId: backend.metadata?.codexSessionId ?? null }, capabilities });
+}
+nodeRepl.write(JSON.stringify(__twInventory));
 `, "Check connected browser backends");
-    return Array.isArray(result) ? result.map(sanitizeBackend) : [];
+    if (inventoryGeneration !== this.#workbenchGeneration) throw new BrowserPreviewError("BROWSER_WORKBENCH_RESTARTED", "Backend inventory belongs to an older Browser runtime; rediscover it");
+    if (!Array.isArray(result) || result.length > 64) throw new BrowserPreviewError("BROWSER_PROTOCOL_ERROR", "Invalid or unbounded Browser backend inventory");
+    const next = new Map();
+    const seen = new Set();
+    const previousByIdentity = new Map([...this.#backends.values()].map((backend) => [backend.identity, backend]));
+    for (const raw of result) {
+      if (typeof raw?.id !== "string" || !raw.id || seen.has(raw.id)) throw new BrowserPreviewError("BROWSER_PROTOCOL_ERROR", "Browser inventory requires unique exact backend IDs");
+      seen.add(raw.id);
+      const identity = JSON.stringify([raw.id, raw.family ?? null, raw.type ?? null, raw.metadata?.extensionInstanceId ?? null, raw.metadata?.codexSessionId ?? null]);
+      const previous = previousByIdentity.get(identity);
+      const backend = { ...raw, identity, backendRef: previous?.backendRef ?? `browser_backend_${randomUUID()}`, workbenchGeneration: this.#workbenchGeneration,
+        supported: raw.type === "extension" && ["chrome", "edge"].includes(raw.family),
+        capabilities: Object.fromEntries(["listTabs", "claimTabs", "openTab", "explicitRelease"].map((key) => [key, raw.capabilities?.[key] === true])) };
+      next.set(backend.backendRef, backend);
+    }
+    this.#backends = next;
+    return [...next.values()];
+  }
+
+  #backendSource(binding) {
+    const backend = this.#backends.get(binding?.backendRef);
+    if (!backend || binding.workbenchGeneration !== this.#workbenchGeneration || backend.family !== binding.family) {
+      throw new BrowserPreviewError("BROWSER_BACKEND_REF_STALE", "Backend binding is stale; refresh codex.browser_status/browser_tabs");
+    }
+    return `
+const __twBackendMatches = (await globalThis.__toolwireBrowserAgent.browsers.list()).filter((backend) => backend.id === ${JSON.stringify(backend.id)});
+if (__twBackendMatches.length !== 1) throw new Error("TOOLWIRE_BROWSER_BACKEND_REF_STALE");
+const __twBackend = __twBackendMatches[0];
+if (JSON.stringify([__twBackend.id, __twBackend.family ?? null, __twBackend.type ?? null, __twBackend.metadata?.extensionInstanceId ?? null, __twBackend.metadata?.codexSessionId ?? null]) !== ${JSON.stringify(backend.identity)}) throw new Error("TOOLWIRE_BROWSER_BACKEND_REF_STALE");
+const __twBrowser = await globalThis.__toolwireBrowserAgent.browsers.get(${JSON.stringify(backend.id)});
+if (__twBrowser.browserId !== ${JSON.stringify(backend.id)}) throw new Error("TOOLWIRE_BROWSER_BACKEND_REF_STALE");
+`;
   }
 
   async #runJson(cwd, body, title, { mutationKind = null, expectedGeneration = null } = {}) {
@@ -4846,13 +4887,31 @@ if (globalThis.__toolwireBrowserAgent?.browsers == null) {
   globalThis.__toolwireBrowserAgent = await setupBrowserRuntime();
 }
 `;
+    const requireMethodsSource = `
+function __twRequireMethods(object, paths, preDispatch = false) {
+  for (const path of paths) {
+    const value = path.split(".").reduce((current, key) => current?.[key], object);
+    if (typeof value !== "function") throw new Error((preDispatch ? "TOOLWIRE_BROWSER_OPERATION_UNSUPPORTED_PRE_DISPATCH:" : "TOOLWIRE_BROWSER_OPERATION_UNSUPPORTED:") + path);
+  }
+}
+`;
+    const browserMethods = [
+      ...(body.includes("__twBrowser.user.openTabs(") ? ["user.openTabs"] : []),
+      ...(body.includes("__twBrowser.user.claimTab(") ? ["user.claimTab"] : []),
+      ...(body.includes("__twBrowser.tabs.new(") ? ["tabs.new"] : []),
+    ];
+    const tabMethods = [...new Set([...body.matchAll(/__twTab\.((?:playwright\.|dom_cua\.|cua\.|capabilities\.)?\w+)\(/g)].map((match) => match[1]))];
+    const capabilityCheckedBody = body
+      .replace(/(const __twBrowser = await globalThis\.__toolwireBrowserAgent\.browsers\.get\([^\n]+\);)/g, (line) => line + "\n__twRequireMethods(__twBrowser, " + JSON.stringify(browserMethods) + ", true);")
+      .replaceAll("__twTab = await __twBrowser.user.claimTab(__twInfo);", "__twTab = await __twBrowser.user.claimTab(__twInfo);\n  __twRequireMethods(__twTab, " + JSON.stringify(tabMethods) + ", " + (body.includes("let __twDispatchAttempted") ? "!__twDispatchAttempted" : "true") + ");")
+      .replaceAll("__twTab = await __twBrowser.tabs.new();", "__twTab = await __twBrowser.tabs.new();\n  __twRequireMethods(__twTab, " + JSON.stringify(tabMethods) + ");");
     const lifecycleAdapterSource = body.includes("markBrowserDeliverable(") || body.includes("cleanupBrowserClaim(")
       ? `${BROWSER_LIFECYCLE_ADAPTER_SOURCE}\n`
       : "";
-    const snapshotAwareBody = body.includes("await __twTab.playwright.domSnapshot()")
-      ? body.replaceAll("await __twTab.playwright.domSnapshot()", "await sanitizeBrowserDomSnapshot(__twTab)")
-      : body;
-    const snapshotSanitizerSource = snapshotAwareBody !== body
+    const snapshotAwareBody = capabilityCheckedBody.includes("await __twTab.playwright.domSnapshot()")
+      ? capabilityCheckedBody.replaceAll("await __twTab.playwright.domSnapshot()", "await sanitizeBrowserDomSnapshot(__twTab)")
+      : capabilityCheckedBody;
+    const snapshotSanitizerSource = snapshotAwareBody !== capabilityCheckedBody
       ? `${BROWSER_PASSWORD_SNAPSHOT_SANITIZER_SOURCE}\n`
       : "";
     let response;
@@ -4861,7 +4920,7 @@ if (globalThis.__toolwireBrowserAgent?.browsers == null) {
         server: NODE_REPL_SERVER,
         tool: NODE_REPL_TOOL,
         cwd: this.#runtimeCwd,
-        arguments: { code: `${bootstrap}\n{\n${lifecycleAdapterSource}${snapshotSanitizerSource}${snapshotAwareBody}\n}`, title },
+        arguments: { code: `${bootstrap}\n{\n${requireMethodsSource}${lifecycleAdapterSource}${snapshotSanitizerSource}${snapshotAwareBody}\n}`, title },
         meta: this.#nextTurnMeta(),
         expectedGeneration: dispatchGeneration,
       });
@@ -4897,7 +4956,8 @@ if (globalThis.__toolwireBrowserAgent?.browsers == null) {
       const classified = classifyBrowserError(new Error(response?.text ?? "node_repl browser call failed"));
       if (classified.code === "BROWSER_TAB_BUSY") throw classified;
       const definitiveMutationResponse = typeof classified?.code === "string"
-        && (classified.code.endsWith("_RESULT_UNCERTAIN") || BROWSER_MUTATION_DEFINITIVE_RESPONSE_CODES.has(classified.code));
+        && (classified.code.endsWith("_RESULT_UNCERTAIN") || BROWSER_MUTATION_DEFINITIVE_RESPONSE_CODES.has(classified.code)
+          || (classified.code === "BROWSER_OPERATION_UNSUPPORTED" && classified.diagnostic?.preDispatch === true));
       if (mutationKind && !definitiveMutationResponse) {
         throw browserMutationResultUncertain(
           mutationKind,
@@ -5060,9 +5120,14 @@ function deriveBrowserClientUrl(skillPath) {
 
 function sanitizeBackend(backend) {
   return {
+    backendRef: backend?.backendRef ?? null,
     name: stringOrNull(backend?.name),
     family: stringOrNull(backend?.family),
+    profileName: stringOrNull(backend?.profileName),
     type: stringOrNull(backend?.type),
+    supported: backend?.supported === true,
+    capabilities: backend?.capabilities ?? {},
+    tabOperations: "feature_checked_on_claim",
   };
 }
 
@@ -5079,6 +5144,7 @@ function publicTab(state) {
   return {
     tabRef: state.tabRef,
     family: state.family ?? "chrome",
+    backendRef: state.backendRef,
     title: state.title,
     url: state.url,
     lastOpened: state.lastOpened,
@@ -5927,21 +5993,6 @@ function browserUnavailable(error) {
   };
 }
 
-function chromeBackendAmbiguous(backends, chromeBackends) {
-  return {
-    status: "unavailable",
-    reason: "BROWSER_CHROME_BACKEND_AMBIGUOUS",
-    error: `The Codex Browser runtime reports ${chromeBackends.length} Chrome-family backends, but the current upstream API exposes only browsers.get(\"chrome\") and no profile/backend selector.`,
-    chromeSkill: "ok",
-    nodeRepl: "ok",
-    connectedBrowsers: backends.map(sanitizeBackend),
-    nextActions: [
-      "Keep exactly one intended Chrome Browser backend active, then call codex.browser_status again.",
-      "Do not guess a Chrome profile or backend index; the current upstream Browser API does not expose a supported selector for it.",
-    ],
-  };
-}
-
 function browserMutationResultUncertain(kind, message) {
   const normalizedKind = ["fill", "navigate", "open_tab", "close_tab", "bulk_close_tab", "scroll", "keypress", "download", "upload", "model_route_probe", "webmcp_call"].includes(kind) ? kind : "click";
   const errorCode = normalizedKind === "model_route_probe"
@@ -6027,6 +6078,8 @@ function browserPermissionDiagnostic(message, source) {
 function classifyBrowserError(error) {
   if (error instanceof BrowserPreviewError) return error;
   const message = error instanceof Error ? error.message : String(error);
+  if (!/RESULT_UNCERTAIN/.test(message) && /TOOLWIRE_BROWSER_BACKEND_REF_STALE/.test(message)) return new BrowserPreviewError("BROWSER_BACKEND_REF_STALE", "The exact backend disappeared or changed; refresh backend and tab refs");
+  if (!/RESULT_UNCERTAIN/.test(message) && /TOOLWIRE_BROWSER_OPERATION_UNSUPPORTED/.test(message)) return new BrowserPreviewError("BROWSER_OPERATION_UNSUPPORTED", "A required documented Browser method is unavailable on the selected backend/tab", [], { preDispatch: /OPERATION_UNSUPPORTED_PRE_DISPATCH/.test(message) });
   const savedPermissionDenied = /\bbrowser-use-persisted-state\b/i.test(message)
     || /\bpersisted_user_denied\b/i.test(message)
     || /the user has a saved preference that blocks it\.?/i.test(message);

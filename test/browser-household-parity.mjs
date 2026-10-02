@@ -778,7 +778,7 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
       }
       if (/^Execute prepared (Chrome|Edge) new tab$/.test(title)) {
         const family = title.includes("Edge") ? "edge" : "chrome";
-        assert.ok(code.includes(`browsers.get(${JSON.stringify(family)})`), "new-tab dispatch must use the prepared browser family");
+        assert.ok(code.includes(`browsers.get(${JSON.stringify(`fixture-${family}-${state.browserBackends.findIndex((backend) => backend.family === family)}`)})`), "new-tab dispatch must use the prepared browser family");
         assert.match(code, /\.tabs\.new\(\)/);
         assert.match(code, /\.goto\(/);
         assert.match(code, /markBrowserDeliverable\(__twBrowser, __twTab\)/, "new-tab cleanup must route through the normalized lifecycle adapter");
@@ -1401,10 +1401,10 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
           }),
         };
       }
-      if (code.includes("browsers.list")) {
+      if (title === "Check connected browser backends") {
         return {
           isError: false,
-          text: JSON.stringify(state.browserBackends),
+          text: JSON.stringify(state.browserBackends.map((backend, index) => ({ ...backend, id: backend.id ?? `fixture-${backend.family}-${index}`, capabilities: { listTabs: true, claimTabs: true, openTab: true, explicitRelease: true } }))),
         };
       }
       if (title === "Discover opaque Browser elements" || title === "Prepare opaque Browser element action") {
@@ -2245,8 +2245,8 @@ test("Browser tab listing thin-projects the stock Edge family and keeps opaque r
   const browserGetCalls = workbench.calls
     .filter((call) => call.arguments?.title === "List current Chrome tabs")
     .map((call) => call.arguments.code);
-  assert.ok(browserGetCalls.some((code) => code.includes('browsers.get("chrome")')));
-  assert.ok(browserGetCalls.some((code) => code.includes('browsers.get("edge")')));
+  assert.ok(browserGetCalls.some((code) => code.includes('browsers.get("fixture-chrome-0")')));
+  assert.ok(browserGetCalls.some((code) => code.includes('browsers.get("fixture-edge-1")')));
 
   const preparedEdgeNavigate = await browser.prepareNavigate({
     tabRef: edge.tabs[0].tabRef,
@@ -2256,8 +2256,8 @@ test("Browser tab listing thin-projects the stock Edge family and keeps opaque r
   const prepareNavigateCode = [...workbench.calls]
     .reverse()
     .find((call) => call.arguments?.title === "Prepare exact Chrome navigation")?.arguments?.code ?? "";
-  assert.match(prepareNavigateCode, /browsers\.get\("edge"\)/, "an Edge opaque ref must prepare against the Edge family even when Chrome exposes the same provider id");
-  assert.doesNotMatch(prepareNavigateCode, /browsers\.get\("chrome"\)/, "Edge prepare must never cross-resolve the colliding provider id through Chrome");
+  assert.match(prepareNavigateCode, /browsers\.get\("fixture-edge-1"\)/, "an Edge opaque ref must prepare against the Edge family even when Chrome exposes the same provider id");
+  assert.doesNotMatch(prepareNavigateCode, /browsers\.get\("fixture-chrome-0"\)/, "Edge prepare must never cross-resolve the colliding provider id through Chrome");
 
   const navigatedEdge = await browser.navigate({ actionApprovalRef: preparedEdgeNavigate.actionApprovalRef });
   assert.equal(navigatedEdge.status, "navigated");
@@ -2266,8 +2266,8 @@ test("Browser tab listing thin-projects the stock Edge family and keeps opaque r
   const executeNavigateCode = [...workbench.calls]
     .reverse()
     .find((call) => call.arguments?.title === "Execute prepared Chrome navigation")?.arguments?.code ?? "";
-  assert.match(executeNavigateCode, /browsers\.get\("edge"\)/, "prepared Edge operate dispatch must stay in the family sealed into the ref");
-  assert.doesNotMatch(executeNavigateCode, /browsers\.get\("chrome"\)/, "prepared Edge operate must not be misdirected to Chrome");
+  assert.match(executeNavigateCode, /browsers\.get\("fixture-edge-1"\)/, "prepared Edge operate dispatch must stay in the family sealed into the ref");
+  assert.doesNotMatch(executeNavigateCode, /browsers\.get\("fixture-chrome-0"\)/, "prepared Edge operate must not be misdirected to Chrome");
 });
 
 test("Browser WebMCP thin projection reuses one stock fetched handle and exposes no registration identity", async () => {
@@ -2418,8 +2418,8 @@ test("Browser WebMCP follows the server-bound Edge family and accepts no execute
   const discoverCode = [...workbench.calls]
     .reverse()
     .find((call) => call.arguments?.title === "Discover current Browser WebMCP tools")?.arguments?.code ?? "";
-  assert.match(discoverCode, /browsers\.get\("edge"\)/);
-  assert.doesNotMatch(discoverCode, /browsers\.get\("chrome"\)/);
+  assert.match(discoverCode, /browsers\.get\("fixture-edge-1"\)/);
+  assert.doesNotMatch(discoverCode, /browsers\.get\("fixture-chrome-0"\)/);
 
   const called = await browser.callWebMcp({
     webMcpRef: discovered.webMcpRef,
@@ -2431,8 +2431,8 @@ test("Browser WebMCP follows the server-bound Edge family and accepts no execute
   const callCode = [...workbench.calls]
     .reverse()
     .find((call) => call.arguments?.title === "Call current Browser WebMCP tool")?.arguments?.code ?? "";
-  assert.match(callCode, /browsers\.get\("edge"\)/);
-  assert.doesNotMatch(callCode, /browsers\.get\("chrome"\)/);
+  assert.match(callCode, /browsers\.get\("fixture-edge-1"\)/);
+  assert.doesNotMatch(callCode, /browsers\.get\("fixture-chrome-0"\)/);
 });
 
 test("Browser password snapshot sanitizer redacts password nodes while preserving ordinary textbox/searchbox content and targeting metadata", () => {
@@ -2528,7 +2528,7 @@ test("Browser read and post-scroll readback share the server-side password snaps
   assert.match(scrolled.snapshot, /textbox "Search" \[ref=e21\]: keep-this-query/);
 });
 
-test("Browser backend topology accepts Chrome plus Edge but fails visibly on multiple Chrome backends without inventing a profile selector", async () => {
+test("Browser backend topology accepts Chrome plus Edge but requires explicit selection when multiple Chrome backends are connected", async () => {
   const mixedWorkbench = makeWorkbench({
     browserBackends: [
       { name: "Chrome", family: "chrome", type: "extension" },
@@ -2549,12 +2549,11 @@ test("Browser backend topology accepts Chrome plus Edge but fails visibly on mul
   });
   const ambiguousBrowser = new CodexBrowserExecutor({ workbench: ambiguousWorkbench, defaultCwd: "C:\\workspace" });
   const ambiguousStatus = await ambiguousBrowser.status({});
-  assert.equal(ambiguousStatus.status, "unavailable");
-  assert.equal(ambiguousStatus.reason, "BROWSER_CHROME_BACKEND_AMBIGUOUS");
-  assert.match(ambiguousStatus.error, /no profile\/backend selector/i);
-  assert.match(ambiguousStatus.nextActions.join(" "), /Do not guess/i);
+  assert.equal(ambiguousStatus.status, "ok");
+  assert.equal(ambiguousStatus.selectionRequired, true);
+  assert.equal(ambiguousStatus.connectedBrowsers.length, 2);
   await assert.rejects(() => ambiguousBrowser.listTabs({}), (error) => {
-    assert.equal(error.code, "BROWSER_CHROME_BACKEND_AMBIGUOUS");
+    assert.equal(error.code, "BROWSER_FAMILY_BACKEND_AMBIGUOUS");
     return true;
   });
 });
