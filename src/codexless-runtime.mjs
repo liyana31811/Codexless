@@ -92,17 +92,42 @@ export async function configuredMcpServerNamesForBrowser(workbench, { cwd } = {}
 
 export function browserMcpIsolationOverrides({
   configuredMcpServerNames = [],
+  configuredMcpServers = {},
+  pluginMcpServers = [],
   nodeReplConfig = null,
   browserAvailable = true,
 } = {}) {
-  const overrides = [];
+  const isolated = Object.create(null);
+  for (const name of uniqueMcpServerNames([...Object.keys(configuredMcpServers), ...configuredMcpServerNames])) {
+    if (browserAvailable && name === "node_repl" && nodeReplConfig) {
+      isolated.node_repl = nodeReplConfig;
+      continue;
+    }
+    const definition = configuredMcpServers[name];
+    if (!definition || typeof definition !== "object" || Array.isArray(definition) ||
+        !(typeof definition.command === "string" && definition.command || typeof definition.url === "string" && definition.url)) {
+      throw new Error(`Browser MCP isolation requires a complete transport definition for ${name}`);
+    }
+    isolated[name] = { ...definition, enabled: false };
+  }
   if (browserAvailable && nodeReplConfig && typeof nodeReplConfig === "object" && !Array.isArray(nodeReplConfig)) {
-    overrides.push(`mcp_servers=${tomlValue({ node_repl: nodeReplConfig })}`);
+    isolated.node_repl = nodeReplConfig;
   }
-  for (const name of uniqueMcpServerNames(configuredMcpServerNames)) {
+  // CLI tables deep-merge with user config. Pin complete disabled definitions so
+  // removing a root transport later cannot turn its launch override into a stub.
+  const overrides = [`mcp_servers=${tomlValue(isolated)}`];
+  const plugins = Object.create(null);
+  for (const { name, pluginId } of pluginMcpServers) {
     if (browserAvailable && name === "node_repl") continue;
-    overrides.push(`mcp_servers.${tomlKey(name)}.enabled=false`);
+    if (typeof name !== "string" || !name || typeof pluginId !== "string" || !pluginId) {
+      throw new Error("Browser MCP isolation requires plugin server provenance");
+    }
+    plugins[pluginId] ??= { mcp_servers: Object.create(null) };
+    plugins[pluginId].mcp_servers[name] = { enabled: false };
   }
+  // A plugin policy does not manufacture a root MCP transport. Inline table
+  // keys also preserve dotted names and plugin IDs exactly in the CLI parser.
+  if (Object.keys(plugins).length) overrides.push(`plugins=${tomlValue(plugins)}`);
   return overrides;
 }
 
@@ -110,12 +135,14 @@ export function buildBrowserConfigOverrides({
   configOverrides = [],
   compatibilityOverrides = [],
   configuredMcpServerNames = [],
+  configuredMcpServers = {},
+  pluginMcpServers = [],
   nodeReplConfig = null,
   browserAvailable = true,
 } = {}) {
   return [
     ...configOverrides,
-    ...browserMcpIsolationOverrides({ configuredMcpServerNames, nodeReplConfig, browserAvailable }),
+    ...browserMcpIsolationOverrides({ configuredMcpServerNames, configuredMcpServers, pluginMcpServers, nodeReplConfig, browserAvailable }),
     ...(browserAvailable ? compatibilityOverrides : []),
   ];
 }
@@ -329,14 +356,15 @@ export async function createCodexlessRuntime({
         let browserWorkbenchCwd = defaultCwd;
         let browserWorkbenchOverrides = configOverrides;
         if (privateConstruction || publicPreview) {
-          const [nodeReplConfig, currentChromeSkill, currentChromePlugin, configuredMcpServerNames] = await Promise.all([
-            workbench.configuredMcpServer({ name: "node_repl", cwd: defaultCwd }).catch(() => null),
+          const [configuredMcpServers, pluginMcpServers, currentChromeSkill, currentChromePlugin] = await Promise.all([
+            workbench.configuredMcpServers({ cwd: defaultCwd }),
+            workbench.configuredMcpPluginServers(),
             workbench.currentChromeSkill({ cwd: defaultCwd }).catch(() => null),
             typeof workbench.currentChromePlugin === "function"
               ? workbench.currentChromePlugin({ cwd: defaultCwd }).catch(() => null)
               : Promise.resolve(null),
-            configuredMcpServerNamesForBrowser(workbench, { cwd: defaultCwd }),
           ]);
+          let nodeReplConfig = configuredMcpServers.node_repl ? structuredClone(configuredMcpServers.node_repl) : null;
           browserRuntimeCompatibility = await resolveBrowserRuntimeCompatibility({
             codexBin,
             chromeSkillPath: currentChromeSkill?.path ?? null,
@@ -347,7 +375,8 @@ export async function createCodexlessRuntime({
           browserWorkbenchOverrides = buildBrowserConfigOverrides({
             configOverrides,
             compatibilityOverrides: browserRuntimeCompatibility.overrides,
-            configuredMcpServerNames,
+            configuredMcpServers,
+            pluginMcpServers,
             nodeReplConfig,
             browserAvailable,
           });
@@ -433,14 +462,15 @@ export async function createCodexlessRuntime({
             let browserWorkbenchCwd = defaultCwd;
             let browserWorkbenchOverrides = configOverrides;
             if (privateConstruction || publicPreview) {
-              const [nodeReplConfig, currentChromeSkill, currentChromePlugin, configuredMcpServerNames] = await Promise.all([
-                existingWorkbench.configuredMcpServer({ name: "node_repl", cwd: defaultCwd }).catch(() => null),
+              const [configuredMcpServers, pluginMcpServers, currentChromeSkill, currentChromePlugin] = await Promise.all([
+                existingWorkbench.configuredMcpServers({ cwd: defaultCwd }),
+                existingWorkbench.configuredMcpPluginServers(),
                 existingWorkbench.currentChromeSkill({ cwd: defaultCwd }).catch(() => null),
                 typeof existingWorkbench.currentChromePlugin === "function"
                   ? existingWorkbench.currentChromePlugin({ cwd: defaultCwd }).catch(() => null)
                   : Promise.resolve(null),
-                configuredMcpServerNamesForBrowser(existingWorkbench, { cwd: defaultCwd }),
               ]);
+              let nodeReplConfig = configuredMcpServers.node_repl ? structuredClone(configuredMcpServers.node_repl) : null;
               compatibility = await resolveBrowserRuntimeCompatibility({
                 codexBin: existing.path,
                 chromeSkillPath: currentChromeSkill?.path ?? null,
@@ -451,7 +481,8 @@ export async function createCodexlessRuntime({
               browserWorkbenchOverrides = buildBrowserConfigOverrides({
                 configOverrides,
                 compatibilityOverrides: compatibility.overrides,
-                configuredMcpServerNames,
+                configuredMcpServers,
+                pluginMcpServers,
                 nodeReplConfig,
                 browserAvailable,
               });

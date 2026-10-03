@@ -1,5 +1,6 @@
 import path from "node:path";
 import { CodexAppServerClient } from "./codex-app-server-client.mjs";
+import { listAllMcpServerStatus } from "./mcp-status-pagination.mjs";
 import { readPreviewAccountPreflight } from "./codex-preview-account-preflight.mjs";
 import {
   StockPromptInputSkillRoutingCore,
@@ -158,20 +159,34 @@ export class CodexPublicContextExecutor {
     return (result?.data ?? []).flatMap((row) => row?.skills ?? []);
   }
 
-  async configuredMcpServerNames({ cwd = this.#defaultCwd } = {}) {
+  async configuredMcpServers({ cwd = this.#defaultCwd } = {}) {
     const effectiveCwd = path.resolve(cwd);
     const configRead = await this.#request("config/read", { cwd: effectiveCwd, includeLayers: false });
     const config = configRead?.config ?? {};
     const servers = config?.mcp_servers ?? config?.mcpServers ?? {};
-    return Object.keys(servers).filter((name) => typeof name === "string" && name);
+    if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+      throw new Error("config/read returned invalid MCP server definitions");
+    }
+    return structuredClone(servers);
+  }
+
+  async configuredMcpPluginServers() {
+    const result = await listAllMcpServerStatus(
+      (params) => this.#request("mcpServerStatus/list", params),
+      { detail: "toolsAndAuthOnly", limit: 50 }
+    );
+    return result.data
+      .filter((server) => typeof server?.pluginId === "string" && server.pluginId && typeof server?.name === "string" && server.name)
+      .map((server) => ({ name: server.name, pluginId: server.pluginId }));
+  }
+
+  async configuredMcpServerNames(options = {}) {
+    return Object.keys(await this.configuredMcpServers(options));
   }
 
   async configuredMcpServer({ name, cwd = this.#defaultCwd } = {}) {
     if (typeof name !== "string" || !name) throw new Error("configuredMcpServer requires a non-empty name");
-    const effectiveCwd = path.resolve(cwd);
-    const configRead = await this.#request("config/read", { cwd: effectiveCwd, includeLayers: false });
-    const config = configRead?.config ?? {};
-    const servers = config?.mcp_servers ?? config?.mcpServers ?? {};
+    const servers = await this.configuredMcpServers({ cwd });
     const value = servers?.[name];
     return value && typeof value === "object" && !Array.isArray(value) ? structuredClone(value) : null;
   }

@@ -40,18 +40,47 @@ function tomlValue(value) {
   throw new Error(`unsupported Browser MCP config value type: ${typeof value}`);
 }
 
-export function browserMcpIsolationOverride(nodeReplConfig) {
-  const isolated = nodeReplConfig && typeof nodeReplConfig === "object" && !Array.isArray(nodeReplConfig)
-    ? { node_repl: nodeReplConfig }
-    : {};
+function disabledMcpDefinition(name, definition) {
+  if (!definition || typeof definition !== "object" || Array.isArray(definition) ||
+      !(typeof definition.command === "string" && definition.command || typeof definition.url === "string" && definition.url)) {
+    throw new Error(`Browser MCP isolation requires a complete transport definition for ${name}`);
+  }
+  return { ...definition, enabled: false };
+}
+
+export function browserMcpIsolationOverride(nodeReplConfig, { configuredMcpServers = {}, browserAvailable = true } = {}) {
+  const isolated = Object.create(null);
+  for (const [name, definition] of Object.entries(configuredMcpServers)) {
+    if (browserAvailable && name === "node_repl" && nodeReplConfig) {
+      isolated.node_repl = nodeReplConfig;
+      continue;
+    }
+    isolated[name] = disabledMcpDefinition(name, definition);
+  }
+  if (browserAvailable && nodeReplConfig && typeof nodeReplConfig === "object" && !Array.isArray(nodeReplConfig)) {
+    isolated.node_repl = nodeReplConfig;
+  }
   return `mcp_servers=${tomlValue(isolated)}`;
 }
 
-export function browserMcpDisableOverrides(serverNames = [], { keep = null } = {}) {
+export function browserMcpDisableOverrides(serverNames = [], { keep = null, configuredMcpServers = {} } = {}) {
   const unique = [...new Set(serverNames.filter((name) => typeof name === "string" && name))];
   return unique
     .filter((name) => name !== keep)
-    .map((name) => `mcp_servers.${tomlKey(name)}.enabled=false`);
+    .map((name) => `mcp_servers=${tomlValue({ [name]: disabledMcpDefinition(name, configuredMcpServers[name]) })}`);
+}
+
+function browserPluginMcpIsolationOverride(pluginMcpServers, { keep = null } = {}) {
+  const plugins = Object.create(null);
+  for (const { name, pluginId } of pluginMcpServers) {
+    if (name === keep) continue;
+    if (typeof name !== "string" || !name || typeof pluginId !== "string" || !pluginId) {
+      throw new Error("Browser MCP isolation requires plugin server provenance");
+    }
+    plugins[pluginId] ??= { mcp_servers: Object.create(null) };
+    plugins[pluginId].mcp_servers[name] = { enabled: false };
+  }
+  return Object.keys(plugins).length ? [`plugins=${tomlValue(plugins)}`] : [];
 }
 
 export function buildBrowserConfigOverrides({
@@ -59,12 +88,18 @@ export function buildBrowserConfigOverrides({
   compatibilityOverrides = [],
   nodeReplConfig = null,
   configuredMcpServerNames = [],
+  configuredMcpServers = {},
+  pluginMcpServers = [],
   browserAvailable = true,
 } = {}) {
+  for (const name of configuredMcpServerNames) {
+    if (browserAvailable && name === "node_repl" && nodeReplConfig) continue;
+    disabledMcpDefinition(name, configuredMcpServers[name]);
+  }
   return [
     ...configOverrides,
-    browserMcpIsolationOverride(browserAvailable ? nodeReplConfig : null),
-    ...browserMcpDisableOverrides(configuredMcpServerNames, { keep: browserAvailable ? "node_repl" : null }),
+    browserMcpIsolationOverride(nodeReplConfig, { configuredMcpServers, browserAvailable }),
+    ...browserPluginMcpIsolationOverride(pluginMcpServers, { keep: browserAvailable ? "node_repl" : null }),
     ...(browserAvailable ? compatibilityOverrides : []),
   ];
 }
@@ -123,11 +158,12 @@ export async function createPublicRuntime({ env = process.env } = {}) {
       runtimeKind: STOCK_RUNTIME_KIND,
     });
     await publicContext.start();
-    const [nodeReplConfig, configuredMcpServerNames, currentChromeSkill] = await Promise.all([
-      publicContext.configuredMcpServer({ name: "node_repl", cwd: defaultCwd }).catch(() => null),
-      publicContext.configuredMcpServerNames({ cwd: defaultCwd }).catch(() => []),
+    const [configuredMcpServers, pluginMcpServers, currentChromeSkill] = await Promise.all([
+      publicContext.configuredMcpServers({ cwd: defaultCwd }),
+      publicContext.configuredMcpPluginServers(),
       publicContext.currentChromeSkill({ cwd: defaultCwd }).catch(() => null),
     ]);
+    const nodeReplConfig = configuredMcpServers.node_repl ? structuredClone(configuredMcpServers.node_repl) : null;
     const browserCompatibility = await resolveBrowserRuntimeCompatibility({
       codexBin,
       chromeSkillPath: currentChromeSkill?.path ?? null,
@@ -139,7 +175,8 @@ export async function createPublicRuntime({ env = process.env } = {}) {
       configOverrides,
       compatibilityOverrides: browserCompatibility.overrides,
       nodeReplConfig,
-      configuredMcpServerNames,
+      configuredMcpServers,
+      pluginMcpServers,
       browserAvailable,
     });
 
