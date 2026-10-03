@@ -561,6 +561,8 @@ export class CodexBrowserExecutor {
   #runtimeCompatibility = null;
   #runtimeCompatibilityFailure = null;
   #runtimeCompatibilityResolver = null;
+  #onRuntimeReady = null;
+  #snapshotIntegrityFailure = null;
   #sessionId = `toolwire-browser-${randomUUID()}`;
   #turnSeq = 0;
   #browserClientUrl = null;
@@ -579,6 +581,7 @@ export class CodexBrowserExecutor {
     authorityExecutor = null,
     runtimeCompatibility = null,
     runtimeCompatibilityResolver = null,
+    onRuntimeReady = null,
   }) {
     if (!workbench) throw new Error("CodexBrowserExecutor requires workbench");
     if (!defaultCwd) throw new Error("CodexBrowserExecutor requires defaultCwd");
@@ -600,6 +603,8 @@ export class CodexBrowserExecutor {
       this.#runtimeCompatibility = normalizeRuntimeCompatibilityBinding(runtimeCompatibility);
     }
     this.#runtimeCompatibilityResolver = runtimeCompatibilityResolver;
+    if (onRuntimeReady !== null && typeof onRuntimeReady !== "function") throw new Error("onRuntimeReady must be null or a function");
+    this.#onRuntimeReady = onRuntimeReady;
     if (this.#runtimeCompatibility && !this.#runtimeCompatibilityResolver) {
       throw new Error("runtimeCompatibilityResolver is required with a Browser runtime compatibility binding");
     }
@@ -4662,31 +4667,67 @@ nodeRepl.write(JSON.stringify(__twPayload));
 
   async #boundRuntimeCompatibilityStatus(cwd, { skillPath = null, pluginBuild = null } = {}) {
     if (!this.#runtimeCompatibility) return null;
+    if (this.#snapshotIntegrityFailure) return structuredClone(this.#snapshotIntegrityFailure);
     let current;
+    let discovered;
     try {
-      current = normalizeRuntimeCompatibilityBinding(
-        await this.#runtimeCompatibilityResolver({ cwd, chromeSkillPath: skillPath, chromePluginBuild: pluginBuild })
-      );
+      discovered = await this.#runtimeCompatibilityResolver({ cwd, chromeSkillPath: skillPath, chromePluginBuild: pluginBuild });
+      current = normalizeRuntimeCompatibilityBinding(discovered);
     } catch {
       current = null;
     }
     if (!current || !runtimeCompatibilityBindingsMatch(this.#runtimeCompatibility, current)) {
-      return {
+      const failure = {
         status: "unavailable",
         reason: "BROWSER_RUNTIME_COMPAT_CHANGED_RESTART_REQUIRED",
+        ...(discovered?.changedComponents ? { changedComponents: discovered.changedComponents.filter((value) => ["snapshot", "browser", "chrome", "node", "codex"].includes(value)) } : {}),
         chromeSkill: "changed",
         nodeRepl: "unknown",
         nextActions: [
-          "Restart the main Codexless household runtime so Browser compatibility, isolated node_repl overrides, and the canonical browser client/service fingerprint are rebound together.",
+          this.#runtimeCompatibility.snapshot
+            ? "Restart the main Codexless household runtime to bind a complete verified Browser dependency snapshot; the active snapshot failed integrity verification."
+            : "Restart the main Codexless household runtime so Browser compatibility, isolated node_repl overrides, and the canonical browser client/service fingerprint are rebound together.",
           "Do not hot-switch the Browser child to the newly discovered plugin inside the current main runtime.",
         ],
       };
+      if (this.#runtimeCompatibility.snapshot) this.#snapshotIntegrityFailure = structuredClone(failure);
+      return failure;
     }
     this.#browserClientUrl = pathToFileURL(this.#runtimeCompatibility.browserClientPath).href;
     return null;
   }
 
   async #dependencyStatus(cwd) {
+    if (this.#runtimeCompatibility?.snapshot) {
+      const changed = await this.#boundRuntimeCompatibilityStatus(cwd);
+      if (changed) return changed;
+      try {
+        const mcp = await this.#workbench.catalog({ kind: "mcp", cwd: this.#runtimeCwd, query: NODE_REPL_TOOL });
+        this.#syncWorkbenchGeneration();
+        const nodeRepl = (mcp?.servers ?? []).find((server) => server?.name === NODE_REPL_SERVER);
+        const js = nodeRepl?.tools?.find((tool) => tool?.name === NODE_REPL_TOOL);
+        if (!js || nodeRepl?.error) {
+          return {
+            status: "unavailable",
+            reason: "node_repl_unavailable",
+            chromeSkill: "ok",
+            nodeRepl: "unavailable",
+            nodeReplError: nodeRepl?.error ?? null,
+            nextActions: [
+              "Restore the Codex node_repl MCP capability, then retry codex.browser_status.",
+              "Do not replace the existing-login Chrome path with generic Computer Use.",
+            ],
+          };
+        }
+      } catch (error) {
+        this.#syncWorkbenchGeneration();
+        return browserUnavailable(new BrowserPreviewError(
+          "BROWSER_NODE_REPL_DISCOVERY_FAILED",
+          `Could not read node_repl status: ${error instanceof Error ? error.message : String(error)}`
+        ));
+      }
+      return { status: "ok", skillPathResolved: Boolean(this.#runtimeCompatibility.chromeSkillPath), chromePluginResolved: true, browserClientResolved: true };
+    }
     let skills;
     let chromePlugin = null;
     try {
@@ -4777,7 +4818,8 @@ nodeRepl.write(JSON.stringify(__twPayload));
       throw new BrowserPreviewError(
         dependency.reason ?? "BROWSER_UNAVAILABLE",
         `Browser dependencies are unavailable: ${dependency.reason ?? "unknown"}`,
-        dependency.nextActions ?? ["Call codex.browser_status for current diagnostics."]
+        dependency.nextActions ?? ["Call codex.browser_status for current diagnostics."],
+        dependency.changedComponents ? { changedComponents: dependency.changedComponents } : null
       );
     }
     const backends = await this.#listBackends(cwd);
@@ -4817,6 +4859,7 @@ nodeRepl.write(JSON.stringify(__twBackends.map((backend) => ({
   type: backend.type ?? null,
 }))));
 `, "Check connected browser backends");
+    await this.#onRuntimeReady?.();
     return Array.isArray(result) ? result.map(sanitizeBackend) : [];
   }
 
@@ -5002,6 +5045,7 @@ function normalizeRuntimeCompatibilityBinding(value) {
     browserClientPath: path.resolve(value.browserClientPath),
     browserServicePath: path.resolve(value.browserServicePath),
     browserClientSha256: value.browserClientSha256.toLowerCase(),
+    ...(value.snapshot ? { snapshot: structuredClone(value.snapshot) } : {}),
   };
 }
 
@@ -5044,7 +5088,9 @@ function runtimeCompatibilityPathMatches(left, right) {
 }
 
 function runtimeCompatibilityBindingsMatch(bound, current) {
-  return bound.build === current.build
+  return (bound.snapshot?.id ?? null) === (current.snapshot?.id ?? null)
+    && (bound.snapshot?.manifestSha256 ?? null) === (current.snapshot?.manifestSha256 ?? null)
+    && bound.build === current.build
     && bound.browserClientSha256 === current.browserClientSha256
     && runtimeCompatibilityPathMatches(bound.chromePluginRoot, current.chromePluginRoot)
     && runtimeCompatibilityPathMatches(bound.browserClientPath, current.browserClientPath)

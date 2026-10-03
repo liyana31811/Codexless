@@ -55,6 +55,8 @@ When a task genuinely needs the Codex model, Codexless can call Codex explicitly
 
 Codexless is not trying to rebuild a second Codex. The point is to make useful local capabilities available from the ChatGPT conversation you already use.
 
+Browser households pin a verified local [dependency snapshot](config/browser-snapshots.md), so removal of the original Desktop package does not replace or invalidate the active Browser implementation. Changes to the active snapshot still fail closed and require a household restart.
+
 ---
 
 ## What can it do?

@@ -15,6 +15,7 @@ import {
 import { CodexAgentExecutor } from "./codex-agent-executor.mjs";
 import { CodexAuthorityExecutor } from "./codex-authority-executor.mjs";
 import { resolveBrowserRuntimeCompatibility } from "./browser-runtime-compat.mjs";
+import { createBrowserDependencySnapshot, defaultBrowserSnapshotStore, verifyBrowserDependencySnapshot } from "./browser-dependency-snapshot.mjs";
 import { createCodexRuntimeProvider } from "./codex-runtime-provider.mjs";
 import { CodexBrowserExecutor } from "./codex-browser-executor.mjs";
 import { createDeferredBrowserAdapter } from "./deferred-browser-adapter.mjs";
@@ -260,6 +261,22 @@ export async function createCodexlessRuntime({
   let browserRecoveryPromise = null;
   let agentExecutor = null;
   let closed = false;
+  const browserSnapshotReleases = [];
+  const bindBrowserSnapshot = async (compatibility, nodeReplConfig, selectedCodexBin) => {
+    if (compatibility.status !== "ok" || !nodeReplConfig) return { compatibility, nodeReplConfig, codexBin: selectedCodexBin };
+    try {
+      const snapshot = await createBrowserDependencySnapshot({ compatibility, nodeReplConfig, codexBin: selectedCodexBin,
+        store: envString(env, "CODEXLESS_BROWSER_SNAPSHOT_STORE", defaultBrowserSnapshotStore(stateRoot)) });
+      browserSnapshotReleases.push(snapshot.release);
+      return snapshot;
+    } catch (error) {
+      return { compatibility: { ...compatibility, status: "unavailable", reason: error.code ?? "browser_snapshot_creation_failed",
+        changedComponents: error.changedComponents ?? ["snapshot"], overrides: [] }, nodeReplConfig: null, codexBin: selectedCodexBin };
+    }
+  };
+  const releaseBrowserSnapshots = async () => {
+    for (const release of browserSnapshotReleases.splice(0)) await release();
+  };
 
   try {
     const executor = new CodexAuthorityExecutor({
@@ -323,13 +340,15 @@ export async function createCodexlessRuntime({
       : workbench;
 
     let browserRuntimeCompatibility = null;
+    let browserSnapshotReady = null;
     if (modelFreeRuntime.lane === "existing") {
       let browserWorkbenchForExecutor = workbench;
+      let browserCodexBin = codexBin;
       if (browserServerRequests.enabled) {
         let browserWorkbenchCwd = defaultCwd;
         let browserWorkbenchOverrides = configOverrides;
         if (privateConstruction || publicPreview) {
-          const [nodeReplConfig, currentChromeSkill, currentChromePlugin, configuredMcpServerNames] = await Promise.all([
+          let [nodeReplConfig, currentChromeSkill, currentChromePlugin, configuredMcpServerNames] = await Promise.all([
             workbench.configuredMcpServer({ name: "node_repl", cwd: defaultCwd }).catch(() => null),
             workbench.currentChromeSkill({ cwd: defaultCwd }).catch(() => null),
             typeof workbench.currentChromePlugin === "function"
@@ -343,6 +362,11 @@ export async function createCodexlessRuntime({
             chromePluginBuild: currentChromePlugin?.localVersion ?? null,
             env,
           });
+          const snapshot = await bindBrowserSnapshot(browserRuntimeCompatibility, nodeReplConfig, codexBin);
+          browserRuntimeCompatibility = snapshot.compatibility;
+          nodeReplConfig = snapshot.nodeReplConfig;
+          browserCodexBin = snapshot.codexBin;
+          browserSnapshotReady = snapshot.markReady ?? null;
           const browserAvailable = browserRuntimeCompatibility.status === "ok" && nodeReplConfig !== null;
           browserWorkbenchOverrides = buildBrowserConfigOverrides({
             configOverrides,
@@ -366,7 +390,7 @@ export async function createCodexlessRuntime({
           },
         });
         browserWorkbench = workbenchFactory({
-          codexBin,
+          codexBin: browserCodexBin,
           defaultCwd: browserWorkbenchCwd,
           configOverrides: browserWorkbenchOverrides,
           serverRequestHandler: (request) => browserElicitationBridge.handleServerRequest(request),
@@ -379,8 +403,9 @@ export async function createCodexlessRuntime({
         defaultCwd,
         authorityExecutor: executor,
         runtimeCompatibility: (privateConstruction || publicPreview) ? browserRuntimeCompatibility : null,
+        onRuntimeReady: browserSnapshotReady,
         runtimeCompatibilityResolver: (privateConstruction || publicPreview) && browserRuntimeCompatibility?.status === "ok"
-          ? ({ chromeSkillPath, chromePluginBuild }) => resolveBrowserRuntimeCompatibility({ codexBin, chromeSkillPath, chromePluginBuild, env })
+          ? () => verifyBrowserDependencySnapshot(browserRuntimeCompatibility)
           : null,
       });
     } else {
@@ -429,11 +454,13 @@ export async function createCodexlessRuntime({
           let dedicatedBrowserWorkbench = null;
           let browserWorkbenchForExecutor = existingWorkbench;
           let compatibility = null;
+          let browserSnapshotReady = null;
+          let browserCodexBin = existing.path;
           if (browserServerRequests.enabled) {
             let browserWorkbenchCwd = defaultCwd;
             let browserWorkbenchOverrides = configOverrides;
             if (privateConstruction || publicPreview) {
-              const [nodeReplConfig, currentChromeSkill, currentChromePlugin, configuredMcpServerNames] = await Promise.all([
+              let [nodeReplConfig, currentChromeSkill, currentChromePlugin, configuredMcpServerNames] = await Promise.all([
                 existingWorkbench.configuredMcpServer({ name: "node_repl", cwd: defaultCwd }).catch(() => null),
                 existingWorkbench.currentChromeSkill({ cwd: defaultCwd }).catch(() => null),
                 typeof existingWorkbench.currentChromePlugin === "function"
@@ -447,6 +474,11 @@ export async function createCodexlessRuntime({
                 chromePluginBuild: currentChromePlugin?.localVersion ?? null,
                 env,
               });
+              const snapshot = await bindBrowserSnapshot(compatibility, nodeReplConfig, existing.path);
+              compatibility = snapshot.compatibility;
+              nodeReplConfig = snapshot.nodeReplConfig;
+              browserCodexBin = snapshot.codexBin;
+              browserSnapshotReady = snapshot.markReady ?? null;
               const browserAvailable = compatibility.status === "ok" && nodeReplConfig !== null;
               browserWorkbenchOverrides = buildBrowserConfigOverrides({
                 configOverrides,
@@ -458,7 +490,7 @@ export async function createCodexlessRuntime({
               browserWorkbenchCwd = compatibility.browserRuntimeCwd;
             }
             dedicatedBrowserWorkbench = workbenchFactory({
-              codexBin: existing.path,
+              codexBin: browserCodexBin,
               defaultCwd: browserWorkbenchCwd,
               configOverrides: browserWorkbenchOverrides,
               serverRequestHandler: (request) => browserElicitationBridge.handleServerRequest(request),
@@ -470,8 +502,9 @@ export async function createCodexlessRuntime({
             defaultCwd,
             authorityExecutor: existingAuthority,
             runtimeCompatibility: (privateConstruction || publicPreview) ? compatibility : null,
+            onRuntimeReady: browserSnapshotReady,
             runtimeCompatibilityResolver: (privateConstruction || publicPreview) && compatibility?.status === "ok"
-              ? ({ chromeSkillPath, chromePluginBuild }) => resolveBrowserRuntimeCompatibility({ codexBin: existing.path, chromeSkillPath, chromePluginBuild, env })
+              ? () => verifyBrowserDependencySnapshot(compatibility)
               : null,
           });
           return {
@@ -684,7 +717,7 @@ export async function createCodexlessRuntime({
           try {
             await existingCatalogWorkbench?.close();
           } finally {
-            await workbench?.close();
+            try { await workbench?.close(); } finally { await releaseBrowserSnapshots(); }
           }
         }
       }
@@ -737,7 +770,7 @@ export async function createCodexlessRuntime({
         try {
           await existingCatalogWorkbench?.close();
         } finally {
-          await workbench?.close();
+          try { await workbench?.close(); } finally { await releaseBrowserSnapshots(); }
         }
       }
     }
