@@ -119,6 +119,14 @@ The underlying task binding remains single-use and replay-safe: a stale or alrea
 
 ---
 
+## External launcher contract
+
+For the existing entry, runtime configuration, health probes, shutdown paths, and current limitations
+of external companion integration in 0.1.2 Preview, see the
+[external launcher contract](docs/EXTERNAL_LAUNCHER_CONTRACT.md).
+
+---
+
 ## Install
 
 Use the source tree from the release/tag you want to install. The installer checks Node.js and your existing local Codex; it does not install Node/npm or replace that local Codex.
