@@ -1,12 +1,12 @@
 {
   "name": "codexless",
-  "version": "0.1.2-preview.0",
+  "version": "0.1.2-preview.1",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
       "name": "codexless",
-      "version": "0.1.2-preview.0",
+      "version": "0.1.2-preview.1",
       "dependencies": {
         "@modelcontextprotocol/node": "2.0.0",
         "@modelcontextprotocol/server": "2.0.0",

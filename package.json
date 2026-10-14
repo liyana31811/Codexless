@@ -1,6 +1,6 @@
 {
   "name": "codexless",
-  "version": "0.1.2-preview.0",
+  "version": "0.1.2-preview.1",
   "private": true,
   "license": "Apache-2.0",
   "description": "Windows and Apple Silicon macOS Technical Preview: let ChatGPT use accepted Codex-backed local capabilities and escalate to Codex only when needed.",
@@ -26,7 +26,7 @@
     "test:browser-operator": "node --test test/browser-household-parity.mjs",
     "test:public-registration": "node test/public-registration-allowlist.mjs",
     "test:diagnostics": "node test/recent-call-diagnostics.mjs && node test/recent-call-http.mjs && node test/doctor-health.mjs",
-    "test": "node test/release-identity.mjs && node test/lifecycle-contract.mjs && node test/installer-lifecycle-windows.mjs && node test/bootstrap-archive-policy.mjs && node test/bootstrap-persistence.mjs && node test/codex-version-gate.mjs && node test/browser-runtime-compat.mjs && node test/public-runtime-browser-guardrails.mjs && node test/stock-prompt-input-catalog.mjs && node test/recent-call-diagnostics.mjs && node test/recent-call-http.mjs && node test/doctor-health.mjs && node test/metered-consent.mjs && node test/agent-consent-card.mjs && node test/reasoning-effort.mjs && node test/public-command-policy.mjs && node test/public-registration-allowlist.mjs && node test/browser-elicitation-fallback.mjs && node test/public-browser-adapter.mjs && node --test test/browser-household-parity.mjs && node test/public-contract.mjs",
+    "test": "node test/release-identity.mjs && node test/lifecycle-contract.mjs && node test/installer-lifecycle-windows.mjs && node test/bootstrap-archive-policy.mjs && node test/bootstrap-persistence.mjs && node test/codex-version-gate.mjs && node test/browser-runtime-compat.mjs && node test/public-runtime-browser-guardrails.mjs && node test/stock-prompt-input-catalog.mjs && node test/recent-call-diagnostics.mjs && node test/recent-call-http.mjs && node test/doctor-health.mjs && node test/metered-consent.mjs && node test/agent-consent-card.mjs && node test/reasoning-effort.mjs && node test/public-command-policy.mjs && node test/public-registration-allowlist.mjs && node test/browser-elicitation-fallback.mjs && node test/public-browser-adapter.mjs && node --test test/browser-household-parity.mjs && node test/public-contract.mjs && npm run test:agent-progress-steer",
     "release:manifest": "node scripts/generate-release-manifest.mjs",
     "bootstrap:materialize": "node scripts/materialize-bootstrap.mjs",
     "test:release-identity": "node test/release-identity.mjs",
@@ -40,7 +40,8 @@
     "skills:sync": "node scripts/sync-codex-skills.mjs sync",
     "test:compatibility": "node --test test/upstream-compatibility-fingerprint.mjs",
     "test:skills": "node --test test/codex-skill-sync.mjs test/public-skill-refresh.mjs",
-    "release:preflight": "node scripts/release-preflight.mjs"
+    "release:preflight": "node scripts/release-preflight.mjs",
+    "test:agent-progress-steer": "node --test test/agent-progress.mjs test/agent-steer.mjs test/agent-steer-boundaries.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "2.0.0",

@@ -1,12 +1,87 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { CodexAppServerClient } from "./codex-app-server-client.mjs";
+import { CodexAppServerClient, CodexRpcError } from "./codex-app-server-client.mjs";
 import { buildAgentResourceReceipt } from "./agent-resource.mjs";
 import { projectCodexModel } from "./codex-model-catalog.mjs";
 
 const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "interrupted"]);
 const DEFAULT_MAX_EVENTS = 128;
 const MAX_EVENT_TEXT_CHARS = 2_048;
+
+const MAX_PROGRESS_MESSAGE_CHARS = 8_192;
+const MAX_PROGRESS_PLAN_STEPS = 64;
+const MAX_PROGRESS_STEP_CHARS = 2_048;
+const MAX_PROGRESS_ID_CHARS = 512;
+const MAX_PROGRESS_LABEL_CHARS = 128;
+
+function boundedProgressString(value, maxChars, { tail = false } = {}) {
+  if (typeof value !== "string") return { value: null, truncated: false };
+  if (value.length <= maxChars) return { value, truncated: false };
+  return {
+    value: tail ? value.slice(-maxChars) : value.slice(0, maxChars),
+    truncated: true,
+  };
+}
+
+function boundedProgressText(value) {
+  const bounded = boundedProgressString(value, MAX_PROGRESS_MESSAGE_CHARS, { tail: true });
+  return { text: bounded.value ?? "", truncated: bounded.truncated };
+}
+
+function boundedPlan(params) {
+  if (!params || typeof params !== "object") return null;
+  const rawPlan = Array.isArray(params.plan) ? params.plan : [];
+  const rawExplanation = boundedProgressString(params.explanation, MAX_PROGRESS_MESSAGE_CHARS);
+  let truncated = rawPlan.length > MAX_PROGRESS_PLAN_STEPS || rawExplanation.truncated;
+  const plan = rawPlan.slice(0, MAX_PROGRESS_PLAN_STEPS).map((entry) => {
+    const step = boundedProgressString(entry?.step, MAX_PROGRESS_STEP_CHARS);
+    const status = boundedProgressString(entry?.status, MAX_PROGRESS_LABEL_CHARS);
+    truncated ||= step.truncated || status.truncated;
+    return {
+      step: step.value ?? "",
+      status: status.value,
+    };
+  });
+  return {
+    explanation: rawExplanation.value,
+    plan,
+    truncated,
+    updatedAt: Date.now(),
+  };
+}
+
+function compactActiveItem(item) {
+  if (!item || typeof item !== "object") return null;
+  const id = boundedProgressString(item.id, MAX_PROGRESS_ID_CHARS);
+  const type = boundedProgressString(item.type, MAX_PROGRESS_LABEL_CHARS);
+  const status = boundedProgressString(item.status, MAX_PROGRESS_LABEL_CHARS);
+  return {
+    id: id.value,
+    type: type.value ?? "unknown",
+    status: status.value ?? "inProgress",
+    truncated: id.truncated || type.truncated || status.truncated,
+    updatedAt: Date.now(),
+  };
+}
+
+function compactAgentMessage(item, fallback = null, statusOverride = null) {
+  if (!item || typeof item !== "object") return fallback;
+  const priorText = typeof fallback?.text === "string" ? fallback.text : "";
+  const sourceText = typeof item.text === "string" ? item.text : priorText;
+  const bounded = boundedProgressText(sourceText);
+  const itemId = boundedProgressString(item.id ?? fallback?.itemId, MAX_PROGRESS_ID_CHARS);
+  const phase = boundedProgressString(item.phase ?? fallback?.phase, MAX_PROGRESS_LABEL_CHARS);
+  const status = boundedProgressString(statusOverride ?? item.status ?? fallback?.status, MAX_PROGRESS_LABEL_CHARS);
+  return {
+    itemId: itemId.value,
+    phase: phase.value,
+    text: bounded.text,
+    truncated: bounded.truncated || (typeof item.text !== "string" && fallback?.truncated === true)
+      || itemId.truncated || phase.truncated || status.truncated,
+    status: status.value,
+    updatedAt: Date.now(),
+  };
+}
 
 function hashRequest(cwd, task, model = null, reasoningEffort = null) {
   const base = `${cwd}\0${task}\0${model ?? ""}`;
@@ -81,6 +156,12 @@ function notificationRequestId(message) {
 
 function controlRequestHash(action, agentRef, targetId) {
   return createHash("sha256").update(`${action}\0${agentRef}\0${targetId ?? ""}`, "utf8").digest("hex");
+}
+
+function steerRequestHash(agentRef, targetTurnId, message) {
+  return createHash("sha256")
+    .update(`steer\0${agentRef}\0${targetTurnId ?? ""}\0${message}`, "utf8")
+    .digest("hex");
 }
 
 function approvalResponseFor(handle, decision) {
@@ -333,6 +414,9 @@ export class CodexAgentExecutor {
       status: "starting",
       latestTurnStatus: null,
       finalResult: null,
+      progressPlan: null,
+      progressAgentMessage: null,
+      progressActiveItem: null,
       latestError: null,
       pendingApproval: null,
       pendingRequestHandle: null,
@@ -534,6 +618,135 @@ export class CodexAgentExecutor {
     return { ...snapshot, duplicate: false };
   }
 
+  async steer({ agentRef, message, clientRequestId, expectedTurnId }) {
+    this.#assertOpen();
+    if (typeof message !== "string" || !message.trim()) throw new Error("message must be a non-empty string");
+    if (typeof clientRequestId !== "string" || !clientRequestId.trim()) {
+      throw new Error("clientRequestId must be a non-empty string");
+    }
+    if (typeof expectedTurnId !== "string" || !expectedTurnId.trim()) {
+      throw new Error("expectedTurnId must be a non-empty string");
+    }
+
+    const state = this.#agents.get(agentRef);
+    if (!state) return this.#unknown(agentRef, "unknown agentRef");
+    await this.#refreshFromOfficial(state);
+    if (state.pendingApproval) throw new Error(`agent ${agentRef} has a pending Codex approval`);
+    const targetTurnId = state.currentTurnId;
+    if (targetTurnId !== expectedTurnId) {
+      throw new Error(`agent task turn changed: expected ${expectedTurnId}, current ${String(targetTurnId ?? "none")}`);
+    }
+
+    const hash = steerRequestHash(agentRef, targetTurnId, message);
+    const prior = this.#controlRequestIds.get(clientRequestId);
+    if (prior) {
+      if (prior.requestHash !== hash) {
+        throw new Error(`clientRequestId was already used for a different agent control action: ${clientRequestId}`);
+      }
+      if (prior.acceptance === "rejected") {
+        throw new Error(prior.error ?? `turn/steer was rejected for agent ${agentRef}`);
+      }
+      await this.#refreshFromOfficial(state);
+      if (prior.acceptance === "unknown" && prior.error) {
+        const refreshError = state.latestError && state.latestError !== prior.error ? state.latestError : null;
+        state.latestError = refreshError ? `${prior.error}; official refresh also failed: ${refreshError}` : prior.error;
+      }
+      return {
+        ...this.#snapshot(state, 0),
+        duplicate: true,
+        controlAcceptance: prior.acceptance ?? "unknown",
+      };
+    }
+
+    if (!state.threadId || state.status !== "running") {
+      throw new Error(`agent has no steerable active turn: ${agentRef} (${state.status})`);
+    }
+
+    const record = {
+      agentRef,
+      requestHash: hash,
+      action: "steer",
+      targetId: targetTurnId,
+      acceptance: "dispatching",
+      error: null,
+    };
+    this.#controlRequestIds.set(clientRequestId, record);
+    this.#appendEvent(state, {
+      type: "turn/steer-dispatched",
+      turnId: targetTurnId,
+      requestId: clientRequestId,
+      at: Date.now(),
+    });
+
+    try {
+      const accepted = await this.#client.request("turn/steer", {
+        threadId: state.threadId,
+        clientUserMessageId: clientRequestId,
+        input: [{ type: "text", text: message }],
+        expectedTurnId: targetTurnId,
+      });
+      if (accepted?.turnId !== targetTurnId) {
+        record.acceptance = "unknown";
+        record.error = `turn/steer returned unexpected turn id ${String(accepted?.turnId ?? "missing")}; do not replay automatically`;
+        state.latestError = record.error;
+        state.updatedAt = Date.now();
+        this.#appendEvent(state, {
+          type: "turn/steer-acceptance-unknown",
+          turnId: targetTurnId,
+          requestId: clientRequestId,
+          text: state.latestError,
+          at: Date.now(),
+        });
+        return { ...this.#snapshot(state, 0), duplicate: false, controlAcceptance: "unknown" };
+      }
+      record.acceptance = "accepted";
+      state.latestError = null;
+      state.updatedAt = Date.now();
+      this.#appendEvent(state, {
+        type: "turn/steer-accepted",
+        turnId: targetTurnId,
+        requestId: clientRequestId,
+        at: Date.now(),
+      });
+      return { ...this.#snapshot(state, 0), duplicate: false, controlAcceptance: "accepted" };
+    } catch (error) {
+      if (error instanceof CodexRpcError) {
+        record.acceptance = "rejected";
+        record.error = error.message;
+        state.latestError = null;
+        state.updatedAt = Date.now();
+        this.#appendEvent(state, {
+          type: "turn/steer-rejected",
+          turnId: targetTurnId,
+          requestId: clientRequestId,
+          text: error.message,
+          at: Date.now(),
+        });
+        throw error;
+      }
+
+      record.acceptance = "unknown";
+      const acceptanceUnknown = `turn/steer acceptance unknown; do not replay automatically: ${error instanceof Error ? error.message : String(error)}`;
+      record.error = acceptanceUnknown;
+      state.latestError = acceptanceUnknown;
+      state.updatedAt = Date.now();
+      this.#appendEvent(state, {
+        type: "turn/steer-acceptance-unknown",
+        turnId: targetTurnId,
+        requestId: clientRequestId,
+        text: acceptanceUnknown,
+        at: Date.now(),
+      });
+      await this.#refreshFromOfficial(state);
+      if (state.latestError && state.latestError !== acceptanceUnknown) {
+        state.latestError = `${acceptanceUnknown}; official refresh also failed: ${state.latestError}`;
+      } else {
+        state.latestError = acceptanceUnknown;
+      }
+      return { ...this.#snapshot(state, 0), duplicate: false, controlAcceptance: "unknown" };
+    }
+  }
+
   async cancel({ agentRef, clientRequestId, expectedTurnId = null }) {
     this.#assertOpen();
     if (typeof clientRequestId !== "string" || !clientRequestId.trim()) {
@@ -666,6 +879,9 @@ export class CodexAgentExecutor {
     state.resourceReceiptTurnId = null;
     state.resourceReceiptPromise = null;
     state.finalResult = null;
+    state.progressPlan = null;
+    state.progressAgentMessage = null;
+    state.progressActiveItem = null;
     state.latestError = null;
     state.status = "running";
     state.requestedModel = requestedModel;
@@ -805,6 +1021,7 @@ export class CodexAgentExecutor {
         state.turnDurationMs = state.turnStartedAt === null ? null : Math.max(0, state.turnEndedAt - state.turnStartedAt);
       }
       if (TERMINAL_TURN_STATUSES.has(turn.status)) {
+        state.progressActiveItem = null;
         const resumed = await this.#client.request("thread/resume", { threadId: state.threadId });
         if (typeof resumed?.model === "string") state.resolvedModel = resumed.model;
         if (typeof resumed?.modelProvider === "string") state.modelProvider = resumed.modelProvider;
@@ -832,24 +1049,97 @@ export class CodexAgentExecutor {
     if (!state) return;
 
     const turn = notificationTurn(message);
-    if (["turn/started", "turn/completed"].includes(message.method) && turnId && state.currentTurnId && turnId !== state.currentTurnId) {
+    const turnScopedProgressEvent = message.method === "turn/plan/updated" || message.method.startsWith("item/");
+    if ((["turn/started", "turn/completed"].includes(message.method) || turnScopedProgressEvent)
+      && turnId && state.currentTurnId && turnId !== state.currentTurnId) {
       state.updatedAt = Date.now();
       this.#appendEvent(state, { type: "stale-turn-notification-ignored", method: message.method, turnId, currentTurnId: state.currentTurnId, at: Date.now() });
       return;
     }
     if (turnId && !state.currentTurnId) state.currentTurnId = turnId;
+    const progressBoundToCurrentTurn = turnScopedProgressEvent
+      && typeof turnId === "string"
+      && turnId.length > 0
+      && state.currentTurnId === turnId;
+    if (turnScopedProgressEvent && !progressBoundToCurrentTurn) {
+      this.#appendEvent(state, {
+        type: "unbound-progress-notification-ignored",
+        method: message.method,
+        turnId: turnId ?? null,
+        currentTurnId: state.currentTurnId,
+        at: Date.now(),
+      });
+    }
     if (message.method === "thread/tokenUsage/updated" && message?.params?.tokenUsage) {
       state.latestTokenUsage = structuredClone(message.params.tokenUsage);
     }
+    if (message.method === "turn/plan/updated" && progressBoundToCurrentTurn) {
+      state.progressPlan = boundedPlan(message.params);
+    }
     if (message.method === "item/started" && message?.params?.item?.id) {
-      state.approvalItems.set(message.params.item.id, structuredClone(message.params.item));
+      const item = message.params.item;
+      state.approvalItems.set(item.id, structuredClone(item));
       if (state.approvalItems.size > 32) {
         const oldest = state.approvalItems.keys().next().value;
         state.approvalItems.delete(oldest);
       }
+      if (progressBoundToCurrentTurn) {
+        state.progressActiveItem = compactActiveItem(item);
+        if (item.type === "agentMessage") {
+          state.progressAgentMessage = compactAgentMessage(item, null, "inProgress");
+        }
+      }
+      if (item.type === "userMessage" && typeof item.clientId === "string" && item.clientId) {
+        const control = this.#controlRequestIds.get(item.clientId);
+        if (
+          control?.action === "steer" &&
+          control.agentRef === state.agentRef &&
+          control.targetId === (turnId ?? state.currentTurnId) &&
+          control.acceptance !== "rejected" &&
+          control.consumption !== "consumed"
+        ) {
+          control.consumption = "consumed";
+          control.consumedAt = Date.now();
+          this.#appendEvent(state, {
+            type: "turn/steer-consumed",
+            turnId: turnId ?? state.currentTurnId,
+            requestId: item.clientId,
+            at: control.consumedAt,
+          });
+        }
+      }
+    }
+    if (message.method === "item/agentMessage/delta" && progressBoundToCurrentTurn) {
+      const delta = message?.params?.delta;
+      if (typeof delta === "string") {
+        const itemId = typeof message?.params?.itemId === "string"
+          ? message.params.itemId
+          : state.progressAgentMessage?.itemId ?? null;
+        const boundedItemId = boundedProgressString(itemId, MAX_PROGRESS_ID_CHARS);
+        const sameItem = state.progressAgentMessage?.itemId === boundedItemId.value;
+        const priorText = sameItem ? state.progressAgentMessage?.text ?? "" : "";
+        const bounded = boundedProgressText(priorText + delta);
+        state.progressAgentMessage = {
+          itemId: boundedItemId.value,
+          phase: sameItem ? state.progressAgentMessage?.phase ?? null : null,
+          text: bounded.text,
+          truncated: (sameItem && state.progressAgentMessage?.truncated === true)
+            || bounded.truncated || boundedItemId.truncated,
+          status: "inProgress",
+          updatedAt: Date.now(),
+        };
+      }
     }
     if (message.method === "item/completed" && message?.params?.item?.id) {
-      state.approvalItems.delete(message.params.item.id);
+      const item = message.params.item;
+      state.approvalItems.delete(item.id);
+      if (progressBoundToCurrentTurn) {
+        const completedItemId = boundedProgressString(item.id, MAX_PROGRESS_ID_CHARS).value;
+        if (state.progressActiveItem?.id === completedItemId) state.progressActiveItem = null;
+        if (item.type === "agentMessage") {
+          state.progressAgentMessage = compactAgentMessage(item, state.progressAgentMessage, "completed");
+        }
+      }
     }
     if (message.method === "serverRequest/resolved") {
       if (state.pendingApproval && String(state.pendingApproval.requestId) === String(requestId)) {
@@ -869,6 +1159,7 @@ export class CodexAgentExecutor {
       const status = turn?.status ?? "completed";
       state.latestTurnStatus = status;
       state.status = normalizeAgentStatus(status);
+      state.progressActiveItem = null;
       if (status === "completed") {
         state.lastCompletedTurnId = turn?.id ?? state.currentTurnId;
         state.finalResult = lastAgentMessage(turn) ?? state.finalResult;
@@ -1001,6 +1292,11 @@ export class CodexAgentExecutor {
       canSend: state.status === "idle" && !state.pendingApproval,
       pendingApproval: state.pendingApproval ? { ...state.pendingApproval } : null,
       finalResult: state.finalResult,
+      progress: {
+        latestAgentMessage: state.progressAgentMessage ? structuredClone(state.progressAgentMessage) : null,
+        plan: state.progressPlan ? structuredClone(state.progressPlan) : null,
+        activeItem: state.progressActiveItem ? structuredClone(state.progressActiveItem) : null,
+      },
       resourceReceipt: state.resourceReceipt ? structuredClone(state.resourceReceipt) : null,
       latestError: state.latestError,
       lastCompletedTurnId: state.lastCompletedTurnId,
@@ -1035,6 +1331,7 @@ export class CodexAgentExecutor {
       canSend: false,
       pendingApproval: null,
       finalResult: null,
+      progress: { latestAgentMessage: null, plan: null, activeItem: null },
       resourceReceipt: null,
       latestError: message,
       lastCompletedTurnId: null,

@@ -16,7 +16,7 @@ import { CodexPublicContextExecutor } from "../src/public-context-executor.mjs";
 import { createRecentCallDiagnostics, recentCallOptionsFromEnv } from "../src/recent-call-diagnostics.mjs";
 import { STOCK_RUNTIME_KIND } from "../src/stock-prompt-input-skill-routing.mjs";
 import { effectiveRuntimeRouting } from "../src/runtime-routing-policy.mjs";
-import { PUBLIC_SERVER_VERSION, PUBLIC_SURFACE_VERSION, PUBLIC_TOOL_NAMES } from "../src/surface-contracts.mjs";
+import { PUBLIC_SERVER_VERSION, PUBLIC_SURFACE_VERSION, PUBLIC_SOURCE_TOOL_COUNT, PUBLIC_TOOL_NAMES } from "../src/surface-contracts.mjs";
 
 const require = createRequire(import.meta.url);
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -48,7 +48,7 @@ record(
 );
 const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
 record("node", Number.isInteger(nodeMajor) && nodeMajor >= 22, `Node ${process.version}`, nodeMajor >= 22 ? null : "Node.js 22+ is required");
-record("public-surface", PUBLIC_TOOL_NAMES.length === 44, `${PUBLIC_SURFACE_VERSION}; ${PUBLIC_TOOL_NAMES.length} tools`);
+record("public-surface", PUBLIC_SOURCE_TOOL_COUNT > 0 && PUBLIC_TOOL_NAMES.length === PUBLIC_SOURCE_TOOL_COUNT && new Set(PUBLIC_TOOL_NAMES).size === PUBLIC_SOURCE_TOOL_COUNT, `${PUBLIC_SURFACE_VERSION}; ${PUBLIC_TOOL_NAMES.length} tools`);
 
 for (const spec of ["@modelcontextprotocol/node", "@modelcontextprotocol/server", "zod"]) {
   try {

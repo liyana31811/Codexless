@@ -104,6 +104,8 @@ If approved, the task runs in the background. When it reaches a terminal state, 
 
 The underlying task binding remains single-use and replay-safe: a stale or already-consumed approval cannot be reused to start the task again.
 
+**See progress and steer a running task (Preview):** Ask ChatGPT to check the current task via `codex.agent_show`: it reports the latest bounded agent message, plan and active item, not hidden reasoning or raw command output. While the *same turn* is still active, `codex.agent_steer` can add a new instruction without starting a separate Codex turn. For example: “Show the test progress; now prioritize regression checks and leave the installer unchanged.” Steer requires the exact active `turnId` and a stable `requestId`; stale turns, pending approvals and uncertain submissions are handled without blind replay. It does not change model, permissions or approval rules. Progress is read on demand, not a promised always-on push notification.
+
 ---
 
 ## Before you install
@@ -213,7 +215,7 @@ The permission ceiling follows effective local Codex authorization. Codexless ma
 
 ### Does ChatGPT get everything Codex can do?
 
-No. The **0.1.2 public contract is 44 tools**, selected and tested as a public surface. Internal or household-only capabilities are not automatically promoted.
+No. The **0.1.2 Preview public contract is 45 tools**, selected and tested as a public surface. Internal or household-only capabilities are not automatically promoted.
 
 ### Do I need to change my existing ChatGPT → Codex workflow?
 
@@ -232,7 +234,7 @@ Do not put Tunnel or endpoint credentials in the repository or public screenshot
 ## For people who want the internals
 
 - The exact public service contract is fixed in `src/surface-contracts.mjs` and covered by public contract tests.
-- The 0.1.2 public surface contains **44 tools**. Call Codex uses fixed-text Approval / Result in normal Chat; neutral `agent_commit(taskId)` / `agent_decline(taskId)` remain part of the authoritative task path.
+- The 0.1.2 Preview public surface contains **45 tools**, including `codex.agent_steer`. Call Codex uses fixed-text Approval / Result in normal Chat; neutral `agent_commit(taskId)` / `agent_decline(taskId)` remain part of the authoritative task path.
 - Public Excel contains the six typed tools listed above. The schema-reader and dynamic Excel gateway remain household-only in this release.
 - Browser exposes reviewed user-intent actions rather than raw browser internals.
 - Codex remains the local permission/trust authority; Codexless can downscope but not silently widen it.

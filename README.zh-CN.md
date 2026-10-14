@@ -100,6 +100,8 @@ Browser 使用你选择的本地浏览器 profile 和其中已有的网站登录
 
 底层任务绑定仍是 single-use / no-replay：过期或已经消费过的审批不能拿来重新启动同一任务。
 
+**运行中看进展、调整方向（Preview）：** 想知道 Codex 干到哪一步，可以让 ChatGPT 调用 `codex.agent_show`，查看最新有界进度、计划和当前工作项；不会暴露隐藏推理或原始命令输出。任务的**同一个 turn 仍在执行时**，可以通过 `codex.agent_steer` 追加新要求，不必启动新 turn。例如：“看看测试进行到哪了，接下来优先查回归，别动安装器。”追加指令必须绑定当前准确的 `turnId` 和稳定的 `requestId`；旧 turn、等待审批或结果不确定时不盲目重放。不会因此改变模型、权限或审批规则。进展属于按需查询，不承诺自动持续推送。
+
 ---
 
 ## 安装前先确认
@@ -201,7 +203,7 @@ Model-free 能力可以继续使用。真正需要 Codex 模型的动作，需�
 
 ### Codex 会什么，ChatGPT 就全部会了吗？
 
-不会。**0.1.2 的公开合同是 44 个工具**，只包含已经选择并验收进公开面的能力；household / internal 能力不会自动公开。
+不会。**0.1.2 Preview 的公开合同是 45 个工具**，只包含已经选择并验收进公开面的能力；household / internal 能力不会自动公开。
 
 ### 我原来的 ChatGPT → Codex 工作流需要改吗？
 
@@ -220,7 +222,7 @@ ChatGPT 拿到的是经过认证 MCP 路径公开出来的 Codexless tools，例
 ## 给想看底层的人
 
 - 精确 public service contract 固定在 `src/surface-contracts.mjs`，并由 public contract tests 验收。
-- 0.1.2 公开面是 **44 个工具**。普通 Chat 的 Call Codex 使用固定文字 Approval / Result；neutral `agent_commit(taskId)` / `agent_decline(taskId)` 继续属于 authoritative task path。
+- 0.1.2 Preview 公开面是 **45 个工具**（含 `codex.agent_steer`）。普通 Chat 的 Call Codex 使用固定文字 Approval / Result；neutral `agent_commit(taskId)` / `agent_decline(taskId)` 继续属于 authoritative task path。
 - Public Excel 只包含上面的六颗 typed tools；schema-reader 和 dynamic Excel gateway 本批继续 household-only。
 - Browser 公开的是经过验收的用户动作语义，不是 raw Browser 内部能力。
 - Codex 继续是本地 permission / trust 权威；Codexless 可以降权，但不能静默扩大权限。
