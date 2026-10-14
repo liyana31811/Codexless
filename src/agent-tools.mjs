@@ -25,6 +25,76 @@ function publicEvent(event) {
   return Object.fromEntries(Object.entries(event).filter(([key]) => EVENT_KEYS.has(key)));
 }
 
+function boundedPublicProgressString(value, maxChars, { tail = false } = {}) {
+  if (typeof value !== "string") return { value: null, truncated: false };
+  if (value.length <= maxChars) return { value, truncated: false };
+  return {
+    value: tail ? value.slice(-maxChars) : value.slice(0, maxChars),
+    truncated: true,
+  };
+}
+
+function publicProgress(progress) {
+  if (!progress || typeof progress !== "object") {
+    return { latestAgentMessage: null, plan: null, activeItem: null };
+  }
+
+  const sourceMessage = progress.latestAgentMessage && typeof progress.latestAgentMessage === "object"
+    ? progress.latestAgentMessage
+    : null;
+  const messageText = boundedPublicProgressString(sourceMessage?.text, 8_192, { tail: true });
+  const messageItemId = boundedPublicProgressString(sourceMessage?.itemId, 512);
+  const messagePhase = boundedPublicProgressString(sourceMessage?.phase, 128);
+  const messageStatus = boundedPublicProgressString(sourceMessage?.status, 128);
+  const latestAgentMessage = sourceMessage
+    ? {
+        itemId: messageItemId.value,
+        phase: messagePhase.value,
+        text: messageText.value ?? "",
+        truncated: sourceMessage.truncated === true || messageText.truncated || messageItemId.truncated
+          || messagePhase.truncated || messageStatus.truncated,
+        status: messageStatus.value,
+        updatedAt: Number.isFinite(sourceMessage.updatedAt) ? sourceMessage.updatedAt : null,
+      }
+    : null;
+
+  const sourcePlan = progress.plan && typeof progress.plan === "object" ? progress.plan : null;
+  const rawPlan = Array.isArray(sourcePlan?.plan) ? sourcePlan.plan : [];
+  const explanation = boundedPublicProgressString(sourcePlan?.explanation, 8_192);
+  let planTruncated = sourcePlan?.truncated === true || rawPlan.length > 64 || explanation.truncated;
+  const planEntries = rawPlan.slice(0, 64).map((entry) => {
+    const step = boundedPublicProgressString(entry?.step, 2_048);
+    const status = boundedPublicProgressString(entry?.status, 128);
+    planTruncated ||= step.truncated || status.truncated;
+    return { step: step.value ?? "", status: status.value };
+  });
+  const plan = sourcePlan
+    ? {
+        explanation: explanation.value,
+        plan: planEntries,
+        truncated: planTruncated,
+        updatedAt: Number.isFinite(sourcePlan.updatedAt) ? sourcePlan.updatedAt : null,
+      }
+    : null;
+
+  const sourceActive = progress.activeItem && typeof progress.activeItem === "object"
+    ? progress.activeItem
+    : null;
+  const activeId = boundedPublicProgressString(sourceActive?.id, 512);
+  const activeType = boundedPublicProgressString(sourceActive?.type, 128);
+  const activeStatus = boundedPublicProgressString(sourceActive?.status, 128);
+  const activeItem = sourceActive
+    ? {
+        id: activeId.value,
+        type: activeType.value ?? "unknown",
+        status: activeStatus.value,
+        updatedAt: Number.isFinite(sourceActive.updatedAt) ? sourceActive.updatedAt : null,
+      }
+    : null;
+
+  return { latestAgentMessage, plan, activeItem };
+}
+
 function publicPendingApproval(pendingApproval) {
   if (!pendingApproval || typeof pendingApproval !== "object") return null;
   const projected = Object.fromEntries(Object.entries(pendingApproval).filter(([key]) => PENDING_APPROVAL_KEYS.has(key)));
@@ -861,6 +931,7 @@ function publicAgentSnapshot(snapshot, taskCard = null, { suppressManualFallback
     canSend: snapshot?.canSend === true,
     pendingApproval,
     finalResult: snapshot?.finalResult ?? null,
+    progress: publicProgress(snapshot?.progress),
     resourceReceipt: snapshot?.resourceReceipt ?? null,
     timing: snapshot?.timing ?? { startedAt: null, endedAt: null, durationMs: null },
     execution: snapshot?.execution ?? { requestedModel: null, resolvedModel: null, modelProvider: null, serviceTier: null, reasoningEffort: null },
@@ -2214,7 +2285,7 @@ export function registerAgentPreviewTools(server, {
     {
       title: "Show Codex Agent",
       description:
-        "Experimental Preview. Read the bounded operational state of one Codexless-owned Codex agent by opaque agentRef. Returns status, sendability, minimal pending-approval summary, a conservative approvalRiskReference, final result, and a bounded event tail; it does not duplicate the Codex transcript. approvalRiskReference is internal default guidance for the common 'handle routine low-risk actions for me' instruction, not a server-side decision and not an override of a more specific user-authored Profile rule. The caller must apply the in-turn priority rule to each pending action: explicit current-task user instruction first, otherwise the valid bound Profile, and the recommended default only when the Profile is missing. If the user expresses a durable preference such as 'don't ask me about this kind next time' or 'always ask me before this kind', offer to update the Profile and persist only after explicit confirmation.",
+        "Experimental Preview. Read the bounded operational state of one Codexless-owned Codex agent by opaque agentRef. Returns status, sendability, minimal pending-approval summary, a conservative approvalRiskReference, final result, bounded native progress (latest agent message, latest plan, and active item identity/status), and a bounded event tail. Progress is deliberately not a Codex transcript: it excludes raw reasoning, command output, file diffs/patches, MCP payload/output, and prior message history. approvalRiskReference is internal default guidance for the common 'handle routine low-risk actions for me' instruction, not a server-side decision and not an override of a more specific user-authored Profile rule. The caller must apply the in-turn priority rule to each pending action: explicit current-task user instruction first, otherwise the valid bound Profile, and the recommended default only when the Profile is missing. If the user expresses a durable preference such as 'don't ask me about this kind next time' or 'always ask me before this kind', offer to update the Profile and persist only after explicit confirmation.",
       inputSchema: z.object({
         agentRef: z.string().min(1).max(512),
         afterSeq: z.number().int().min(0).optional(),
@@ -2232,6 +2303,36 @@ export function registerAgentPreviewTools(server, {
         suppressManualFallback: suppress,
         portableTaskBody: record?.portableTaskBody ?? null,
       });
+    })
+  );
+
+  server.registerTool(
+    "codex.agent_steer",
+    {
+      title: "Steer Active Codex Agent",
+      description:
+        "Experimental Preview. Steer the currently active turn of one Codexless-owned Codex agent through official turn/steer without starting a new turn. expectedTurnId is required and must match the active turn so stale supervision fails closed. Steering changes only the in-flight user instruction; it cannot change model, reasoning effort, cwd, sandbox, permissions, or output schema. requestId is a caller-stable idempotency key and MUST be reused for retries of the same logical steer. A confirmed duplicate is never dispatched twice. If transport acceptance is uncertain, Codexless reports controlAcceptance=unknown and MUST NOT replay the steer automatically; inspect agent_show before deciding what to do next. Use agent_cancel for an immediate hard interrupt instead.",
+      inputSchema: z.object({
+        agentRef: z.string().min(1).max(512),
+        message: z.string().min(1).max(200_000),
+        expectedTurnId: z.string().min(1).max(512)
+          .describe("Exact active turnId from codex.agent_show. Steering fails closed if the agent has advanced or the turn is no longer active."),
+        requestId: z.string().min(1).max(512)
+          .describe("Stable caller-generated idempotency key for this logical steer. Reuse this exact value after an uncertain response; never invent a new retry id for the same steer."),
+      }).strict(),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ agentRef, message, expectedTurnId, requestId }) => structured(async () => {
+      assertFormalAgentAvailable();
+      const snapshot = await agentExecutor.steer({
+        agentRef,
+        message,
+        expectedTurnId,
+        clientRequestId: requestId,
+      });
+      const card = cardForAgent(snapshot?.agentRef ?? agentRef);
+      const record = card?.taskRef ? taskRecords.get(card.taskRef) ?? null : null;
+      return publicAgentSnapshot(snapshot, card, { portableTaskBody: record?.portableTaskBody ?? null });
     })
   );
 

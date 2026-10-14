@@ -26,7 +26,7 @@ const secret = "SUPER_SECRET_FIXTURE_MUST_NOT_LEAK";
 
 try {
   await mkdir(fakeTools, { recursive: true });
-  await writeFile(path.join(fakeTools, "npm.cmd"), "@echo off\r\necho added noisy npm fixture output\r\nexit /b 0\r\n", "utf8");
+  await writeFile(path.join(fakeTools, "npm.cmd"), "@echo off\r\necho added noisy npm fixture output\r\necho npm notice from fixture 1>&2\r\nexit /b 0\r\n", "utf8");
   await mkdir(stateDir, { recursive: true });
   const recentState = path.join(stateDir, "recent-calls.json");
   const taskState = path.join(stateDir, "agent-task-cards.json");

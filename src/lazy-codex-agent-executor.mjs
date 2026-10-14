@@ -33,6 +33,7 @@ export class LazyCodexAgentExecutor {
   async resolvePendingRequest(input) { return (await this.#get()).resolvePendingRequest(input); }
   async rejectPendingRequest(input) { return (await this.#get()).rejectPendingRequest(input); }
   async resolveApproval(input) { return (await this.#get()).resolveApproval(input); }
+  async steer(input) { return (await this.#get()).steer(input); }
   async cancel(input) { return (await this.#get()).cancel(input); }
   async send(input) { return (await this.#get()).send(input); }
 

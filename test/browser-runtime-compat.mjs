@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resolveBrowserRuntimeCompatibility } from "../src/browser-runtime-compat.mjs";
@@ -38,9 +38,9 @@ try {
   assert.equal(resolved.status, "ok");
   assert.equal(resolved.source, "codex-skills-list");
   assert.equal(resolved.build, build);
-  assert.equal(path.resolve(resolved.chromeSkillPath), path.resolve(skillPath));
-  assert.equal(path.resolve(resolved.browserClientPath), path.resolve(clientPath));
-  assert.equal(path.resolve(resolved.browserServicePath), path.resolve(servicePath));
+  assert.equal(realpathSync(resolved.chromeSkillPath), realpathSync(skillPath));
+  assert.equal(realpathSync(resolved.browserClientPath), realpathSync(clientPath));
+  assert.equal(realpathSync(resolved.browserServicePath), realpathSync(servicePath));
   assert.equal(path.resolve(resolved.browserRuntimeCwd), path.resolve(env.CODEX_TOOLBOX_BROWSER_RUNTIME_CWD));
   assert.match(resolved.browserClientSha256, /^[a-f0-9]{64}$/);
   assert.equal(resolved.overrides.length, 4);
@@ -59,9 +59,9 @@ try {
   assert.equal(skilllessPlugin.status, "ok");
   assert.equal(skilllessPlugin.source, "codex-plugin-list");
   assert.equal(skilllessPlugin.chromeSkillPath, null);
-  assert.equal(path.resolve(skilllessPlugin.chromePluginRoot), path.resolve(chromeVersionRoot));
-  assert.equal(path.resolve(skilllessPlugin.browserClientPath), path.resolve(clientPath));
-  assert.equal(path.resolve(skilllessPlugin.browserServicePath), path.resolve(servicePath));
+  assert.equal(realpathSync(skilllessPlugin.chromePluginRoot), realpathSync(chromeVersionRoot));
+  assert.equal(realpathSync(skilllessPlugin.browserClientPath), realpathSync(clientPath));
+  assert.equal(realpathSync(skilllessPlugin.browserServicePath), realpathSync(servicePath));
 
   writeFileSync(browserManifestPath, JSON.stringify({ name: "browser", version: `${build}-drift` }));
   const manifestMismatch = await resolveBrowserRuntimeCompatibility({

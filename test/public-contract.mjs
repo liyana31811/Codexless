@@ -41,7 +41,7 @@ function createIsolatedPublicTestEnv(extra = {}) {
 }
 
 assert.equal(PUBLIC_SURFACE_VERSION, "codexless-public-preview-v1");
-assert.equal(PUBLIC_TOOL_NAMES.length, 44);
+assert.equal(PUBLIC_TOOL_NAMES.length, 45);
 for (const relative of [
   "src/browser-tools.mjs",
   "src/codex-browser-executor.mjs",
@@ -81,7 +81,7 @@ try {
   const tools = await client.listTools();
   const names = tools.tools.map((tool) => tool.name);
   assert.deepEqual([...names].sort(), [...PUBLIC_TOOL_NAMES].sort());
-  assert.equal(names.length, 44);
+  assert.equal(names.length, 45);
 
   for (const name of forbiddenNames) {
     assert.equal(names.includes(name), false, `${name} must not be exposed by the public preview`);
@@ -134,6 +134,13 @@ try {
 
   const startTool = tools.tools.find((tool) => tool.name === "codex.agent_start");
   const sendTool = tools.tools.find((tool) => tool.name === "codex.agent_send");
+  const steerTool = tools.tools.find((tool) => tool.name === "codex.agent_steer");
+  assert.ok(steerTool, "agent_steer must be exposed by the public runtime");
+  assert.deepEqual(steerTool.inputSchema.required, ["agentRef", "message", "expectedTurnId", "requestId"]);
+  assert.deepEqual(Object.keys(steerTool.inputSchema.properties), ["agentRef", "message", "expectedTurnId", "requestId"]);
+  assert.equal(steerTool.inputSchema.additionalProperties, false);
+  assert.match(steerTool.description, /MUST NOT replay/);
+  assert.match(tools.tools.find((tool) => tool.name === "codex.agent_show").description, /bounded native progress/);
   assert.equal(startTool?._meta?.ui?.resourceUri, undefined);
   assert.equal(startTool?._meta?.["openai/outputTemplate"], undefined);
   assert.equal(Object.hasOwn(startTool?.inputSchema?.properties ?? {}, "consentRef"), false);
@@ -328,7 +335,7 @@ try {
     await httpClient.connect(httpTransport);
     const httpTools = await httpClient.listTools();
     const httpNames = httpTools.tools.map((tool) => tool.name);
-    assert.equal(httpNames.length, 44);
+    assert.equal(httpNames.length, 45);
     assert.deepEqual([...httpNames].sort(), [...PUBLIC_TOOL_NAMES].sort());
     for (const name of forbiddenNames) {
       assert.equal(httpNames.includes(name), false, `${name} must not be exposed by the public HTTP preview`);

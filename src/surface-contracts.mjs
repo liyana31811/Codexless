@@ -8,7 +8,7 @@ export const WORKBENCH_SURFACE_VERSION = "p4-workbench-agent-task-card-v13-brows
 export const WORKBENCH_SOURCE_TOOL_COUNT_WITH_CUA = 68;
 export const WORKBENCH_SOURCE_TOOL_COUNT_WITHOUT_CUA = 63;
 
-export const PUBLIC_SERVER_VERSION = "0.1.2-preview.0";
+export const PUBLIC_SERVER_VERSION = "0.1.2-preview.1";
 export const PUBLIC_SURFACE_VERSION = "codexless-public-preview-v1";
 export const PUBLIC_TOOL_ALLOWLIST = Object.freeze([
   "codex.command_exec",
@@ -49,6 +49,7 @@ export const PUBLIC_TOOL_ALLOWLIST = Object.freeze([
   "codex.model_list",
   "codex.agent_start",
   "codex.agent_show",
+  "codex.agent_steer",
   "codex.agent_send",
   "codex.agent_decline",
   "codex.agent_commit",

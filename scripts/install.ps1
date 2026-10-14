@@ -52,6 +52,8 @@ function Invoke-Checked {
     [Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments
   )
 
+  # Native npm stderr notices are not installer failures; the exit code is authoritative.
+  $ErrorActionPreference = "Continue"
   if ($Json) {
     $captured = (& $Command @Arguments 2>&1 | Out-String).Trim()
     $exitCode = $LASTEXITCODE

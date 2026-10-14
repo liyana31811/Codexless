@@ -1267,7 +1267,7 @@ function makeWorkbench({ chromeConnected = true, skillAvailable = true, nodeRepl
             snapshot: "POST_DOWNLOAD_OK",
             clickReturned: true,
             downloadConfirmed: true,
-            downloadPath: "C:\\Users\\Test\\Downloads\\fixture.txt",
+            downloadPath: path.join(projectRoot, "fixture.txt"),
             pathError: null,
             readbackError: null,
             ...state.cleanupReceipt,
@@ -3607,7 +3607,7 @@ test("Browser prepared download confirms one exact target and returns the browse
   const downloaded = await browser.download({ actionApprovalRef: prepared.actionApprovalRef });
   assert.equal(downloaded.status, "downloaded");
   assert.equal(downloaded.downloadConfirmed, true);
-  assert.equal(downloaded.downloadPath, "C:\\Users\\Test\\Downloads\\fixture.txt");
+  assert.equal(downloaded.downloadPath, path.join(projectRoot, "fixture.txt"));
   assert.equal(downloaded.downloadFileName, "fixture.txt");
   assert.equal(downloaded.pathStatus, "available");
   assert.equal(downloaded.readbackStatus, "ok");
