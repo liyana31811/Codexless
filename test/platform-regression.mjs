@@ -98,8 +98,11 @@ setInterval(() => {}, 1000);
         if (await isRunning(pid)) {
           try { process.kill(pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
         }
+        await eventually(async () => !await isRunning(pid), "synthetic peer survived fixture disposal");
       }
-      await rm(root, { recursive: true, force: true });
+      // Windows can report a terminated process before releasing its CWD handle.
+      // Retry only this known disposable fixture; non-transient errors still fail.
+      await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     },
   };
 }
