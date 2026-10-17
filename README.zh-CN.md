@@ -106,7 +106,7 @@ Browser 使用你选择的本地浏览器 profile 和其中已有的网站登录
 
 ## 安装前先确认
 
-- **平台：** Windows + **Apple Silicon macOS（arm64）** Technical Preview。Intel Mac 暂不支持。
+- **平台：** Windows、**Apple Silicon macOS（arm64）** 及 **Ubuntu Linux（x64）** Technical Preview。Linux arm64 已有平台分支，尚无真机验收；Intel Mac 暂不支持。
 - **前提：** 本机已有 **Node.js 22+** 和一套可工作的 **Codex**。Codex Desktop 不是必须项，有可用 CLI/runtime 即可。
 - **Recommended 双路径：** 可以额外准备一套固定版本的官方 Codex runtime，用于已经支持的文件 / 命令工作；它不会替换本机 Codex，登录状态也相互隔离。
 - **Browser：** 本机需要 Chrome 或 Edge，以及已连接的 ChatGPT 浏览器扩展。
@@ -180,6 +180,22 @@ sh ./bin/codexless-install.sh
 ```sh
 "$HOME/Library/Application Support/Codexless/app/bin/codexless-uninstall.sh"
 ```
+
+### Ubuntu Linux（Preview）
+
+Linux 使用独立名称 `codexless-linux` 与 XDG 目录，`CODEX_HOME`、配置、登录和状态与原有 Codex 隔离；不读取或修改原有 `~/.codex/config.toml`，也不复用 Windows 的插件或 Tunnel 身份。
+
+```sh
+node scripts/linux.mjs install \
+  --codex /absolute/path/to/codex \
+  --cwd /absolute/path/to/authorized/project --trust-project
+"$HOME/.local/bin/codexless-linux-doctor"
+"$HOME/.local/bin/codexless-linux-stdio"
+```
+
+需要 Node.js 22+、npm 和已有的本机 Codex CLI。`--trust-project` 只对新建的独立配置明确授权所选项目；未授权时省略。安装不会启动服务或启用自启动。命令装到 `~/.local/bin`，该目录不在 `PATH` 时使用绝对路径。
+
+完整步骤见 [Linux 安装与运行手册](README.linux.md) 和 [独立 Tunnel / ChatGPT 插件手册](README.linux-tunnel.zh-CN.md)。Linux 已验证文件、Git 与受限命令路径；模型调用另需 `codexless-linux-login`，Browser / Excel 尚未在 Linux 验收。跟随桌面客户端启动/退出属于可选集成，须明确配置兼容客户端；关闭浏览器标签页不属于该生命周期。
 
 升级或重装时，获取新的 release/tag 后再次运行同一个 installer 即可。安装目录之外的用户状态会保留。Codexless 不会偷偷扩大 Codex trust，也不会替用户配置 Tunnel 或浏览器文件访问权限。
 

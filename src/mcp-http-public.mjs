@@ -2,6 +2,7 @@ import http from "node:http";
 import { createRequire } from "node:module";
 import { createCodexlessRuntime } from "./codexless-runtime.mjs";
 import { createMcpHttpSessionRouter } from "./mcp-http-session-router.mjs";
+import { codexlessIdentity } from "./linux-identity.mjs";
 
 const require = createRequire(import.meta.url);
 const { createMcpHandler } = require("@modelcontextprotocol/server");
@@ -46,12 +47,12 @@ const server = http.createServer(async (req, res) => {
         // Compatibility service id retained for health-check consumers; not the product name.
         // Compatibility service id for existing public-preview health probes; not the product name.
         service: "codexless-public",
+        serverName: codexlessIdentity().name,
         transport: "streamable-http",
         publicPreview: true,
         version: runtime.version,
         surfaceVersion: runtime.surfaceVersion,
         toolCount: runtime.toolAllowlist?.length ?? null,
-        defaultCwd: runtime.authorityValidation.defaultCwd ?? null,
       }));
       return;
     }

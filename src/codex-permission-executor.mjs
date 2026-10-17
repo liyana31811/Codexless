@@ -23,7 +23,8 @@ const KNOWN_SANDBOX_FIELDS = {
 };
 
 function normalizeConfigPath(value) {
-  return path.resolve(value).replaceAll("/", "\\").toLowerCase();
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 function getMcpServers(config) {
@@ -32,7 +33,7 @@ function getMcpServers(config) {
 
 function getTrustLevel(config, workspaceRoot) {
   const projects = config?.projects ?? {};
-  const entry = projects[normalizeConfigPath(workspaceRoot)];
+  const entry = Object.entries(projects).find(([root]) => normalizeConfigPath(root) === normalizeConfigPath(workspaceRoot))?.[1];
   return entry?.trust_level ?? entry?.trustLevel ?? null;
 }
 

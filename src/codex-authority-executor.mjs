@@ -50,8 +50,9 @@ async function resolveWindowsExecutable(command) {
   }
 }
 
-function normalizeConfigPath(value) {
-  return path.resolve(value).replaceAll("/", "\\").toLowerCase();
+export function normalizeConfigPath(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 function getMcpServers(config) {
@@ -71,7 +72,7 @@ function buildQuietSessionConfig(config) {
   };
 }
 
-function findTrustedAncestor(config, cwd) {
+export function findTrustedAncestor(config, cwd) {
   const target = normalizeConfigPath(cwd);
   const projects = config?.projects ?? {};
   let best = null;
@@ -80,7 +81,8 @@ function findTrustedAncestor(config, cwd) {
     const trustLevel = entry?.trust_level ?? entry?.trustLevel ?? null;
     if (trustLevel !== "trusted") continue;
     const normalizedRoot = normalizeConfigPath(rawRoot);
-    const withinRoot = target === normalizedRoot || target.startsWith(`${normalizedRoot}\\`);
+    const relative = path.relative(normalizedRoot, target);
+    const withinRoot = relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
     if (!withinRoot) continue;
     if (!best || normalizedRoot.length > best.normalizedRoot.length) {
       best = { root: path.resolve(rawRoot), normalizedRoot, trustLevel };
@@ -88,6 +90,18 @@ function findTrustedAncestor(config, cwd) {
   }
 
   return best;
+}
+
+export function boundLinuxPermissionProfile(profileId, { access = "inherit", allowedProfiles, platform = process.platform } = {}) {
+  if (platform !== "linux") return access === "readOnly" ? ":read-only" : profileId;
+  if ([":read-only", ":workspace", ":danger-full-access"].includes(profileId) && access === "readOnly") return ":read-only";
+  if (profileId === ":read-only" || profileId === ":workspace") return profileId;
+  const allowed = allowedProfiles instanceof Set ? allowedProfiles : new Set(allowedProfiles ?? []);
+  if (profileId === ":danger-full-access" && allowed.has(":workspace")) return ":workspace";
+  throw new ToolwirePermissionError(
+    "Linux remote operations require a locally authorized read-only or workspace sandbox; an unbounded or unverified custom permission profile is not accepted.",
+    { code: "LINUX_PERMISSION_CEILING", nextActions: ["Use a locally authorized Codex read-only/workspace profile; do not disable the sandbox to repair a remote tool call."] }
+  );
 }
 
 function explicitDefaultPermissionProfile(config) {
@@ -568,7 +582,7 @@ export class CodexAuthorityExecutor {
       throw new Error(`authority resolver returned a Codex profile that is not currently allowed: ${authority.profileId}`);
     }
 
-    const permissionProfile = access === "readOnly" ? ":read-only" : authority.profileId;
+    const permissionProfile = boundLinuxPermissionProfile(authority.profileId, { access, allowedProfiles });
     if (!allowedProfiles.has(permissionProfile)) {
       throw new Error(`requested Codexless downscope is not available in Codex: ${permissionProfile}`);
     }
@@ -576,7 +590,7 @@ export class CodexAuthorityExecutor {
     return {
       effectiveCwd,
       permissionProfile,
-      permissionCeiling: authority.profileId,
+      permissionCeiling: boundLinuxPermissionProfile(authority.profileId, { access: "inherit", allowedProfiles }),
       authoritySource: authority.source,
       trustedAncestor: authority.trustedAncestor,
     };
@@ -654,7 +668,10 @@ export class CodexAuthorityExecutor {
     }
 
     const trusted = findTrustedAncestor(effectiveConfig, this.#defaultCwd);
-    if (!trusted && this.#allowUntrustedReadOnlyBootstrap) {
+    // Linux can start and advertise its public surface before the user selects
+    // an already trusted project. This probe only checks the read-only runtime;
+    // operation authority still requires trust in #resolveAuthorityWithClient.
+    if (!trusted && (this.#allowUntrustedReadOnlyBootstrap || process.platform === "linux")) {
       const result = await client.exec(
         {
           command: [process.execPath, "-e", `process.stdout.write(${JSON.stringify(COMPATIBILITY_PROBE_MARKER)})`],

@@ -54,6 +54,14 @@ Adding another runtime source file is a public-surface decision, not a routine c
 
 Release engineering files are also intentionally bounded: `scripts/doctor.mjs`, `scripts/resolve-codex.mjs`, `scripts/launch.mjs`, `scripts/install.ps1`, `scripts/uninstall.ps1`, `scripts/install.sh`, `scripts/uninstall.sh`, and the accepted `bin/codexless-*.cmd` / `bin/codexless-*.sh` launchers. The platform installers copy an explicit release-entry list instead of recursively mirroring the upstream development tree.
 
+## Linux Preview contribution
+
+The Linux contribution reuses the public runtime and unchanged tool schemas, adding `src/linux-identity.mjs`, the `scripts/linux*.mjs` / `scripts/linux*.py` lifecycle helpers, `bin/codexless-linux*`, a non-secret example configuration, and Linux tests/documentation. The npm/release product remains `codexless`; `codexless-linux` is the independent Linux service and connection identity. This list is a proposed extension of the accepted release boundary for maintainer review, not permission to export a developer's installed configuration, runtime, credentials, or account resources.
+
+The contribution changes the shared `src/construction-tools.mjs` authority helper. That file is normally a byte-for-byte canonical mirror, so local public-contract and Browser regressions alone cannot certify its export lineage. Before release, the maintainer must reconcile the helper with the canonical source and run the household `test:public-browser-export-parity` gate, including the atomic mirror and copied regressions required above. That household source/gate is unavailable in the standalone public checkout; do not report it as passed or replace it with a locally invented hash baseline.
+
+Review the Linux packaging roots together with all platform staging lists and the generated release manifest. Linux-specific docs and launchers belong in the artifact identity. Keep local acceptance probes, deployment receipts, installed XDG directories, Tunnel profiles, keys, and downloaded binary/runtime archives out of the contribution. Linux tests use isolated synthetic fixtures rather than user projects.
+
 ## Explicit exclusions
 
 The export must not bring in implementation or registration for:

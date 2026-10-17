@@ -1034,7 +1034,7 @@ function createTaskPersistence({ filePath = null, ttlMs = DEFAULT_TASK_STORE_TTL
   function flush() {
     assertAvailable();
     trim();
-    mkdirSync(path.dirname(resolvedPath), { recursive: true });
+    mkdirSync(path.dirname(resolvedPath), { recursive: true, mode: 0o700 });
     const tmp = `${resolvedPath}.tmp-${randomUUID()}`;
     writeFileSync(tmp, JSON.stringify({ version: TASK_STORE_VERSION, records: [...records.values()] }), { encoding: "utf8", mode: 0o600 });
     renameSync(tmp, resolvedPath);

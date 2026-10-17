@@ -106,7 +106,7 @@ function Copy-ReleaseTree {
   $entries = @(
     "src", "config", "scripts", "skills", "bin",
     "package.json",
-    "README.md", "README.zh-CN.md", "SECURITY.md", "EXPORT_SYNC.md",
+    "README.md", "README.zh-CN.md", "README.linux.md", "README.linux-tunnel.zh-CN.md", "SECURITY.md", "EXPORT_SYNC.md",
     "THIRD_PARTY_NOTICES.md", "LICENSE"
   )
   foreach ($entry in $entries) {

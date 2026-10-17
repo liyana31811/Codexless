@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { codexlessIdentity } from "./linux-identity.mjs";
 import { registerAgentPreviewTools } from "./agent-tools.mjs";
 import { registerBrowserPreviewTools } from "./browser-tools.mjs";
 import { registerConstructionTools } from "./construction-tools.mjs";
@@ -86,8 +87,7 @@ export function createCodexToolboxServerFactory({
   return function createServer() {
     const server = new McpServer(
       {
-        name: "codexless",
-        title: "Codexless",
+        ...codexlessIdentity(),
         version,
         description: "Thin MCP adapter to model-free tools exposed by the official Codex App Server.",
       },

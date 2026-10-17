@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+SCRIPT_PATH=$(readlink -f -- "$0")
+APP_ROOT=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)
+if [ -n "${CODEXLESS_LINUX_NODE:-}" ]; then
+  NODE_BIN=$CODEXLESS_LINUX_NODE
+elif [ -x "$APP_ROOT/../runtime/bin/node" ]; then
+  NODE_BIN=$APP_ROOT/../runtime/bin/node
+else
+  NODE_BIN=$(command -v node 2>/dev/null || true)
+fi
+[ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ] || {
+  echo 'Node.js 22+ is required. Set CODEXLESS_LINUX_NODE to its absolute executable path.' >&2
+  exit 1
+}
+exec "$NODE_BIN" "$APP_ROOT/scripts/linux-chatgpt.mjs" "$@"

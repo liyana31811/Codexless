@@ -22,6 +22,7 @@ export class CodexAppServerClient {
   #cwd;
   #launchFactory;
   #child = null;
+  #ownedProcess = null;
   #cleanup = null;
   #buffer = "";
   #nextId = 1;
@@ -106,6 +107,9 @@ export class CodexAppServerClient {
 
   async start() {
     if (this.#child) return this.#initializedResult;
+    // A crashed server can leave a launch-factory cleanup pending even after
+    // its process group has already been stopped by the exit handler.
+    if (this.#ownedProcess || this.#cleanup) await this.close();
     this.#closing = false;
     this.#buffer = "";
 
@@ -117,9 +121,14 @@ export class CodexAppServerClient {
       env: spec.options?.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: spec.options?.windowsHide ?? true,
+      // Give this bridge-owned child a separate POSIX process group so timeout
+      // cleanup can also stop commands that outlive the App Server process.
+      detached: process.platform !== "win32",
       shell: false,
     });
+    const ownedProcess = { child, groupFinalized: false, error: null };
     this.#child = child;
+    this.#ownedProcess = ownedProcess;
     this.#cleanup = typeof spec.cleanup === "function" ? spec.cleanup : null;
 
     child.stdout.setEncoding("utf8");
@@ -134,6 +143,12 @@ export class CodexAppServerClient {
     });
     child.on("error", (error) => this.#failAll(error));
     child.on("exit", (code, signal) => {
+      // Finalize immediately and at most once. Retrying a saved numeric PGID
+      // during a later close could target an unrelated, reused process group.
+      if (process.platform !== "win32") {
+        try { finalizeOwnedGroup(ownedProcess); }
+        catch (error) { ownedProcess.error = error; }
+      }
       const wasRunning = this.#child === child;
       if (wasRunning) this.#child = null;
       if (wasRunning && !this.#closing) {
@@ -200,46 +215,54 @@ export class CodexAppServerClient {
   }
 
   async close() {
-    const child = this.#child;
+    const ownedProcess = this.#ownedProcess;
+    const child = ownedProcess?.child ?? this.#child;
     const cleanup = this.#cleanup;
-    let cleanupError = null;
+    const errors = [];
     this.#closing = true;
 
     if (child && this.#pendingServerRequests.size) {
       this.#closePendingServerRequests();
     }
     this.#child = null;
+    this.#ownedProcess = null;
     this.#cleanup = null;
 
-    if (child) {
-      try {
-        child.stdin.end();
-      } catch {}
-      await Promise.race([
-        new Promise((resolve) => child.once("exit", resolve)),
-        new Promise((resolve) => setTimeout(resolve, 1_000)),
-      ]);
-      if (child.exitCode === null && child.signalCode === null) {
+    try {
+      if (child) {
+        try { child.stdin.end(); } catch {}
+        await waitForChildExit(child, 1_000);
+        if (child.exitCode === null && child.signalCode === null) {
+          signalChild(child, "SIGTERM");
+          await waitForChildExit(child, 1_000);
+        }
+        if (process.platform !== "win32") finalizeOwnedGroup(ownedProcess);
+        else if (child.exitCode === null && child.signalCode === null) signalChild(child, "SIGKILL");
+        await waitForChildExit(child, 1_000);
+      }
+    } catch (error) {
+      errors.push(error);
+    } finally {
+      if (process.platform !== "win32" && ownedProcess && !ownedProcess.groupFinalized) {
         try {
-          child.kill();
-        } catch {}
+          finalizeOwnedGroup(ownedProcess);
+          await waitForChildExit(child, 1_000);
+        } catch (error) { errors.push(error); }
       }
-    }
-
-    if (cleanup) {
-      try {
-        await cleanup();
-      } catch (error) {
-        cleanupError = error;
-        process.stderr.write(`[codex-app-server] cleanup failure: ${error instanceof Error ? error.message : String(error)}\n`);
+      // A failed signal must not skip private launch-file cleanup.
+      if (cleanup) {
+        try { await cleanup(); }
+        catch (error) {
+          errors.push(error);
+          process.stderr.write(`[codex-app-server] cleanup failure: ${error instanceof Error ? error.message : String(error)}\n`);
+        }
       }
+      if (this.#pending.size) this.#failAll(new Error("codex app-server closed before pending requests completed"));
+      this.#closing = false;
     }
-
-    if (this.#pending.size) {
-      this.#failAll(new Error("codex app-server closed before pending requests completed"));
-    }
-    this.#closing = false;
-    if (cleanupError) throw cleanupError;
+    if (ownedProcess?.error && !errors.includes(ownedProcess.error)) errors.push(ownedProcess.error);
+    if (errors.length === 1) throw errors[0];
+    if (errors.length) throw new AggregateError(errors, "Codex App Server shutdown and cleanup failed");
   }
 
   #send(message) {
@@ -428,4 +451,28 @@ export class CodexAppServerClient {
     }
     this.#pending.clear();
   }
+}
+
+function finalizeOwnedGroup(ownedProcess) {
+  if (!ownedProcess || ownedProcess.groupFinalized) return;
+  ownedProcess.groupFinalized = true;
+  signalChild(ownedProcess.child, "SIGKILL");
+}
+
+function signalChild(child, signal) {
+  try {
+    if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); child.removeListener("exit", done); resolve(); };
+    const timer = setTimeout(done, timeoutMs);
+    child.once("exit", done);
+  });
 }

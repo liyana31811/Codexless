@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { codexlessIdentity } from "./linux-identity.mjs";
 import { registerAgentPreviewTools } from "./agent-tools.mjs";
 import { registerBrowserPreviewTools } from "./browser-tools.mjs";
 import { registerConstructionTools } from "./construction-tools.mjs";
@@ -102,8 +103,7 @@ export function createPublicServerFactory({
     let inFlight = 0;
     const server = new McpServer(
       {
-        name: "codexless",
-        title: "Codexless",
+        ...codexlessIdentity(),
         version: PUBLIC_SERVER_VERSION,
         description: "Local bridge that lets ChatGPT use accepted Codex-backed capabilities and explicitly escalate to Codex when needed.",
       },

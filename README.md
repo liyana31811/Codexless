@@ -110,7 +110,7 @@ The underlying task binding remains single-use and replay-safe: a stale or alrea
 
 ## Before you install
 
-- **Platforms:** Windows and **Apple Silicon macOS (`arm64`)** Technical Preview. Intel Mac is not supported yet.
+- **Platforms:** Windows, **Apple Silicon macOS (`arm64`)**, and **Ubuntu Linux (`x64`)** Technical Preview. Linux `arm64` has platform support but has not passed real-machine acceptance. Intel Mac is not supported yet.
 - **Prerequisites:** **Node.js 22+** and one working local **Codex** installation. Codex Desktop is optional if a working CLI/runtime is available.
 - **Recommended dual runtime:** Recommended setup can also prepare a pinned official Codex runtime as an independent path for supported file/command work. It does not replace your existing local Codex and uses an isolated login.
 - **Browser:** Chrome or Edge plus the ChatGPT browser extension, connected in the profile you want to use.
@@ -192,6 +192,24 @@ Uninstall:
 ```sh
 "$HOME/Library/Application Support/Codexless/app/bin/codexless-uninstall.sh"
 ```
+
+### Ubuntu Linux (Preview)
+
+Linux uses the independent service name `codexless-linux` and XDG application, configuration, and state directories. Its isolated `CODEX_HOME` does not read or change your existing `~/.codex/config.toml` or copy its login credentials. Existing Windows/macOS connections remain separate.
+
+From a reviewed source checkout, with Node.js 22+, npm, and an existing native Codex CLI:
+
+```sh
+node scripts/linux.mjs install \
+  --codex /absolute/path/to/codex \
+  --cwd /absolute/path/to/authorized/project --trust-project
+"$HOME/.local/bin/codexless-linux-doctor"
+"$HOME/.local/bin/codexless-linux-stdio"
+```
+
+`--trust-project` explicitly trusts only that project in a newly created isolated Codex configuration; omit it to preserve trust decisions. Installation does not start a service or enable autostart. Commands are installed under `~/.local/bin`; use their absolute paths if that directory is absent from your `PATH`.
+
+See the [Linux installation and lifecycle manual](README.linux.md) and [official Tunnel / separate ChatGPT connection guide](README.linux-tunnel.zh-CN.md) (Chinese). File, Git, and bounded command paths have Linux integration tests. Model use requires a separate `codexless-linux-login`; Browser and Excel are not included in Linux acceptance. Optional desktop-client lifecycle integration requires a locally installed compatible client and explicit setup; a browser tab is not an application lifecycle signal.
 
 To upgrade or reinstall, get the newer release/tag and run the same installer again. User state stored outside the install tree is preserved. Codexless does not silently widen Codex trust, configure your Tunnel, or change browser file permissions for you.
 

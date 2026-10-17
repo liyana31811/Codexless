@@ -27,6 +27,7 @@ import { readCodexQuotaSnapshot } from "./codex-quota-snapshot.mjs";
 import { createPreviewTelemetryClient } from "./codex-preview-account-preflight.mjs";
 import { createCodexToolboxServerFactory } from "./mcp-server-factory.mjs";
 import { createRecentCallReceiptStore } from "./recent-call-receipts.mjs";
+import { codexlessPaths } from "./linux-identity.mjs";
 
 function envString(env, name, fallback = null) {
   const value = env?.[name];
@@ -240,7 +241,7 @@ export async function createCodexlessRuntime({
     env,
     envNames.agentTaskStateFile,
     publicPreview
-      ? path.join(os.homedir(), ".config", "codexless", "agent-task-cards.json")
+      ? path.join(stateRoot ?? codexlessPaths({ env }).state, "agent-task-cards.json")
       : path.join(
           os.homedir(),
           ".config",

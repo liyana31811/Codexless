@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "applicationId": "codexless-linux",
+  "serverName": "codexless-linux",
+  "host": "127.0.0.1",
+  "port": 7691,
+  "defaultCwd": "/absolute/path/to/a/project/already-trusted-by-codex",
+  "codexBin": null
+}

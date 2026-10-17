@@ -77,7 +77,7 @@ export function managedLoginJourney({ managedCodexHome } = {}) {
 
 export async function createCodexRuntimeProvider({
   env = process.env,
-  stateRoot = defaultCodexlessStateRoot(),
+  stateRoot = defaultCodexlessStateRoot(env),
 } = {}) {
   let routing;
   try {
