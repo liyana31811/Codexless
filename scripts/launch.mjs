@@ -6,9 +6,9 @@ if (!new Set(["http", "stdio"]).has(mode)) {
   process.exit(2);
 }
 
-const supportedPlatform = process.platform === "win32" || (process.platform === "darwin" && process.arch === "arm64");
+const supportedPlatform = process.platform === "win32" || (process.platform === "darwin" && process.arch === "arm64") || (process.platform === "linux" && ["x64", "arm64"].includes(process.arch));
 if (!supportedPlatform) {
-  process.stderr.write(`Codexless Technical Preview currently supports Windows and Apple Silicon macOS only. Current: ${process.platform}/${process.arch}\n`);
+  process.stderr.write(`Codexless supports Windows, Apple Silicon macOS, and Linux x64/arm64. Current: ${process.platform}/${process.arch}\n`);
   process.exit(1);
 }
 

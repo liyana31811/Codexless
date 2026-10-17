@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { codexlessPaths } from "./linux-identity.mjs";
 
 export const CODEX_CALL_PROFILE_SCHEMA_VERSION = 2;
 export const CODEX_CALL_PROFILE_DOCUMENT_TYPE = "codex-call-profile";
@@ -54,7 +54,7 @@ export function defaultCodexCallProfilePath(env = process.env) {
   const explicit = typeof env?.CODEXLESS_CALL_PROFILE_FILE === "string"
     ? env.CODEXLESS_CALL_PROFILE_FILE.trim()
     : "";
-  return explicit || path.join(os.homedir(), ".config", "codexless", "codex-call-profile.md");
+  return explicit || path.join(codexlessPaths({ env }).config, "codex-call-profile.md");
 }
 
 function parseScalar(raw) {
@@ -343,7 +343,7 @@ export function saveCodexCallProfile({
   const text = serializeProfile({ profileRevision, requireCallApproval, instruction });
 
   const resolvedPath = path.resolve(filePath);
-  mkdirSync(path.dirname(resolvedPath), { recursive: true });
+  mkdirSync(path.dirname(resolvedPath), { recursive: true, ...(process.platform === "linux" ? { mode: 0o700 } : {}) });
   const tmp = `${resolvedPath}.tmp-${randomUUID()}`;
   writeFileSync(tmp, text, { encoding: "utf8", mode: 0o600 });
   const latest = loadCodexCallProfile({ filePath: resolvedPath });

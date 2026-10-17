@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { codexlessPaths } from "./linux-identity.mjs";
 
 export const RECENT_CALL_STORE_VERSION = 1;
 export const DEFAULT_RECENT_CALL_TTL_MS = 15 * 60_000;
@@ -25,13 +25,13 @@ const RECEIPT_KEY_SET = new Set(RECEIPT_KEYS);
 const STATUSES = new Set(["arrived", "handler_started", "returned", "handler_error"]);
 const RESULT_CLASSES = new Set(["success", "tool_error"]);
 
-export function defaultRecentCallStateFile() {
-  return path.join(os.homedir(), ".config", "codexless", "recent-calls.json");
+export function defaultRecentCallStateFile(env = process.env) {
+  return path.join(codexlessPaths({ env }).state, "recent-calls.json");
 }
 
 export function recentCallOptionsFromEnv(env = process.env, { readOnly = false } = {}) {
   return {
-    filePath: envString(env, "CODEXLESS_RECENT_CALLS_STATE_FILE", defaultRecentCallStateFile()),
+    filePath: envString(env, "CODEXLESS_RECENT_CALLS_STATE_FILE", defaultRecentCallStateFile(env)),
     ttlMs: envInteger(env, "CODEXLESS_RECENT_CALLS_TTL_MS", DEFAULT_RECENT_CALL_TTL_MS, { min: 10, max: 7 * 24 * 60 * 60_000 }),
     maxEntries: envInteger(env, "CODEXLESS_RECENT_CALLS_MAX_ENTRIES", DEFAULT_RECENT_CALL_MAX_ENTRIES, { min: 1, max: 10_000 }),
     queryLimit: envInteger(env, "CODEXLESS_RECENT_CALLS_QUERY_LIMIT", DEFAULT_RECENT_CALL_QUERY_LIMIT, { min: 1, max: MAX_RECENT_CALL_QUERY_LIMIT }),
@@ -107,7 +107,7 @@ export function createRecentCallDiagnostics({
     trim();
     let tmp = null;
     try {
-      mkdirSync(path.dirname(resolvedPath), { recursive: true });
+      mkdirSync(path.dirname(resolvedPath), { recursive: true, ...(process.platform === "linux" ? { mode: 0o700 } : {}) });
       tmp = `${resolvedPath}.tmp-${randomUUID()}`;
       const payload = JSON.stringify({ version: RECENT_CALL_STORE_VERSION, receipts: [...records.values()] });
       writeFileSync(tmp, payload, { encoding: "utf8", mode: 0o600 });

@@ -19,6 +19,7 @@ export const RELEASE_TREE_ENTRIES = Object.freeze([
   "package.json",
   "README.md",
   "README.zh-CN.md",
+  "README.linux.md",
   "SECURITY.md",
   "EXPORT_SYNC.md",
   "THIRD_PARTY_NOTICES.md",

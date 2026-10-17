@@ -54,6 +54,14 @@ Adding another runtime source file is a public-surface decision, not a routine c
 
 Release engineering files are also intentionally bounded: `scripts/doctor.mjs`, `scripts/resolve-codex.mjs`, `scripts/launch.mjs`, `scripts/install.ps1`, `scripts/uninstall.ps1`, `scripts/install.sh`, `scripts/uninstall.sh`, and the accepted `bin/codexless-*.cmd` / `bin/codexless-*.sh` launchers. The platform installers copy an explicit release-entry list instead of recursively mirroring the upstream development tree.
 
+## Linux core contribution
+
+The Linux contribution reuses the public runtime and unchanged tool schemas. It adds `src/linux-identity.mjs`, `src/linux-construction-adapter.mjs`, the core `scripts/linux.mjs` installer, `bin/codexless-linux*`, a non-secret example configuration, and focused tests/documentation. The npm/release product remains `codexless`; `codexless-linux` is the independent Linux service identity. Managed Tunnel, Secret Service and desktop lifecycle helpers are deferred to a separate contribution; they are not part of this core package.
+
+The canonical `construction-tools.mjs`, `browser-tools.mjs`, and `codex-browser-executor.mjs` remain byte-identical to the public upstream baseline for this contribution. Linux-specific write dispatch is isolated in an adapter which reuses canonical validation/preview and registration schemas. This removes the known canonical-file delta; it does not certify the private household export lineage. Before release, the maintainer still needs to run the household `test:public-browser-export-parity` gate required above. That household source/gate is unavailable in this public checkout; do not report it as passed or substitute the public-baseline comparison for it.
+
+Review new runtime imports and platform staging lists with the generated manifest. Keep local acceptance probes, deployment receipts, installed XDG directories, Tunnel profiles, keys, and downloaded binary/runtime archives out of the contribution. Test fixtures are synthetic and isolated. Native Windows/macOS regression checks are provided separately and must be observed on those operating systems before being reported as passed.
+
 ## Explicit exclusions
 
 The export must not bring in implementation or registration for:

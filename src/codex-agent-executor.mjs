@@ -378,6 +378,9 @@ export class CodexAgentExecutor {
     if (permissionProfile !== null && (typeof permissionProfile !== "string" || !permissionProfile.trim())) {
       throw new Error("permissionProfile must be a non-empty string when provided");
     }
+    if (process.platform === "linux" && permissionProfile !== null && ![":read-only", ":workspace"].includes(permissionProfile)) {
+      throw new Error("Linux agent execution requires the locally resolved read-only or workspace permission profile");
+    }
     const requestedModel = normalizeModel(model);
     const requestedReasoningEffort = normalizeReasoningEffort(reasoningEffort);
 

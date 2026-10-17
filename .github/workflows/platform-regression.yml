@@ -1,0 +1,39 @@
+name: Native platform regression
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, feature/codexless-linux]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  platform-regression:
+    name: Node 22 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+      - name: Model-free native process, executable, and authority regressions
+        run: node --test test/platform-regression.mjs
+        env:
+          HOME: ${{ runner.temp }}/codexless-ci-home
+          USERPROFILE: ${{ runner.temp }}/codexless-ci-home
+          CODEX_HOME: ${{ runner.temp }}/codexless-ci-codex-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/codexless-ci-config
+          XDG_STATE_HOME: ${{ runner.temp }}/codexless-ci-state
+          OPENAI_API_KEY: ''
+          CODEXLESS_LINUX_TUNNEL_API_KEY: ''
+      - name: Linux process group descendants and cleanup failures
+        if: runner.os == 'Linux'
+        run: node --test test/linux-app-server-cleanup.mjs

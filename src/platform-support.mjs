@@ -1,4 +1,7 @@
 export function codexlessPlatformSupport({ platform = process.platform, arch = process.arch } = {}) {
+  if (platform === "linux" && ["x64", "arm64"].includes(arch)) {
+    return { status: "supported", platform, arch, product: `Linux ${arch}`, scope: "core-files-git-terminal-codex" };
+  }
   if (platform === "win32" && arch === "x64") {
     return { status: "supported", platform, arch, product: "Windows x64" };
   }
