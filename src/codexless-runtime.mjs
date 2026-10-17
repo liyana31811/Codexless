@@ -241,7 +241,7 @@ export async function createCodexlessRuntime({
     env,
     envNames.agentTaskStateFile,
     publicPreview
-      ? path.join(stateRoot ?? codexlessPaths({ env }).state, "agent-task-cards.json")
+      ? path.join(process.platform === "linux" ? stateRoot ?? codexlessPaths({ env }).state : codexlessPaths({ env }).state, "agent-task-cards.json")
       : path.join(
           os.homedir(),
           ".config",

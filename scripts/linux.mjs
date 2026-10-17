@@ -12,8 +12,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ID = "codexless-linux";
 const UNIT_MARKER = "# Managed by codexless-linux; independent of codexless";
-const COMMANDS = ["install", "start", "stop", "restart", "status", "logs", "doctor", "update", "rollback", "uninstall", "http", "stdio", "enable", "disable", "login", "tunnel", "chatgpt"];
-const COPY_ENTRIES = ["src", "scripts", "bin", "config", "skills", "package.json", "npm-shrinkwrap.json", "README.md", "README.zh-CN.md", "README.linux.md", "README.linux-tunnel.zh-CN.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md", "EXPORT_SYNC.md", "LICENSE"];
+const COMMANDS = ["install", "start", "stop", "restart", "status", "logs", "doctor", "update", "rollback", "uninstall", "http", "stdio", "enable", "disable", "login"];
+const COPY_ENTRIES = ["src", "scripts", "bin", "config", "skills", "package.json", "npm-shrinkwrap.json", "README.md", "README.zh-CN.md", "README.linux.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md", "EXPORT_SYNC.md", "LICENSE"];
 
 export function linuxPaths(env = process.env, home = os.homedir()) {
   const xdg = (key, fallback) => env[key] ? absolute(env[key], key) : path.join(home, fallback);
@@ -33,7 +33,6 @@ function absolute(value, label) {
   if (typeof value !== "string" || !path.isAbsolute(value) || /[\n\r\0]/.test(value)) throw new Error(`${label} must be an absolute path without control characters`);
   return path.resolve(value);
 }
-function shellQuote(value) { return `'${String(value).replaceAll("'", "'\\''")}'`; }
 function systemdQuote(value, escapeDollar = false) {
   const quoted = String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%");
   return `"${escapeDollar ? quoted.replaceAll("$", "$$") : quoted}"`;
@@ -176,7 +175,7 @@ async function resolveNpm(options, nodeSource) {
 }
 
 async function install(paths, options, updating = false) {
-  await assertSessionStopped(paths);
+  await assertCoreInstallation(paths);
   const old = await ownership(paths, { required: updating });
   if (old) {
     await assertStopped();
@@ -314,31 +313,14 @@ async function assertStopped() {
   try { const result = await service(["is-active", `${ID}.service`]); if (result.code === 0 || ["activating", "deactivating", "reloading"].includes(result.stdout.trim())) throw new Error("Stop codexless-linux before changing its installation"); }
   catch (error) { if (error.code !== "ENOENT") throw error; }
 }
-async function assertSessionStopped(paths) {
-  const configuration = path.join(paths.config, "session.json");
-  if (!(await exists(configuration))) return;
-  await rejectSymlink(configuration);
-  const configStat = await lstat(configuration);
-  if (!configStat.isFile() || configStat.uid !== process.getuid() || (configStat.mode & 0o077)) throw new Error("Session configuration must be an owned private regular file before changing the installation");
-  const { sessionPaths, sameProcess } = await import("./linux-chatgpt.mjs");
-  const defaults = sessionPaths({ ...process.env, XDG_DATA_HOME: path.dirname(paths.data), XDG_CONFIG_HOME: path.dirname(paths.config), XDG_STATE_HOME: path.dirname(paths.state) }, paths.home);
-  const config = await json(configuration);
-  if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("Invalid ChatGPT session configuration; inspect it before changing the installation");
-  const runtime = config.runtimeDir === undefined ? defaults.runtime : absolute(config.runtimeDir, "session runtimeDir");
-  const lock = path.join(runtime, "chatgpt-session.lock");
-  if (!(await exists(lock))) return;
-  const lockStat = await lstat(lock);
-  if (!lockStat.isDirectory() || lockStat.isSymbolicLink() || lockStat.uid !== process.getuid() || (lockStat.mode & 0o077)) throw new Error("Unsafe ChatGPT session lock; inspect it before changing the installation");
-  const ownerPath = path.join(lock, "owner.json");
-  if (!(await exists(ownerPath))) {
-    if (Date.now() - lockStat.mtimeMs < 5000) throw new Error("ChatGPT session is starting; run codexless-linux-chatgpt stop before changing the installation");
-    return;
+async function assertCoreInstallation(paths) {
+  // Optional integrations are maintained separately. Do not replace their
+  // installed helpers or launchers with a distribution that does not contain them.
+  for (const name of ["session.json", "desktop-integration.json", "tunnel"]) {
+    if (await exists(path.join(paths.config, name))) {
+      throw new Error(`Optional integration configuration exists (${name}); use the integration distribution for maintenance. This core checkout will not replace it.`);
+    }
   }
-  const ownerStat = await lstat(ownerPath);
-  if (!ownerStat.isFile() || ownerStat.isSymbolicLink() || ownerStat.uid !== process.getuid() || (ownerStat.mode & 0o077)) throw new Error("Unsafe ChatGPT session owner metadata; inspect it before changing the installation");
-  const owner = await json(ownerPath);
-  if (!Number.isSafeInteger(owner?.pid) || owner.pid < 1 || typeof owner.startTime !== "string" || !/^\d+$/.test(owner.startTime)) throw new Error("Invalid ChatGPT session owner metadata; inspect it before changing the installation");
-  if (await sameProcess(owner)) throw new Error("ChatGPT session is running; run codexless-linux-chatgpt stop before changing the installation. This stops the bridge and Tunnel without closing ChatGPT.");
 }
 async function requireStartConfirmation(paths, options) {
   const marker = path.join(paths.state, "service-start-approved.json");
@@ -382,8 +364,7 @@ async function doctor(paths, options) {
 }
 
 async function uninstall(paths) {
-  await assertSessionStopped(paths);
-  if (await exists(path.join(paths.config, "desktop-integration.json"))) throw new Error(`Restore the ChatGPT desktop launcher before uninstalling: python3 ${shellQuote(path.join(paths.app, "scripts", "linux-desktop.py"))} restore. The session configuration and credential are preserved.`);
+  await assertCoreInstallation(paths);
   const receipt = await ownership(paths, { required: false });
   if (!receipt) return { ok: true, action: "already_uninstalled", applicationId: ID, configurationPreserved: true };
   await assertStopped();
@@ -457,7 +438,7 @@ async function validateRollbackBackup(paths, backup, previous) {
 // The optional adapters let the isolated lifecycle tests exercise mid-switch I/O failures.
 // CLI callers always use the native filesystem operations.
 export async function rollbackInstallation(paths, { move = rename, commitReceipt = atomicJson } = {}) {
-  await assertSessionStopped(paths);
+  await assertCoreInstallation(paths);
   const current = await ownership(paths);
   await assertStopped(); await assertUnmodified(paths, current);
   if (!current.previousBackup) throw new Error("No previous installation backup exists");
@@ -511,16 +492,6 @@ function parseArgs(argv) {
 }
 
 export async function main(argv = process.argv.slice(2), paths = linuxPaths()) {
-  if (argv[0] === "chatgpt") {
-    const { main: chatgptMain } = await import("./linux-chatgpt.mjs");
-    process.exitCode = await chatgptMain(argv.slice(1));
-    return null;
-  }
-  if (argv[0] === "tunnel") {
-    const { main: tunnelMain } = await import("./linux-tunnel.mjs");
-    process.exitCode = await tunnelMain(argv.slice(1));
-    return null;
-  }
   const { command, options } = parseArgs(argv);
   if (command === "help" || command === "--help") {
     return { applicationId: ID, commands: COMMANDS, install: "codexless-linux-install --node /absolute/node --npm /absolute/npm [--codex /absolute/codex] [--cwd /project] [--trust-project]", start: "codexless-linux-start --confirm-start", autostart: "codexless-linux-enable --confirm-autostart", update: "codexless-linux-update --source /reviewed/checkout", notes: "Original ~/.codex, Windows plugin and Tunnel are untouched. A separate Codex home is used; --trust-project explicitly trusts only defaultCwd in that isolated home. install never starts or enables services. Configuration and logs survive uninstall." };

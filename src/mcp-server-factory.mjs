@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { codexlessIdentity } from "./linux-identity.mjs";
 import { registerAgentPreviewTools } from "./agent-tools.mjs";
 import { registerBrowserPreviewTools } from "./browser-tools.mjs";
-import { registerConstructionTools } from "./construction-tools.mjs";
+import { registerPlatformConstructionTools } from "./linux-construction-adapter.mjs";
 import { registerExcelTools } from "./excel-tools.mjs";
 import { registerPublicTools } from "./public-tools.mjs";
 import { wrapToolHandlerWithRecentCallReceipt } from "./recent-call-receipts.mjs";
@@ -209,7 +209,7 @@ export function createCodexToolboxServerFactory({
           ? " Direct Codex model/control invocation is not a supported fallback on this model-callable process lane: household formal Codex work must use codex.agent_start/codex.agent_send. Required Call Approval returns fixed compact text bound to one exact Task ID; map literal Yes/No only through codex.agent_commit/codex.agent_decline. Running has no mechanical presentation and terminal Result is fixed text. This is an accidental-routing guard, not a claim that a generic process/PTY is an inescapable sandbox against arbitrarily wrapped executables."
           : "",
       });
-      registerConstructionTools(registrationServer, { authorityExecutor });
+      registerPlatformConstructionTools(registrationServer, { authorityExecutor });
       registerExcelTools(registrationServer, { workbench, sessionRefs: excelSessionRefs });
       if (publicPreview) registerPublicTools(registrationServer, { workbench });
     }

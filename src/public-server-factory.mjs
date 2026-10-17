@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { codexlessIdentity } from "./linux-identity.mjs";
 import { registerAgentPreviewTools } from "./agent-tools.mjs";
 import { registerBrowserPreviewTools } from "./browser-tools.mjs";
-import { registerConstructionTools } from "./construction-tools.mjs";
+import { registerPlatformConstructionTools } from "./linux-construction-adapter.mjs";
 import { registerPublicContextTools } from "./public-context-tools.mjs";
 import { installRecentCallToolInstrumentation } from "./recent-call-diagnostics.mjs";
 import { PUBLIC_SERVER_VERSION, PUBLIC_SURFACE_VERSION, PUBLIC_TOOL_NAMES } from "./surface-contracts.mjs";
@@ -162,7 +162,7 @@ export function createPublicServerFactory({
     );
 
     registerPublicContextTools(publicServer, publicContext);
-    registerConstructionTools(publicServer, { authorityExecutor });
+    registerPlatformConstructionTools(publicServer, { authorityExecutor });
     registerBrowserPreviewTools(publicServer, browser);
     registerAgentPreviewTools(publicServer, {
       agentExecutor,

@@ -34,6 +34,32 @@ test("Linux lifecycle uses absolute XDG paths, loopback, a separate Codex home a
   assert.doesNotMatch(systemdUnit(paths), /sudo|danger-full-access|enable --now/);
 });
 
+test("core lifecycle preserves optional integration configurations without loading their implementation", async () => {
+  const scratch = await mkdtemp(path.join(os.tmpdir(), "codexless-linux-integrations-"));
+  const paths = linuxPaths({}, scratch);
+  try {
+    await mkdir(paths.config, { recursive: true, mode: 0o700 });
+    const help = await main(["help"], paths);
+    assert.ok(!help.commands.includes("tunnel"));
+    assert.ok(!help.commands.includes("chatgpt"));
+    for (const name of ["session.json", "desktop-integration.json", "tunnel"]) {
+      const marker = path.join(paths.config, name);
+      if (name === "tunnel") await mkdir(marker, { mode: 0o700 });
+      else await writeFile(marker, "integration-owned fixture\n", { mode: 0o600 });
+      for (const command of ["install", "update", "rollback", "uninstall"]) {
+        await assert.rejects(main([command], paths), /use the integration distribution.*core checkout will not replace it/);
+        await assert.rejects(lstat(paths.ownership), { code: "ENOENT" });
+      }
+      await assert.rejects(rollbackInstallation(paths), /core checkout will not replace it/);
+      if (name === "tunnel") assert.ok((await lstat(marker)).isDirectory());
+      else assert.equal(await readFile(marker, "utf8"), "integration-owned fixture\n");
+      await rm(marker, { recursive: name === "tunnel" });
+    }
+    await assert.rejects(main(["tunnel"], paths), /Unknown command/);
+    await assert.rejects(main(["chatgpt"], paths), /Unknown command/);
+  } finally { await rm(scratch, { recursive: true, force: true }); }
+});
+
 test("install, stdio, idempotent reinstall, guarded update, rollback and uninstall preserve user state", { timeout: 180_000 }, async () => {
   const scratch = await mkdtemp(path.join(os.tmpdir(), "codexless-linux-lifecycle-"));
   const home = path.join(scratch, "home space"), source = path.join(scratch, "source space");
@@ -115,24 +141,16 @@ test("install, stdio, idempotent reinstall, guarded update, rollback and uninsta
     await writeFile(path.join(source, "npm-shrinkwrap.json"), JSON.stringify({ ...packageInfo, lockfileVersion: 3, requires: true, packages: { "": packageInfo } }));
     const updated = await main(["update", ...options], paths);
     assert.equal(updated.version, "2.0.0");
-    const { processIdentity } = await import("../scripts/linux-chatgpt.mjs");
-    const sessionRuntime = path.join(scratch, "session runtime"), sessionLock = path.join(sessionRuntime, "chatgpt-session.lock");
-    await mkdir(sessionLock, { recursive: true, mode: 0o700 });
-    const sessionConfig = path.join(paths.config, "session.json"), sessionOwner = path.join(sessionLock, "owner.json");
-    await writeFile(sessionConfig, JSON.stringify({ runtimeDir: sessionRuntime }), { mode: 0o600 });
-    const liveIdentity = await processIdentity(process.pid);
-    assert.ok(liveIdentity);
-    await writeFile(sessionOwner, JSON.stringify({ ...liveIdentity, sessionId: "lifecycle-test" }), { mode: 0o600 });
-    for (const command of ["install", "update", "rollback", "uninstall"]) await assert.rejects(main([command, ...(command === "install" || command === "update" ? options : [])], paths), /codexless-linux-chatgpt stop/);
-    // A PID with a different start time is stale and must not block maintenance.
-    await writeFile(sessionOwner, JSON.stringify({ ...liveIdentity, startTime: "0", sessionId: "lifecycle-test" }));
-    await assert.rejects(main(["update", ...options, "--cwd", path.join(scratch, "missing")], paths), /existing directory/);
-    await rm(sessionConfig); await rm(sessionRuntime, { recursive: true });
-    const desktopReceipt = path.join(paths.config, "desktop-integration.json");
-    await writeFile(desktopReceipt, "{}", { mode: 0o600 });
-    await assert.rejects(main(["uninstall"], paths), /linux-desktop\.py.*restore/);
-    assert.equal(JSON.parse(await readFile(path.join(paths.app, "package.json"), "utf8")).version, "2.0.0");
-    await rm(desktopReceipt);
+    // A core-only update must never displace an existing integrated deployment.
+    const receiptBeforeIntegrationGuard = await readFile(paths.ownership, "utf8");
+    const sessionConfig = path.join(paths.config, "session.json");
+    await writeFile(sessionConfig, "{}", { mode: 0o600 });
+    for (const command of ["install", "update", "rollback", "uninstall"]) {
+      await assert.rejects(main([command, ...(command === "install" || command === "update" ? options : [])], paths), /core checkout will not replace it/);
+      assert.equal(await readFile(paths.ownership, "utf8"), receiptBeforeIntegrationGuard);
+      assert.equal(JSON.parse(await readFile(path.join(paths.app, "package.json"), "utf8")).version, "2.0.0");
+    }
+    await rm(sessionConfig);
     const currentReceipt = await readFile(paths.ownership, "utf8");
     const backup = updated.previousBackup;
     const assertCurrent = async () => {

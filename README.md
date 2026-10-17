@@ -209,7 +209,7 @@ node scripts/linux.mjs install \
 
 `--trust-project` explicitly trusts only that project in a newly created isolated Codex configuration; omit it to preserve trust decisions. Installation does not start a service or enable autostart. Commands are installed under `~/.local/bin`; use their absolute paths if that directory is absent from your `PATH`.
 
-See the [Linux installation and lifecycle manual](README.linux.md) and [official Tunnel / separate ChatGPT connection guide](README.linux-tunnel.zh-CN.md) (Chinese). File, Git, and bounded command paths have Linux integration tests. Model use requires a separate `codexless-linux-login`; Browser and Excel are not included in Linux acceptance. Optional desktop-client lifecycle integration requires a locally installed compatible client and explicit setup; a browser tab is not an application lifecycle signal.
+See the [Linux core manual](README.linux.md) for isolation, permissions, lifecycle commands and testing. Managed Tunnel/keyring/desktop integration is deferred to a separate contribution.
 
 To upgrade or reinstall, get the newer release/tag and run the same installer again. User state stored outside the install tree is preserved. Codexless does not silently widen Codex trust, configure your Tunnel, or change browser file permissions for you.
 

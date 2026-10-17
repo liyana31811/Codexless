@@ -195,7 +195,7 @@ node scripts/linux.mjs install \
 
 需要 Node.js 22+、npm 和已有的本机 Codex CLI。`--trust-project` 只对新建的独立配置明确授权所选项目；未授权时省略。安装不会启动服务或启用自启动。命令装到 `~/.local/bin`，该目录不在 `PATH` 时使用绝对路径。
 
-完整步骤见 [Linux 安装与运行手册](README.linux.md) 和 [独立 Tunnel / ChatGPT 插件手册](README.linux-tunnel.zh-CN.md)。Linux 已验证文件、Git 与受限命令路径；模型调用另需 `codexless-linux-login`，Browser / Excel 尚未在 Linux 验收。跟随桌面客户端启动/退出属于可选集成，须明确配置兼容客户端；关闭浏览器标签页不属于该生命周期。
+详见 [Linux 核心手册](README.linux.md)。Tunnel 自动管理、密钥环和桌面联动另行贡献。
 
 升级或重装时，获取新的 release/tag 后再次运行同一个 installer 即可。安装目录之外的用户状态会保留。Codexless 不会偷偷扩大 Codex trust，也不会替用户配置 Tunnel 或浏览器文件访问权限。
 

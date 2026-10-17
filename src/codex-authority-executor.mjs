@@ -51,8 +51,10 @@ async function resolveWindowsExecutable(command) {
 }
 
 export function normalizeConfigPath(value) {
-  const resolved = path.resolve(value);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  // Keep accepted Windows/macOS behavior unchanged; Linux paths are case-sensitive.
+  return process.platform === "linux"
+    ? path.resolve(value)
+    : path.resolve(value).replaceAll("/", "\\").toLowerCase();
 }
 
 function getMcpServers(config) {
@@ -81,8 +83,10 @@ export function findTrustedAncestor(config, cwd) {
     const trustLevel = entry?.trust_level ?? entry?.trustLevel ?? null;
     if (trustLevel !== "trusted") continue;
     const normalizedRoot = normalizeConfigPath(rawRoot);
-    const relative = path.relative(normalizedRoot, target);
-    const withinRoot = relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+    const relative = process.platform === "linux" ? path.relative(normalizedRoot, target) : null;
+    const withinRoot = process.platform === "linux"
+      ? relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+      : target === normalizedRoot || target.startsWith(`${normalizedRoot}\\`);
     if (!withinRoot) continue;
     if (!best || normalizedRoot.length > best.normalizedRoot.length) {
       best = { root: path.resolve(rawRoot), normalizedRoot, trustLevel };

@@ -42,7 +42,8 @@
     "test:skills": "node --test test/codex-skill-sync.mjs test/public-skill-refresh.mjs",
     "release:preflight": "node scripts/release-preflight.mjs",
     "test:agent-progress-steer": "node --test test/agent-progress.mjs test/agent-steer.mjs test/agent-steer-boundaries.mjs",
-    "test:linux": "node test/linux-core-security.mjs && node --test test/linux-lifecycle.mjs test/linux-tunnel.mjs test/linux-chatgpt-session.mjs test/linux-app-server-cleanup.mjs && python3 -B test/linux-desktop-credential.py && node test/linux-mcp-integration.mjs"
+    "test:linux": "node test/linux-core-security.mjs && node --test test/linux-lifecycle.mjs test/linux-app-server-cleanup.mjs && node test/linux-mcp-integration.mjs",
+    "test:platform": "node --test test/platform-regression.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "2.0.0",
@@ -76,7 +77,6 @@
     "THIRD_PARTY_NOTICES.md",
     "skills",
     "bin/codexless-linux*",
-    "README.linux.md",
-    "README.linux-tunnel.zh-CN.md"
+    "README.linux.md"
   ]
 }

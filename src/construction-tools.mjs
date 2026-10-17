@@ -3,7 +3,6 @@ import { createReadStream } from "node:fs";
 import { readFile, realpath, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { gzipSync } from "node:zlib";
 
 const require = createRequire(import.meta.url);
 const z = require("zod/v4");
@@ -22,36 +21,6 @@ const DEFAULT_PDF_MAX_TEXT_CHARS = 50_000;
 const MAX_PDF_MAX_TEXT_CHARS = 200_000;
 const DEFAULT_PDF_MAX_RENDER_PIXELS = 12_000_000;
 const MAX_PDF_MAX_RENDER_PIXELS = 30_000_000;
-
-// Linux mutations use the same official Codex sandbox as commands. Keep this
-// transport Linux-only: Windows has a much smaller aggregate argv limit.
-const GUARDED_EDIT_SCRIPT = `
-const fs = require('node:fs');
-const path = require('node:path');
-const {createHash} = require('node:crypto');
-const data = JSON.parse(require('node:zlib').gunzipSync(Buffer.from(process.argv.slice(1).join(''), 'base64')).toString('utf8'));
-const hash = value => createHash('sha256').update(value).digest('hex');
-const root = fs.realpathSync(data.root);
-const target = fs.realpathSync(data.target);
-const relative = path.relative(root, target);
-if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) throw new Error('precise edit refused path outside trusted root');
-const fd = fs.openSync(target, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0));
-try {
-  const info = fs.fstatSync(fd);
-  if (!info.isFile() || info.nlink !== 1) throw new Error('precise edit requires a regular file without additional hard links');
-  const before = fs.readFileSync(fd);
-  if (hash(before) !== data.beforeSha256) throw new Error('precise edit refused: file changed before sandboxed write');
-  const parts = before.toString('utf8').split(data.expectedText);
-  if (parts.length - 1 !== data.expectedOccurrences) throw new Error('precise edit refused: occurrence count changed');
-  const after = Buffer.from(parts.join(data.replacementText), 'utf8');
-  if (hash(after) !== data.afterSha256) throw new Error('precise edit refused: intended output hash mismatch');
-  fs.ftruncateSync(fd, 0);
-  let position = 0;
-  while (position < after.length) position += fs.writeSync(fd, after, position, after.length - position, position);
-  fs.fsyncSync(fd);
-  process.stdout.write(JSON.stringify({afterSha256: hash(fs.readFileSync(target))}));
-} finally { fs.closeSync(fd); }
-`;
 
 export function registerConstructionTools(server, { authorityExecutor }) {
   if (!authorityExecutor) return;
@@ -315,34 +284,12 @@ export async function preciseEditAuthorized({ authorityExecutor, path: requested
   const preview = buildPreview(initialText, nextText, expectedText);
 
   if (!previewOnly) {
-    if (authority.permissionProfile === ":read-only") {
-      throw new Error("precise edit refused: local Codex authority is read-only");
+    const currentBuffer = await readFile(target);
+    const currentSha256 = sha256(currentBuffer);
+    if (currentSha256 !== beforeSha256) {
+      throw new Error("precise edit refused: file changed after validation and before write; re-read and retry with current content");
     }
-    if (process.platform === "linux") {
-      if (typeof authorityExecutor.exec !== "function") throw new Error("precise edit requires the official Codex sandboxed command executor");
-      const editPayload = gzipSync(Buffer.from(JSON.stringify({ root, target, beforeSha256, afterSha256, expectedText, replacementText, expectedOccurrences }), "utf8")).toString("base64");
-      // ASCII chunks avoid both Linux's per-argument byte limit and splitting
-      // UTF-16 surrogate pairs while Node serializes each argument to UTF-8.
-      const chunks = [];
-      for (let index = 0; index < editPayload.length; index += 16_000) chunks.push(editPayload.slice(index, index + 16_000));
-      const result = await authorityExecutor.exec({
-        command: [process.execPath, "-e", GUARDED_EDIT_SCRIPT, ...chunks],
-        cwd: authority.effectiveCwd,
-        access: "inherit",
-        timeoutMs: 10_000,
-      });
-      if (result.exitCode !== 0) throw new Error(`precise edit sandboxed write failed: ${String(result.stderr || result.stdout || `exit ${result.exitCode}`).slice(0, 2_000)}`);
-      let receipt;
-      try { receipt = JSON.parse(result.stdout); } catch { throw new Error("precise edit returned no verifiable sandboxed write receipt; do not blindly replay"); }
-      if (receipt.afterSha256 !== afterSha256) throw new Error("precise edit sandboxed write receipt hash mismatch; do not blindly replay");
-    } else {
-      // Preserve the existing native construction path on Windows/macOS.
-      const currentBuffer = await readFile(target);
-      if (sha256(currentBuffer) !== beforeSha256) {
-        throw new Error("precise edit refused: file changed after validation and before write; re-read and retry with current content");
-      }
-      await writeFile(target, afterBuffer);
-    }
+    await writeFile(target, afterBuffer);
     const writtenBuffer = await readFile(target);
     const writtenSha256 = sha256(writtenBuffer);
     if (writtenSha256 !== afterSha256) {

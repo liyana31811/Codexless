@@ -343,7 +343,7 @@ export function saveCodexCallProfile({
   const text = serializeProfile({ profileRevision, requireCallApproval, instruction });
 
   const resolvedPath = path.resolve(filePath);
-  mkdirSync(path.dirname(resolvedPath), { recursive: true, mode: 0o700 });
+  mkdirSync(path.dirname(resolvedPath), { recursive: true, ...(process.platform === "linux" ? { mode: 0o700 } : {}) });
   const tmp = `${resolvedPath}.tmp-${randomUUID()}`;
   writeFileSync(tmp, text, { encoding: "utf8", mode: 0o600 });
   const latest = loadCodexCallProfile({ filePath: resolvedPath });

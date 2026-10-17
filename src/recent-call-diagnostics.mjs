@@ -107,7 +107,7 @@ export function createRecentCallDiagnostics({
     trim();
     let tmp = null;
     try {
-      mkdirSync(path.dirname(resolvedPath), { recursive: true, mode: 0o700 });
+      mkdirSync(path.dirname(resolvedPath), { recursive: true, ...(process.platform === "linux" ? { mode: 0o700 } : {}) });
       tmp = `${resolvedPath}.tmp-${randomUUID()}`;
       const payload = JSON.stringify({ version: RECENT_CALL_STORE_VERSION, receipts: [...records.values()] });
       writeFileSync(tmp, payload, { encoding: "utf8", mode: 0o600 });
