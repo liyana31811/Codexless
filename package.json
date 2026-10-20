@@ -64,6 +64,7 @@
     "bin/codexless-http.cmd",
     "bin/codexless-install.cmd",
     "bin/codexless-stdio.cmd",
+    "bin/codexless-uninstall.cmd",
     "bin/codexless-doctor.sh",
     "bin/codexless-http.sh",
     "bin/codexless-install.sh",
