@@ -8,11 +8,23 @@ import { CodexAppServerClient, CodexRpcTimeoutError } from "../src/codex-app-ser
 import { boundLinuxPermissionProfile, findTrustedAncestor, normalizeConfigPath } from "../src/codex-authority-executor.mjs";
 import { validatePermissionProjection } from "../src/codex-permission-executor.mjs";
 import { findPosixExecutable, probeCodexExecutable, resolveCodexExecutable } from "../src/codex-bin.mjs";
+import { codexlessPlatformSupport } from "../src/platform-support.mjs";
+import { releaseAssetContract } from "../src/release-discovery.mjs";
 
 // Run this file on each native OS. Passing here does not certify another OS.
 // The protocol peer is a synthetic model-free server, not a live Codex account.
 const host = `${process.platform}/${process.arch}`;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("Linux arm64 remains unverified and cannot select a supported release asset", () => {
+  const support = codexlessPlatformSupport({ platform: "linux", arch: "arm64" });
+  assert.equal(support.status, "unverified");
+  assert.match(support.reason, /unverified.*outside accepted preview support/);
+  assert.throws(() => releaseAssetContract("0.1.2-preview.1", "linux", "arm64"), error => error.code === "UNSUPPORTED_PLATFORM");
+  assert.equal(codexlessPlatformSupport({ platform: "linux", arch: "x64" }).status, "supported");
+  assert.equal(codexlessPlatformSupport({ platform: "win32", arch: "x64" }).status, "supported");
+  assert.equal(codexlessPlatformSupport({ platform: "darwin", arch: "arm64" }).status, "supported");
+});
 
 async function eventually(check, message) {
   const deadline = Date.now() + 5_000;

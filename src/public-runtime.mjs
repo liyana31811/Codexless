@@ -72,7 +72,7 @@ export function buildBrowserConfigOverrides({
 export async function createPublicRuntime({ env = process.env } = {}) {
   const supportedPlatform = process.platform === "win32" || (process.platform === "darwin" && process.arch === "arm64") || (process.platform === "linux" && ["x64", "arm64"].includes(process.arch));
   if (!supportedPlatform && env.CODEXLESS_ALLOW_NONWINDOWS_PROBE !== "1") {
-    throw new Error("Codexless supports Windows, Apple Silicon macOS, and Linux x64/arm64 core tools");
+    throw new Error("Codexless runtime branches cover Windows, Apple Silicon macOS, and Linux x64/arm64 core tools; Linux arm64 is unverified and outside accepted preview support");
   }
 
   const codexResolution = await resolveCodexExecutable({ env });

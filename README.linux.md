@@ -8,7 +8,7 @@ Tunnel Client 自动管理、密钥环及桌面应用联动另行贡献，不是
 
 - 已验证 Ubuntu 22.04 x64，Node.js 22.23.3、npm 10.9.9、Codex CLI 0.163.0。
 - 需要 Node.js 22+、npm、支持 App Server 的现有 Codex CLI。安装器拒绝 root，不执行 sudo，不替换 Codex。
-- Linux arm64 有平台分支，尚无真机验收；其他发行版需单独验证。
+- Linux arm64 只有未验收的运行分支，不在已接纳的预览支持范围内；其他发行版需单独验证。
 - 普通文件/Git/命令通过官方 App Server `command/exec`，不会发起 Codex 模型 turn。模型任务保留准确 Task ID、审批、防重放和验证机制，需另行独立登录。
 - Browser/Excel schema 保留，Linux 运行环境及成功的模型 turn 尚未验收。
 

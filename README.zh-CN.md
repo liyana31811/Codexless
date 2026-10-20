@@ -106,7 +106,7 @@ Browser 使用你选择的本地浏览器 profile 和其中已有的网站登录
 
 ## 安装前先确认
 
-- **平台：** Windows、**Apple Silicon macOS（arm64）** 及 **Ubuntu Linux（x64）** Technical Preview。Linux arm64 已有平台分支，尚无真机验收；Intel Mac 暂不支持。
+- **平台：** Windows、**Apple Silicon macOS（arm64）** 及 **Ubuntu Linux（x64）** Technical Preview。Linux arm64 只有未验收的运行分支，不在已接纳的预览支持范围内；Intel Mac 暂不支持。
 - **前提：** 本机已有 **Node.js 22+** 和一套可工作的 **Codex**。Codex Desktop 不是必须项，有可用 CLI/runtime 即可。
 - **Recommended 双路径：** 可以额外准备一套固定版本的官方 Codex runtime，用于已经支持的文件 / 命令工作；它不会替换本机 Codex，登录状态也相互隔离。
 - **Browser：** 本机需要 Chrome 或 Edge，以及已连接的 ChatGPT 浏览器扩展。

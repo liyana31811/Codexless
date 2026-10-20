@@ -45,7 +45,7 @@ record(
     : process.platform === "darwin" && process.arch === "arm64"
       ? "Apple Silicon macOS"
       : process.platform === "linux" && ["x64", "arm64"].includes(process.arch)
-        ? `Linux ${process.arch}`
+        ? `Linux ${process.arch}${process.arch === "arm64" ? " (unverified runtime branch; outside accepted preview support)" : ""}`
         : `Unsupported platform: ${process.platform}/${process.arch}`
 );
 const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);

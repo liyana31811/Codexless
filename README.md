@@ -110,7 +110,7 @@ The underlying task binding remains single-use and replay-safe: a stale or alrea
 
 ## Before you install
 
-- **Platforms:** Windows, **Apple Silicon macOS (`arm64`)**, and **Ubuntu Linux (`x64`)** Technical Preview. Linux `arm64` has platform support but has not passed real-machine acceptance. Intel Mac is not supported yet.
+- **Platforms:** Windows, **Apple Silicon macOS (`arm64`)**, and **Ubuntu Linux (`x64`)** Technical Preview. Linux `arm64` has an unverified runtime branch and is outside accepted preview support. Intel Mac is not supported yet.
 - **Prerequisites:** **Node.js 22+** and one working local **Codex** installation. Codex Desktop is optional if a working CLI/runtime is available.
 - **Recommended dual runtime:** Recommended setup can also prepare a pinned official Codex runtime as an independent path for supported file/command work. It does not replace your existing local Codex and uses an isolated login.
 - **Browser:** Chrome or Edge plus the ChatGPT browser extension, connected in the profile you want to use.
