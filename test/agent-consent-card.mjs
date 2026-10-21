@@ -158,7 +158,7 @@ function createHarness({ agentReasoningEffort = true, quotaProvider = async () =
     assert.ok(entry, `missing tool ${name}`);
     return entry.handler(args);
   }
-  return { server, starts, sends, invoke };
+  return { server, starts, sends, invoke, agents };
 }
 
 function assertPreparedApproval(result, { task, modelLabel = "Fake Default", model = "fake-default", effort = "medium" } = {}) {
@@ -177,6 +177,8 @@ function assertPreparedApproval(result, { task, modelLabel = "Fake Default", mod
   assert.equal(text, payload.chatPresentation?.text, "Call Approval content must exactly equal the server-fixed presentation text");
   const delivery = payload.chatPresentation?.delivery;
   assert.equal(delivery?.mode, "verbatim_text");
+  assert.match(delivery?.choiceInstruction ?? "", /prefer an available Chat choice component/);
+  assert.match(delivery?.choiceInstruction ?? "", /exact existing format and wait for a text Yes \/ No reply/);
   assert.equal(delivery?.mustPresentVerbatim, true);
   assert.equal(delivery?.noProseBeforeOrAfter, true);
   assert.equal(delivery?.allowSummary, false);
@@ -368,4 +370,41 @@ test("reasoningEffort remains opt-in and historical card/portable tools are abse
   for (const name of ["codex.agent_card_render", "codex.agent_card_state", "codex.agent_portable_commit", "codex.agent_portable_decline"]) {
     assert.equal(server.tools.has(name), false, `${name} must not be discoverable`);
   }
+});
+
+
+test("both approval stages expose host-choice guidance without changing task bindings", async () => {
+  const { server, invoke, agents } = createHarness();
+  for (const name of ["codex.agent_start", "codex.agent_send", "codex.agent_approve"]) {
+    const description = server.tools.get(name)?.definition.description ?? "";
+    assert.match(description, /selecting Yes \/ No submits an actual user reply to this same current Chat/);
+    assert.match(description, /continue the same task through the existing approval workflow/);
+    assert.match(description, /only updates local UI state is not usable/);
+    assert.match(description, /verbatim-text delivery rules constrain that text, not the reply input control/);
+    assert.match(description, /next applicable step within its original authority, rather than stopping at acknowledgement/);
+    assert.match(description, /Do not start a new task\/session or reset context/);
+    assert.match(description, /bound to the exact current task\/request/);
+    assert.match(description, /must not connect directly to Codex or call approval\/execution tools/);
+  }
+  const prepared = await invoke("codex.agent_start", { prompt: "CHOICE_HINT", requestId: "choice-hint", cwd: projectRoot });
+  assertPreparedApproval(prepared, { task: "CHOICE_HINT" });
+  const started = await invoke("codex.agent_commit", { taskId: prepared.structuredContent.taskId });
+  const agentRef = started.structuredContent.agentRef;
+  const state = agents.get(agentRef);
+  state.status = "awaitingApproval";
+  state.canSend = false;
+  state.pendingApproval = { requestId: "approval-choice-1", method: "item/commandExecution/requestApproval", details: { kind: "command", command: "git status", cwd: projectRoot }, reason: "Inspect the current task" };
+  const pending = await invoke("codex.agent_show", { agentRef });
+  const presentation = pending.structuredContent.approvalPresentation;
+  assert.equal(presentation.status, "decision_required");
+  assert.deepEqual(presentation.choices, ["Yes", "No"]);
+  assert.equal(presentation.choiceInstruction, prepared.structuredContent.chatPresentation.delivery.choiceInstruction);
+  assert.equal(pending.structuredContent.pendingApproval.requestId, "approval-choice-1");
+  assert.equal(pending.content[0].text, presentation.text);
+  assert.match(presentation.text, /Reply Yes/);
+  state.pendingApproval.method = "unsupported/requestApproval";
+  const unsupported = await invoke("codex.agent_show", { agentRef });
+  assert.equal(unsupported.structuredContent.approvalPresentation.failClosed, true);
+  assert.deepEqual(unsupported.structuredContent.approvalPresentation.choices, []);
+  assert.equal(unsupported.structuredContent.approvalPresentation.choiceInstruction, undefined);
 });
