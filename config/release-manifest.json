@@ -4,7 +4,7 @@
   "version": "0.1.2-preview.1",
   "buildIdAlgorithm": "sha256-release-identity-v1",
   "fileHashAlgorithm": "sha256-raw-file-v1",
-  "sourceRevision": "394e8f4d356f064c27143a8580c3ba4028373e21",
+  "sourceRevision": "ede230f83f93fe5c2088febde93700a0208ff994",
   "hostContractVersion": "codexless-public-preview-v1",
   "stateCompatibility": {
     "migration": "none",
@@ -17,13 +17,13 @@
       }
     }
   },
-  "buildId": "31dc0d0614200479c14822ea5536ffc4abefa0e52af486e9fad2728d7ded1b3d",
+  "buildId": "029f1a0a1deebee34ca1275471fe7a3a6ce7b5fae776da8c6dd602e61943a332",
   "files": [
     { "path": "EXPORT_SYNC.md", "sha256": "d4618e85994911b887f02237b3e0a25c50e11cc101cce535d8059888c175aa16" },
     { "path": "LICENSE", "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4" },
     { "path": "README.linux.md", "sha256": "6db25e473643f61fe92ccd0e5963b6fbdeb42613fe795b5bfaa1ca4869cab7b4" },
-    { "path": "README.md", "sha256": "fe3f1159c93b278d16b220264d7b8af7538849c576b1829fec0744c82b2925e9" },
-    { "path": "README.zh-CN.md", "sha256": "8c7808aa11ec5678c678344413fdf6d1c65d5c3d73a01b97f8be09db1b9d630f" },
+    { "path": "README.md", "sha256": "c8157d9f046a546b09c09545fc87d38f225befb76befd76a73b4f65905d7f04a" },
+    { "path": "README.zh-CN.md", "sha256": "3e00b72ac86543ab7bf36006d1ed448b26921d84e0b810f0ce5bb82de844875b" },
     { "path": "SECURITY.md", "sha256": "51f9d33307b2bbe36875b69233ee8339d6399d34727fdc35816ceedd2ff2638c" },
     { "path": "THIRD_PARTY_NOTICES.md", "sha256": "532d98de514ed71e3e30879366c023e028727435853ea5a47c42b67206228235" },
     { "path": "bin/codexless-doctor.cmd", "sha256": "8433095510e2bcb5248f9b51c9b23e9db5922bd86a6827e37c1f6fc9ffffa5ef" },
@@ -82,7 +82,7 @@
     { "path": "skills/codexless-browser-repair/SKILL.md", "sha256": "43b24574da21f09ee625e56b56ff753a03f6d35043c1fb3203ae47f43097f647" },
     { "path": "src/agent-card-ui.mjs", "sha256": "7c746482191e781afe6fc2dcb7a9ce41b322007fce4ac2a5d4703a21feca5c91" },
     { "path": "src/agent-resource.mjs", "sha256": "585528b34d8a3f4b4e4d1e797724628972cb1e9d2d843766a12401c4c2f23382" },
-    { "path": "src/agent-tools.mjs", "sha256": "d735d25381beabd22fb5c814ba88c62628fce5bc3adb8bc1c4be9329a2897471" },
+    { "path": "src/agent-tools.mjs", "sha256": "613915ea02b55d78db70f8bb303b363748370f61d5a8a4fefe75115b280ec018" },
     { "path": "src/bootstrap-archive.mjs", "sha256": "8ad353e63399126b4a9c766194ee360a767c7d9e2158d19f024b96e64d5e5f3f" },
     { "path": "src/bootstrap-persistence.mjs", "sha256": "5641812542306bfb48d0503721fc9d586ae987fcc23c4c4e4032d7543a2d68a5" },
     { "path": "src/bootstrap-updater.mjs", "sha256": "8fc1d19dfebcb956aa8b9887190830efc13141253ae407cb14b8629ffc428c3f" },

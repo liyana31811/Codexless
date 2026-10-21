@@ -100,6 +100,8 @@ For writes and formatting, a successful dispatch is not automatically treated as
 
 Before a metered Codex call, normal Chat shows a compact **text approval** with the task, model/reasoning information, current quota context, and an exact Task ID, then asks for **Yes / No**.
 
+For initial and subsequent approvals, use a Chat choice component only when selecting **Yes / No** submits an actual user reply to the same current Chat, bound to the current task/request. A component that only updates local UI state is not usable. Chat receives the reply and resumes the same task's existing approval handling and next applicable step within its original authority, rather than stopping at acknowledgement or starting a new task/session; the button does not connect directly to Codex or call approval/execution tools. If no reply-submitting component is available, use the exact existing approval text format and ask for a text reply.
+
 If approved, the task runs in the background. When it reaches a terminal state, Codexless returns a compact text Result with the outcome, mutation/verification evidence, any remaining blocker, quota context, and the same Task ID.
 
 The underlying task binding remains single-use and replay-safe: a stale or already-consumed approval cannot be reused to start the task again.
