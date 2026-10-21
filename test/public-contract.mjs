@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -14,8 +14,17 @@ const { StdioClientTransport } = require("@modelcontextprotocol/client/stdio");
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const codexBin = (await resolveCodexExecutable()).path;
-const testCwd = process.env.CODEXLESS_TEST_CWD;
 const contractStateRoot = mkdtempSync(path.join(os.tmpdir(), "codexless-public-contract-"));
+// Linux acceptance must not depend on the developer's real trust/config/login.
+// Keep the existing native Windows/macOS test path unchanged.
+const linuxFixture = process.platform === "linux" ? path.join(contractStateRoot, "project") : null;
+const testCwd = linuxFixture ?? process.env.CODEXLESS_TEST_CWD;
+const codexHome = linuxFixture ? path.join(contractStateRoot, "codex-home") : null;
+if (linuxFixture) {
+  mkdirSync(linuxFixture);
+  mkdirSync(codexHome, { mode: 0o700 });
+  writeFileSync(path.join(codexHome, "config.toml"), `approval_policy = "on-request"\nsandbox_mode = "workspace-write"\n[projects.${JSON.stringify(linuxFixture)}]\ntrust_level = "trusted"\n`, { mode: 0o600 });
+}
 const recentCallStateFile = path.join(contractStateRoot, "recent-calls.json");
 const agentTaskStateFile = path.join(contractStateRoot, "agent-task-cards.json");
 process.once("exit", () => rmSync(contractStateRoot, { recursive: true, force: true }));
@@ -23,7 +32,7 @@ process.once("exit", () => rmSync(contractStateRoot, { recursive: true, force: t
 function createIsolatedPublicTestEnv(extra = {}) {
   const env = { ...process.env };
   for (const key of Object.keys(env)) {
-    if (key.startsWith("CODEX_TOOLBOX_") || key.startsWith("CODEXLESS_")) delete env[key];
+    if (key.startsWith("CODEX_TOOLBOX_") || key.startsWith("CODEXLESS_") || key.startsWith("TUNNEL_CLIENT_") || ["OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY", "CONTROL_PLANE_API_KEY"].includes(key)) delete env[key];
   }
   Object.assign(env, {
     CODEX_BIN: codexBin,
@@ -34,6 +43,11 @@ function createIsolatedPublicTestEnv(extra = {}) {
     CODEX_TOOLBOX_AGENT_METERED_CONSENT: "__codexless_must_ignore__",
     CODEXLESS_RECENT_CALLS_STATE_FILE: recentCallStateFile,
     CODEXLESS_AGENT_TASK_STATE_FILE: agentTaskStateFile,
+    ...(codexHome ? {
+      CODEX_HOME: codexHome,
+      CODEXLESS_STATE_ROOT: contractStateRoot,
+      CODEXLESS_CALL_PROFILE_FILE: path.join(contractStateRoot, "codex-call-profile.md"),
+    } : {}),
     ...(testCwd ? { CODEXLESS_DEFAULT_CWD: testCwd } : {}),
     ...extra,
   });

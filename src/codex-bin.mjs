@@ -1,4 +1,5 @@
-import { access, readdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, readdir, stat } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -48,7 +49,7 @@ export async function resolveCodexExecutable({ env = process.env } = {}) {
 }
 
 export async function probeCodexExecutable(target, { cwd = process.cwd(), timeoutMs = 10_000 } = {}) {
-  await access(target);
+  await access(target, process.platform === "linux" ? constants.X_OK : constants.F_OK);
   const result = spawnSync(target, ["--version"], {
     cwd,
     encoding: "utf8",
@@ -182,7 +183,7 @@ async function posixCodexCandidates(env) {
       label: "ChatGPT.app:bundled-codex",
     });
   }
-  const found = whichFirst("codex");
+  const found = process.platform === "linux" ? await findPosixExecutable("codex", env) : whichFirst("codex");
   if (found) candidates.push({ path: found, source: "PATH", label: "PATH:codex" });
   return candidates;
 }
@@ -291,10 +292,26 @@ function whereAll(name) {
   return String(result.stdout ?? "").split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
 }
 
+// macOS retains its accepted discovery behavior; Linux does not require `which`.
 function whichFirst(name) {
   const result = spawnSync("which", [name], { encoding: "utf8", timeout: 3_000 });
   if (result.status !== 0) return null;
   return String(result.stdout ?? "").split(/\r?\n/).map((value) => value.trim()).find(Boolean) ?? null;
+}
+
+export async function findPosixExecutable(name, env = process.env) {
+  if (typeof name !== "string" || !name || name.includes("/")) return null;
+  for (const entry of String(env.PATH ?? "").split(path.delimiter)) {
+    // Ignore implicit current-directory PATH entries for a remote bridge.
+    if (!entry || !path.isAbsolute(entry)) continue;
+    const candidate = path.join(entry, name);
+    try {
+      if (!(await stat(candidate)).isFile()) continue;
+      await access(candidate, constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  return null;
 }
 
 function parseComparableVersion(version) {

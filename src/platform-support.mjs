@@ -1,4 +1,13 @@
 export function codexlessPlatformSupport({ platform = process.platform, arch = process.arch } = {}) {
+  if (platform === "linux" && arch === "arm64") {
+    return {
+      status: "unverified", platform, arch, product: "Linux arm64", scope: "core-files-git-terminal-codex",
+      reason: "Linux arm64 has an unverified runtime branch, without native acceptance evidence; it is outside accepted preview support.",
+    };
+  }
+  if (platform === "linux" && arch === "x64") {
+    return { status: "supported", platform, arch, product: `Linux ${arch}`, scope: "core-files-git-terminal-codex" };
+  }
   if (platform === "win32" && arch === "x64") {
     return { status: "supported", platform, arch, product: "Windows x64" };
   }

@@ -1,4 +1,3 @@
-import os from "node:os";
 import path from "node:path";
 import { createAgentPreviewState } from "./agent-tools.mjs";
 import { CodexAgentExecutor } from "./codex-agent-executor.mjs";
@@ -14,6 +13,7 @@ import { CodexPublicContextExecutor } from "./public-context-executor.mjs";
 import { createPublicServerFactory } from "./public-server-factory.mjs";
 import { createRecentCallDiagnostics, recentCallOptionsFromEnv } from "./recent-call-diagnostics.mjs";
 import { STOCK_RUNTIME_KIND } from "./stock-prompt-input-skill-routing.mjs";
+import { codexlessPaths } from "./linux-identity.mjs";
 import { PUBLIC_SERVER_VERSION, PUBLIC_SURFACE_VERSION, PUBLIC_TOOL_NAMES } from "./surface-contracts.mjs";
 
 function envString(env, name, fallback = null) {
@@ -70,9 +70,9 @@ export function buildBrowserConfigOverrides({
 }
 
 export async function createPublicRuntime({ env = process.env } = {}) {
-  const supportedPlatform = process.platform === "win32" || (process.platform === "darwin" && process.arch === "arm64");
+  const supportedPlatform = process.platform === "win32" || (process.platform === "darwin" && process.arch === "arm64") || (process.platform === "linux" && ["x64", "arm64"].includes(process.arch));
   if (!supportedPlatform && env.CODEXLESS_ALLOW_NONWINDOWS_PROBE !== "1") {
-    throw new Error("Codexless Technical Preview currently supports Windows and Apple Silicon macOS only");
+    throw new Error("Codexless runtime branches cover Windows, Apple Silicon macOS, and Linux x64/arm64 core tools; Linux arm64 is unverified and outside accepted preview support");
   }
 
   const codexResolution = await resolveCodexExecutable({ env });
@@ -94,7 +94,7 @@ export async function createPublicRuntime({ env = process.env } = {}) {
   const agentTaskStateFile = envString(
     env,
     "CODEXLESS_AGENT_TASK_STATE_FILE",
-    path.join(os.homedir(), ".config", "codexless", "agent-task-cards.json")
+    path.join(codexlessPaths({ env }).state, "agent-task-cards.json")
   );
   const recentCallDiagnostics = createRecentCallDiagnostics(recentCallOptionsFromEnv(env));
 

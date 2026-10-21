@@ -36,7 +36,7 @@ let browser = normalizeBrowserReaderHealth({ status: "unavailable", reason: "not
 let nodeRepl = { status: "not_checked", reason: "conditional_feature" };
 const recentCallDiagnostics = createRecentCallDiagnostics(recentCallOptionsFromEnv(process.env, { readOnly: true }));
 
-const supportedPlatform = process.platform === "win32" || (process.platform === "darwin" && process.arch === "arm64");
+const supportedPlatform = process.platform === "win32" || (process.platform === "darwin" && process.arch === "arm64") || (process.platform === "linux" && ["x64", "arm64"].includes(process.arch));
 record(
   "platform",
   supportedPlatform,
@@ -44,7 +44,9 @@ record(
     ? "Windows"
     : process.platform === "darwin" && process.arch === "arm64"
       ? "Apple Silicon macOS"
-      : `Unsupported platform: ${process.platform}/${process.arch}`
+      : process.platform === "linux" && ["x64", "arm64"].includes(process.arch)
+        ? `Linux ${process.arch}${process.arch === "arm64" ? " (unverified runtime branch; outside accepted preview support)" : ""}`
+        : `Unsupported platform: ${process.platform}/${process.arch}`
 );
 const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
 record("node", Number.isInteger(nodeMajor) && nodeMajor >= 22, `Node ${process.version}`, nodeMajor >= 22 ? null : "Node.js 22+ is required");

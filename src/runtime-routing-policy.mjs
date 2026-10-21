@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { codexlessPaths } from "./linux-identity.mjs";
 
 export const CODEXLESS_RUNTIME_ENV = "CODEXLESS_CODEX_RUNTIME";
 export const RECOMMENDED_RUNTIME_MODE = "recommended";
@@ -18,8 +18,8 @@ export const INSTALLABLE_RUNTIME_MODES = Object.freeze([RECOMMENDED_RUNTIME_MODE
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(moduleDir, "..");
 
-export function defaultCodexlessStateRoot() {
-  return path.join(os.homedir(), ".config", "codexless");
+export function defaultCodexlessStateRoot(env = process.env) {
+  return codexlessPaths({ env }).state;
 }
 
 export function codexRuntimeSelection(env = process.env) {

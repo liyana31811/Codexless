@@ -426,7 +426,7 @@ ERROR_CODE="STAGING_FAILED"
 mkdir -p "$PARENT_DIR" "$CACHE_DIR"
 STAGE_DIR=$(mktemp -d "$PARENT_DIR/.Codexless-stage.XXXXXX") || fail "Unable to create staging directory beside install target."
 
-for entry in src config scripts skills bin package.json README.md README.zh-CN.md SECURITY.md EXPORT_SYNC.md THIRD_PARTY_NOTICES.md LICENSE; do
+for entry in src config scripts skills bin package.json README.md README.zh-CN.md README.linux.md SECURITY.md EXPORT_SYNC.md THIRD_PARTY_NOTICES.md LICENSE; do
   [ -e "$SOURCE_ROOT/$entry" ] || fail "Release source is missing required entry: $entry"
   cp -R "$SOURCE_ROOT/$entry" "$STAGE_DIR/$entry" || fail "Failed to stage release entry: $entry"
 done

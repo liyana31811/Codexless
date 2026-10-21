@@ -389,7 +389,7 @@ async function createFixtureRelease(name, marker, hostContractVersion, { incompa
     packages: { "": { name: "codexless", version } },
   }, null, 2)}\n`, "utf8");
 
-  for (const file of ["README.md", "README.zh-CN.md", "SECURITY.md", "EXPORT_SYNC.md", "THIRD_PARTY_NOTICES.md", "LICENSE"]) {
+  for (const file of ["README.md", "README.zh-CN.md", "README.linux.md", "SECURITY.md", "EXPORT_SYNC.md", "THIRD_PARTY_NOTICES.md", "LICENSE"]) {
     await writeFile(path.join(releaseRoot, file), `${file} fixture ${name}\n`, "utf8");
   }
 
